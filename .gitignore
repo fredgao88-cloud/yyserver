@@ -9,3 +9,4 @@ nginx/ssl/
 *.key
 *.crt
 .venv*/
+freetds.conf

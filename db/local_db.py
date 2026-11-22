@@ -18,7 +18,9 @@ if os.path.exists(dotenv_path):
 LOCAL_DB_HOST = os.getenv("LOCAL_DB_HOST", "sqlserver")
 LOCAL_DB_PORT = int(os.getenv("LOCAL_DB_PORT", "1433"))
 LOCAL_DB_USER = os.getenv("LOCAL_DB_USER", "sa")
-LOCAL_DB_PASS = os.getenv("LOCAL_DB_PASS", "")
+LOCAL_DB_PASS = os.getenv("LOCAL_DB_PASS")
+if not LOCAL_DB_PASS:
+    raise ValueError("LOCAL_DB_PASS environment variable must be explicitly configured and non-empty.")
 LOCAL_DB_NAME = os.getenv("LOCAL_DB_NAME", "his_agent_db")
 
 def get_local_db_connection(as_dict: bool = True) -> Tuple[Any, pymssql.Connection]:

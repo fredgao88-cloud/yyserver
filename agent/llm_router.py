@@ -19,21 +19,37 @@ def parse_local_intent(text: str, channel: str = "web") -> Dict[str, Any]:
     
     # ---------------- 1. 渠道隔离与钉钉隐私盾牌 ----------------
     if channel.lower() == "dingtalk":
-        privacy_keywords = ["患者", "住院号", "床号", "姓名", "费用", "超标", "预警", "查房", "病案", "自负"]
-        if any(k in text_clean for k in privacy_keywords):
+        is_patient_query = bool(
+            re.search(r'(\d+\s*床|床号|病床|大爷|大娘|大叔|阿姨|师傅|患者|病人|住院号|zy\d+|流水号|病案|姓名|花销|花了多少|费用|花了|花费|多少钱|自负|自付|自费|超标|预警|查房)', text_clean, re.I)
+        )
+        if is_patient_query:
             return {
                 "intent": "privacy_shielded",
                 "reply": "【院内业务安全提醒】根据医疗数据安全合规要求，涉及在院患者具体明细与控费预警信息不通过移动端回显。请使用工作站登录院内专属 HTTPS 工作台查看：\nhttps://hospital-internal.local/inpatient",
-                "data": {"shielded": True, "channel": channel}
+                "data": {"shielded": True, "channel": "dingtalk"}
             }
 
-    # ---------------- 2. 金额口径澄清识别 ----------------
-    has_reimburse_query = bool(re.search(r'(能报|报销|报多少|自负|自费多少|自理)', text_clean))
-    reimburse_clarification = (
-        "\n\n【金额口径澄清提示】\n"
-        "• 若您询问的是【医保拨付医院 DIP 预估统筹额】：根据主要诊断分值与医院系数测算（如下）。\n"
-        "• 若您询问的是【患者个人医保自负报销额】：需依据患者参保地政策（起付线、个人报销比例及目录外自费项目），以出院医保实时结算单为准，DIP 病种分值不直接等同于个人报销金额。"
-    ) if has_reimburse_query else ""
+    # ---------------- 2. 报销口径前置澄清拦截 ----------------
+    # 当医生/用户咨询“能报多少/报销多少/个人自负”时，必须前置区分患者报销与医院DIP统筹，绝不直接将医院DIP预算当成患者报销金额
+    has_reimburse_query = bool(re.search(r'(能报|报销|报多少|自负|自费多少|自理|自付多少)', text_clean))
+    if has_reimburse_query:
+        return {
+            "intent": "need_reimbursement_clarification",
+            "reply": (
+                "【医保报销口径前置澄清】\n"
+                "您询问了“能报多少/报销政策”，请注意区分以下两个完全不同的业务口径：\n"
+                "1. 【患者端个人报销/自付】：需结合患者参保类型、起付线、乙类先行自付比例、分段报销比例及目录外自费，需由医保窗口以实时结算单为准。\n"
+                "2. 【医院端 DIP 医保统筹支付基准】：医保局向医院按主要诊断分值、统筹区点值与医疗机构系数核算的定额预算总额。\n\n"
+                "为避免误导患者或临床计费，请明确您需要咨询的是【医院端 DIP 预估基准】还是【患者个人自付政策】？"
+            ),
+            "data": {
+                "matched": False,
+                "status": "PENDING",
+                "pending_reason": "NEED_REIMBURSEMENT_CLARIFICATION",
+                "query": text_clean
+            }
+        }
+    reimburse_clarification = ""
 
     # ---------------- 3. 提取年龄 ----------------
     age = None
@@ -60,7 +76,7 @@ def parse_local_intent(text: str, channel: str = "web") -> Dict[str, Any]:
     op_status = "UNKNOWN"
     if any(k in text_clean for k in ["取消", "未做", "未行", "放弃", "暂不做"]):
         op_status = "CANCELED"
-    elif any(k in text_clean for k in ["拟行", "拟做", "计划", "准备行", "拟实施", "准备做"]):
+    elif any(k in text_clean for k in ["拟行", "拟做", "计划", "准备行", "拟实施", "准备做", "打算做"]):
         op_status = "PLANNED"
     elif any(k in text_clean for k in ["已完成", "已行", "已做", "做完", "术后", "已实施"]):
         op_status = "COMPLETED"
@@ -68,10 +84,13 @@ def parse_local_intent(text: str, channel: str = "web") -> Dict[str, Any]:
     op_keyword = None
     op_note = ""
     
-    if op_status == "CANCELED":
-        # 已取消操作：不纳入手术加分，自动回退到保守治疗
+    if op_status in ("CANCELED", "PLANNED"):
+        # 依规范：拟行或已取消操作均尚未实际发生加分效力，一律回退至保守治疗/基础分组测算
         op_keyword = "保守"
-        op_note = "（检测到手术/操作已取消，按保守治疗或基础分组测算）"
+        if op_status == "CANCELED":
+            op_note = "（检测到手术/操作已取消，按保守治疗基础分组测算）"
+        else:
+            op_note = "（检测到操作为拟行/尚未执行状态，依规暂不计入手术操作组，按保守治疗分组测算；待实际执行后按新组结算）"
     else:
         # 优先提取具体复合操作词，避免笼统词（如单纯“切除”）覆盖复合术式
         candidate_ops = [
@@ -95,9 +114,6 @@ def parse_local_intent(text: str, channel: str = "web") -> Dict[str, Any]:
             if pattern in text_clean:
                 op_keyword = op_kw
                 break
-            
-        if op_status == "PLANNED":
-            op_note = "（注：当前按拟行操作预估，出院以实际执行为准）"
 
     # ---------------- 7. 识别病种 (区分显式 ICD 编码与宽泛病名) ----------------
     disease = None
@@ -160,18 +176,24 @@ def parse_local_intent(text: str, channel: str = "web") -> Dict[str, Any]:
             "intent": "need_clarification",
             "reply": (
                 "【需要明确具体诊断或治疗方案】\n"
-                "检测到您输入了宽泛病名“膝关节病”，未提供明确 ICD 编码或治疗方案（保守治疗 / 手术操作）。\n"
-                "• 若确认为【未特指的膝关节病 (M17.9) 高龄保守治疗】，预估分值为 620.2 分（基准 ￥2790.90 元）；\n"
-                "• 若拟行内镜下手术或为常规保守/中医优势病种，分值各不相同。\n"
-                "请补充具体的临床诊断编码或是否拟行手术操作，绝不盲目套用单一金额。"
-            ) + reimburse_clarification,
+                "检测到您输入了宽泛病名“膝关节病”，未提供明确 ICD 编码或治疗方案（保守治疗 / 关节镜手术等）。\n"
+                "根据院内 DIP 目录，膝关节病存在多种可能分组候选：\n"
+                "• 保守治疗分组（如 M17.9 未特指的膝关节病 保守治疗/中医优势）\n"
+                "• 手术操作分组（如关节镜下探查术、清理术或松解术）\n"
+                "在未明确具体治疗方案前，系统按合规要求暂不测算并暂不输出金额，请补充具体的临床诊断编码或明确治疗方式（保守或手术操作）。"
+            ),
             "data": {
                 "matched": False,
                 "status": "PENDING",
                 "pending_reason": "AMBIGUOUS_BROAD_DIAGNOSIS",
                 "disease": disease,
                 "age": age,
-                "ins_type": ins_type
+                "ins_type": ins_type,
+                "candidates": [
+                    {"group_name": "未特指的膝关节病:核心病种-保守治疗", "treatment": "保守治疗"},
+                    {"group_name": "未特指的膝关节病:核心病种-保守治疗&中医优势", "treatment": "中医优势保守治疗"},
+                    {"group_name": "膝关节病:手术操作组", "treatment": "关节镜/手术操作"}
+                ]
             }
         }
 

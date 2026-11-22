@@ -89,10 +89,11 @@ class InpatientScanner:
 
         # 1. Fetch patients to evaluate
         patients_to_scan = []
-        active_inpatients = self.his_reader.get_active_inpatients(department=department)
+        active_inpatients = self.his_reader.get_active_inpatients(department=department, limit=limit)
         patients_to_scan.extend(active_inpatients)
 
-        if include_recent_settled or len(patients_to_scan) < 10:
+        # Strictly decouple: Only include settled cases when explicitly requested (e.g. for replay/backtesting)
+        if include_recent_settled:
             settled_cases = self.his_reader.get_settled_cases(limit=limit, department=department)
             for sc in settled_cases:
                 # Avoid duplicate scan if patient already active
@@ -147,13 +148,13 @@ class InpatientScanner:
                 ins_type = self.map_insurance_type(pat.get('ylzffs'), pat.get('insurance_type'))
 
                 # Calculate current fee
+                has_fee_activity = True
                 if '_pre_settled_amount' in pat:
                     current_fee = Decimal(str(pat['_pre_settled_amount']))
                 else:
-                    fee_detail = self.his_reader.get_case_fee_detail(zyh)
-                    cz_tot = fee_detail.get('cz_stat', {}).get('total', Decimal('0'))
-                    fy_tot = fee_detail.get('fy_stat', {}).get('total', Decimal('0'))
-                    current_fee = cz_tot + fy_tot
+                    fee_info = self.his_reader.get_active_patient_fee(zyh, cutoff_time=data_cutoff_time)
+                    current_fee = fee_info['total_fee']
+                    has_fee_activity = fee_info['has_activity']
 
                 # Diagnosis & Procedures
                 diag_code = (pat.get('admission_diag_code') or '').strip()
@@ -178,6 +179,10 @@ class InpatientScanner:
                 elif not diag_code and not diag_name and not op_kw:
                     alert_level = "PENDING"
                     pending_reason = "MISSING_DIAGNOSIS"
+                elif not has_fee_activity and current_fee == Decimal('0.00'):
+                    # Data incomplete or no fee activity yet - do NOT falsely classify as GREEN
+                    alert_level = "PENDING"
+                    pending_reason = "NO_FEE_ACTIVITY"
                 else:
                     disease_query = diag_code if diag_code else diag_name
                     match_res = match_dip_rule(
@@ -190,12 +195,11 @@ class InpatientScanner:
                     )
 
                     if match_res.get("matched"):
-                        rule = match_res["target_rule"]
-                        matched_rule_id = rule["rule_id"]
+                        matched_rule_id = match_res.get("rule_id")
                         target_base = Decimal(str(match_res["benchmark_amount"]))
 
-                        low_th = Decimal(str(rule.get("low_threshold") or "0.9000"))
-                        high_th = Decimal(str(rule.get("high_threshold") or "1.1000"))
+                        low_th = Decimal(str(match_res.get("low_threshold") or "0.9000"))
+                        high_th = Decimal(str(match_res.get("high_threshold") or "1.1000"))
 
                         eval_res = evaluate_traffic_light(
                             current_cost=current_fee,

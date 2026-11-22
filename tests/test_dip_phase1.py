@@ -37,22 +37,28 @@ def run_phase1_tests():
 
     # ---------------- 用例 2: 宽泛病名缺少方案追问 ----------------
     print("\n--- [Case 2] 宽泛病名缺少方案触发 PENDING 追问 ---")
-    query_2 = "68岁，职工医保，膝关节病。请查询医院 DIP 预估支付额。"
+    query_2 = "68岁职工膝关节病"
     res_2 = parse_local_intent(query_2)
     assert res_2["intent"] == "need_clarification"
     assert res_2["data"]["matched"] is False
     assert res_2["data"]["status"] == "PENDING"
     assert res_2["data"]["pending_reason"] == "AMBIGUOUS_BROAD_DIAGNOSIS"
-    print(f"PASS [Case 2]: 宽泛“膝关节病”未定手术方案 -> 触发 PENDING (原因: {res_2['data']['pending_reason']})，绝不盲目套用第一条")
+    # 严格审查断言：回复文本中彻底剔除任何硬编码金额与分值！
+    assert "2790.90" not in res_2["reply"]
+    assert "620.2" not in res_2["reply"]
+    assert len(res_2["data"].get("candidates", [])) > 0
+    print(f"PASS [Case 2]: 宽泛“膝关节病”未定手术方案 -> 触发 PENDING 追问，回复文本彻底剔除金额，附带候选列表")
 
     # ---------------- 用例 3: “能报多少”金额口径主动澄清 ----------------
     print("\n--- [Case 3] “能报多少”金额口径主动澄清 ---")
-    query_3 = "68岁职工膝关节病能报多少"
+    query_3 = "68岁职工 M17.9 保守治疗能报多少"
     res_3 = parse_local_intent(query_3)
-    assert "金额口径澄清提示" in res_3["reply"]
-    assert "患者个人医保自负报销额" in res_3["reply"]
-    assert "医保拨付医院 DIP 预估统筹额" in res_3["reply"]
-    print(f"PASS [Case 3]: 医生询问“能报多少” -> 成功触发个人报销与医院DIP统筹口径澄清提示")
+    assert res_3["intent"] == "need_reimbursement_clarification"
+    assert "患者端个人报销" in res_3["reply"]
+    assert "医院端 DIP 医保统筹支付基准" in res_3["reply"]
+    # 澄清前严禁提前输出预估基准金额
+    assert "2790.90" not in res_3["reply"]
+    print(f"PASS [Case 3]: 医生询问“能报多少” -> 成功前置澄清个人报销与医院DIP统筹口径，暂扣支付金额")
 
     # ---------------- 用例 4: 参保类型缺失阻断 ----------------
     print("\n--- [Case 4] 参保类型缺失阻断 (严禁默认职工) ---")
@@ -77,14 +83,15 @@ def run_phase1_tests():
     assert "已取消" in res_5a["reply"]
     print(f"PASS [Case 5a]: 操作已取消 -> 成功回退至保守治疗分组 #{res_5a['data']['rule_id']} (分值: {res_5a['data']['score']})")
 
-    # 5b. 拟行胃镜 -> 标记拟行操作预估
+    # 5b. 拟行胃镜 -> 依规回退至保守治疗分组 (357.0 分)
     query_5b = "结肠息肉 K63.5 职工医保，拟行切除术+胃镜检查"
     res_5b = parse_local_intent(query_5b)
     assert res_5b["intent"] == "query_dip_rule"
     assert res_5b["data"]["matched"] is True
-    assert res_5b["data"]["score"] == 602.5
-    assert "拟行操作" in res_5b["reply"]
-    print(f"PASS [Case 5b]: 拟行操作 -> 预估手术分值 #{res_5b['data']['rule_id']} (分值: {res_5b['data']['score']}) 并明确标注拟行")
+    # 修正此前写反的断言：拟行操作尚未执行，依规排除操作加分，按保守组 357.0 分测算
+    assert res_5b["data"]["score"] == 357.0
+    assert "拟行" in res_5b["reply"]
+    print(f"PASS [Case 5b]: 拟行操作 -> 依规回退至保守治疗分组 #{res_5b['data']['rule_id']} (分值: {res_5b['data']['score']})")
 
     # 5c. 已完成切除术+胃镜 -> 正式手术分值
     query_5c = "结肠息肉 K63.5 职工医保，已完成切除术+胃镜检查"
@@ -96,13 +103,13 @@ def run_phase1_tests():
 
     # ---------------- 用例 6: 钉钉渠道外部移动端隐私盾牌 ----------------
     print("\n--- [Case 6] 钉钉渠道外部移动端隐私盾牌 ---")
-    query_6 = "查一下马患者住院号 zy2025042901 当前费用是否超标"
-    res_6_web = parse_local_intent(query_6, channel="web")
+    query_6 = "帮我查一下3床张大爷现在花了多少钱"
     res_6_ding = parse_local_intent(query_6, channel="dingtalk")
     assert res_6_ding["intent"] == "privacy_shielded"
     assert "https://hospital-internal.local/inpatient" in res_6_ding["reply"]
-    assert "zy2025042901" not in res_6_ding["reply"]
-    print(f"PASS [Case 6]: 钉钉端患者明细查询 -> 触发隐私盾牌，仅返回院内 HTTPS 入口，杜绝患者信息外传")
+    assert "张大爷" not in res_6_ding["reply"]
+    assert "3床" not in res_6_ding["reply"]
+    print(f"PASS [Case 6]: 钉钉端查床(帮我查一下3床张大爷现在花了多少钱) -> 成功触发隐私盾牌，仅返回院内入口，绝不回显患者私密信息")
 
     print("\n" + "=" * 70)
     print(">>> 恭喜！Phase 1 验收回归测试套件 6 大关键测试集全部 100% 通过！ <<<")

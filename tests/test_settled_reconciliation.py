@@ -105,11 +105,16 @@ def run_settled_reconciliation_suite():
             'fy_expected': yfmoney
         })
 
-    print(f"  -> Category Ledger (his_zycjz) Exact Match: {exact_category_matches}/{len(settled_cases)} (100.0%)")
-    print(f"  -> Clinical Item (his_zycz vs cz+yj) Match (<=0.05Y): {exact_clinical_matches}/{len(settled_cases)} (96.0%)")
-    print(f"  -> Pharmacy Dispensing Match (within 0.10Y): {close_pharmacy_matches}/{len(settled_cases)} (100.0%)")
-    assert exact_category_matches == len(settled_cases), f"Expected 100% category match, got {exact_category_matches}"
-    assert exact_clinical_matches >= 46, f"Expected >=46 clinical matches, got {exact_clinical_matches}"
+    category_match_rate = exact_category_matches / len(settled_cases)
+    clinical_match_rate = exact_clinical_matches / len(settled_cases)
+    pharmacy_match_rate = close_pharmacy_matches / len(settled_cases)
+
+    print(f"  -> Category Ledger (his_zycjz) Exact Match: {exact_category_matches}/{len(settled_cases)} ({category_match_rate:.1%})")
+    print(f"  -> Clinical Item (his_zycz vs cz+yj) Match (<=0.05Y): {exact_clinical_matches}/{len(settled_cases)} ({clinical_match_rate:.1%})")
+    print(f"  -> Pharmacy Dispensing Match (within 0.10Y): {close_pharmacy_matches}/{len(settled_cases)} ({pharmacy_match_rate:.1%})")
+    assert category_match_rate == 1.0, f"Expected 100% category match, got {category_match_rate:.1%}"
+    assert clinical_match_rate >= 0.90, f"Expected >=90.0% clinical matches, got {clinical_match_rate:.1%}"
+    assert pharmacy_match_rate >= 0.95, f"Expected >=95.0% pharmacy matches, got {pharmacy_match_rate:.1%}"
     print("  [PASS] Suite 2 Accounting Formula Verified.")
 
     # -------------------------------------------------------------
@@ -133,6 +138,7 @@ def run_settled_reconciliation_suite():
         print(f"  -> Found {len(refund_cases)} settled cases with negative/refund items in his_zycz.")
         for rc in refund_cases:
             lsh = rc['lsh']
+            masked_lsh = lsh[:4] + "****" if len(lsh) > 4 else "***"
             detail = reader.get_case_fee_detail(lsh, settlement_id=rc['id'])
             pos_amt = detail['cz_stat']['positive']
             ref_amt = detail['cz_stat']['refund']
@@ -143,7 +149,7 @@ def run_settled_reconciliation_suite():
             assert abs((pos_amt + ref_amt) - tot_amt) < Decimal('0.01'), \
                 f"Refund net math mismatch: {pos_amt} + {ref_amt} != {tot_amt}"
             refund_verified_count += 1
-            print(f"     Patient {lsh}: PositiveItems={pos_amt}, RefundOffset={ref_amt}, NetTotal={tot_amt} -> Verified!")
+            print(f"     Patient {masked_lsh}: PositiveItems={pos_amt}, RefundOffset={ref_amt}, NetTotal={tot_amt} -> Verified!")
 
         assert refund_verified_count > 0, "No refund cases could be verified!"
         print(f"  -> Successfully verified {refund_verified_count} cases with refund deductions.")
@@ -155,10 +161,11 @@ def run_settled_reconciliation_suite():
     # Test Suite 4: Ward & Bed Transfer Tracking
     # -------------------------------------------------------------
     print("\n[Suite 4] Verifying ward/bed transfer tracking (his_zk)...")
-    transfers = reader.get_patient_transfers('zy2012092600001')
-    print(f"  -> Sample case zy2012092600001 transfers found: {len(transfers)}")
+    sample_lsh = 'zy2012092600001'
+    transfers = reader.get_patient_transfers(sample_lsh)
+    print(f"  -> Sample case transfers found: {len(transfers)}")
     for t in transfers:
-        print(f"     Transfer ID={t['id']}, OldDept={t['yksid']} -> NewDept={t['xksid']}, Date={t['zkrq']}")
+        print(f"     Transfer ID={t['id']}, Date={t['zkrq']}")
         assert t['yksid'] is not None and t['xksid'] is not None
     print("  [PASS] Suite 4 Ward & Bed Transfers Verified.")
 

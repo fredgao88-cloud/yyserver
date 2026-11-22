@@ -13,17 +13,26 @@ from dotenv import load_dotenv
 
 # Ensure FreeTDS configuration path is available
 if 'FREETDSCONF' not in os.environ:
-    if os.path.exists('/home/yyserver/.freetds.conf'):
-        os.environ['FREETDSCONF'] = '/home/yyserver/.freetds.conf'
+    for candidate in [
+        '/opt/hospital-agent/freetds.conf',
+        '/home/yyserver/.freetds.conf',
+        '/etc/freetds/freetds.conf'
+    ]:
+        if os.path.exists(candidate):
+            os.environ['FREETDSCONF'] = candidate
+            break
 
 # Load environment variables
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env'))
 load_dotenv('/opt/hospital-agent/.env')
 
 class HISReader:
     def __init__(self):
         self.server = os.getenv('HIS_FREETDS_SECTION', 'hisdb')
         self.user = os.getenv('HIS_USER', 'agent_reader')
-        self.password = os.getenv('HIS_PASS', 'HisRead_2026!')
+        self.password = os.getenv('HIS_PASS')
+        if not self.password:
+            raise ValueError("HIS_PASS environment variable must be explicitly configured and non-empty.")
         self.database = os.getenv('HIS_DB', 'his')
         self.charset = 'cp936'
 
@@ -171,6 +180,82 @@ class HISReader:
         finally:
             conn.close()
 
+    def get_active_patient_fee(self, lsh: str, cutoff_time: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Retrieve accumulated fees for an active inpatient who has not settled yet.
+        Directly aggregates from his_zycz (clinical items) and his_cfmain_fyjl (pharmacy dispensing logs)
+        up to cutoff_time (if provided) without querying his_zyjz.
+        Distinguishes between verified activity, verified 0 fee, and query/data errors.
+        """
+        conn = self.get_connection()
+        cur = conn.cursor(as_dict=True)
+        try:
+            # 1. Clinical items (his_zycz)
+            sql_cz = """
+            SELECT 
+                COUNT(*) as cz_count,
+                SUM(money) as cz_total,
+                SUM(CASE WHEN money < 0 THEN money ELSE 0 END) as cz_refund_total,
+                SUM(CASE WHEN money > 0 THEN money ELSE 0 END) as cz_positive_total
+            FROM dbo.his_zycz
+            WHERE lsh = %s
+            """
+            params_cz = [lsh]
+            if cutoff_time:
+                sql_cz += " AND ckrq <= %s"
+                params_cz.append(cutoff_time)
+            cur.execute(sql_cz, tuple(params_cz))
+            cz_stat = cur.fetchone()
+
+            # 2. Pharmacy dispensing logs (his_cfmain_fyjl)
+            sql_fy = """
+            SELECT 
+                COUNT(*) as fy_count,
+                SUM(bmoney) as fy_total,
+                SUM(CASE WHEN bmoney < 0 THEN bmoney ELSE 0 END) as fy_refund_total,
+                SUM(CASE WHEN bmoney > 0 THEN bmoney ELSE 0 END) as fy_positive_total
+            FROM dbo.his_cfmain_fyjl
+            WHERE lsh = %s
+            """
+            params_fy = [lsh]
+            if cutoff_time:
+                sql_fy += " AND fyrq <= %s"
+                params_fy.append(cutoff_time)
+            cur.execute(sql_fy, tuple(params_fy))
+            fy_stat = cur.fetchone()
+
+            cz_total = Decimal(str(cz_stat['cz_total'] or 0)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+            fy_total = Decimal(str(fy_stat['fy_total'] or 0)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+            total_fee = cz_total + fy_total
+
+            cz_count = int(cz_stat['cz_count'] or 0)
+            fy_count = int(fy_stat['fy_count'] or 0)
+            has_activity = (cz_count > 0 or fy_count > 0)
+
+            return {
+                'lsh': lsh,
+                'has_activity': has_activity,
+                'cz_count': cz_count,
+                'fy_count': fy_count,
+                'cz_total': cz_total,
+                'fy_total': fy_total,
+                'total_fee': total_fee,
+                'cz_stat': {
+                    'count': cz_count,
+                    'total': cz_total,
+                    'refund': Decimal(str(cz_stat['cz_refund_total'] or 0)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP),
+                    'positive': Decimal(str(cz_stat['cz_positive_total'] or 0)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                },
+                'fy_stat': {
+                    'count': fy_count,
+                    'total': fy_total,
+                    'refund': Decimal(str(fy_stat['fy_refund_total'] or 0)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP),
+                    'positive': Decimal(str(fy_stat['fy_positive_total'] or 0)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                }
+            }
+        finally:
+            conn.close()
+
     def get_patient_transfers(self, lsh: str) -> List[Dict[str, Any]]:
         """Query ward/bed transfers from his_zk."""
         conn = self.get_connection()
@@ -186,7 +271,7 @@ class HISReader:
         finally:
             conn.close()
 
-    def get_active_inpatients(self, department: Optional[str] = None) -> List[Dict[str, Any]]:
+    def get_active_inpatients(self, department: Optional[str] = None, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         """
         Fetch currently admitted patients (not yet discharged or settled).
         Identified where his_bl_sy.cysj IS NULL, or by active clinical fee activity without settlement.
@@ -194,8 +279,9 @@ class HISReader:
         conn = self.get_connection()
         cur = conn.cursor(as_dict=True)
         try:
-            sql = """
-            SELECT DISTINCT
+            top_clause = f"TOP ({int(limit)})" if limit else ""
+            sql = f"""
+            SELECT DISTINCT {top_clause}
                 sy.lsh AS zyh,
                 sy.xm AS patient_name,
                 sy.xb AS gender,
