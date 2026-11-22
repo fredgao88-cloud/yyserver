@@ -1,0 +1,41 @@
+services:
+  api:
+    build: .
+    image: hospital-agent-api:v1.2
+    container_name: hospital_agent_api
+    restart: unless-stopped
+    networks:
+      - hospital_internal
+    ports:
+      - "127.0.0.1:8000:8000"
+    env_file:
+      - .env
+    environment:
+      - ENV=${ENV:-production}
+      - PORT=${PORT:-8000}
+      - LOCAL_DB_HOST=${LOCAL_DB_HOST:-sqlserver}
+      - LOCAL_DB_PORT=${LOCAL_DB_PORT:-1433}
+      - LOCAL_DB_USER=${LOCAL_DB_USER:-sa}
+      - LOCAL_DB_PASS=${LOCAL_DB_PASS}
+      - LOCAL_DB_NAME=${LOCAL_DB_NAME:-his_agent_db}
+    volumes:
+      - .:/opt/hospital-agent
+
+  nginx:
+    image: nginx:alpine
+    container_name: hospital_agent_nginx
+    restart: unless-stopped
+    networks:
+      - hospital_internal
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/https.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - api
+
+networks:
+  hospital_internal:
+    driver: bridge

@@ -1,0 +1,16 @@
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+nginx/ssl/
+*.pem
+*.key
+*.crt
+data/*.xlsx
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.venv*
+tests/
