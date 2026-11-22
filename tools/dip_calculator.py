@@ -373,13 +373,28 @@ def match_dip_rule(
             "range_90_110": None
         }
 
+    # Step 7.5: 参保类型合规检查（当前统筹区仅支持职工医保与居民医保测算）
+    # 公费医疗、工伤等尚未核准映射的参保类型，统一标记 PENDING 并保留原类别，严禁盲目套用居民规则
+    is_employee = bool("职工" in ins_type or "城镇" in ins_type)
+    is_resident = bool("居民" in ins_type or "城乡" in ins_type or "农合" in ins_type)
+
+    if not is_employee and not is_resident:
+        return {
+            "matched": False,
+            "status": "PENDING",
+            "pending_reason": f"UNSUPPORTED_INS_TYPE:{ins_type}",
+            "message": f"参保类型【{ins_type}】不适用当前统筹区基本医保 DIP 测算基准（仅支持职工/居民），需人工核实，绝不盲目套用居民标准",
+            "rule_id": rule["rule_id"],
+            "rule_version": rule["rule_version"],
+            "ins_type": ins_type
+        }
+
     # Step 8: 从数据库字段动态读取参数计算基准金额（严禁硬编码系数）
     dip_score = Decimal(str(rule["dip_score"]))
     hosp_coef = Decimal(str(rule["hosp_coef"]))
     low_th = Decimal(str(rule["low_threshold"]))
     high_th = Decimal(str(rule["high_threshold"]))
 
-    is_employee = ("职工" in ins_type or "城镇" in ins_type)
     if is_employee:
         point_val = Decimal(str(rule["employee_point"]))
         base_unit = Decimal(str(rule["employee_base"]))

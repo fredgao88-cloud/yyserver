@@ -18,7 +18,7 @@ def parse_local_intent(text: str, channel: str = "web") -> Dict[str, Any]:
     text_clean = text.strip()
     
     # ---------------- 1. 渠道隔离与钉钉隐私盾牌 ----------------
-    if channel.lower() == "dingtalk":
+    if "dingtalk" in channel.lower():
         is_patient_query = bool(
             re.search(r'(\d+\s*床|床号|病床|大爷|大娘|大叔|阿姨|师傅|患者|病人|住院号|zy\d+|流水号|病案|姓名|花销|花了多少|费用|花了|花费|多少钱|自负|自付|自费|超标|预警|查房)', text_clean, re.I)
         )
@@ -26,7 +26,7 @@ def parse_local_intent(text: str, channel: str = "web") -> Dict[str, Any]:
             return {
                 "intent": "privacy_shielded",
                 "reply": "【院内业务安全提醒】根据医疗数据安全合规要求，涉及在院患者具体明细与控费预警信息不通过移动端回显。请使用工作站登录院内专属 HTTPS 工作台查看：\nhttps://hospital-internal.local/inpatient",
-                "data": {"shielded": True, "channel": "dingtalk"}
+                "data": {"shielded": True, "channel": channel}
             }
 
     # ---------------- 2. 报销口径前置澄清拦截 ----------------
@@ -45,8 +45,7 @@ def parse_local_intent(text: str, channel: str = "web") -> Dict[str, Any]:
             "data": {
                 "matched": False,
                 "status": "PENDING",
-                "pending_reason": "NEED_REIMBURSEMENT_CLARIFICATION",
-                "query": text_clean
+                "pending_reason": "NEED_REIMBURSEMENT_CLARIFICATION"
             }
         }
     reimburse_clarification = ""
@@ -169,35 +168,9 @@ def parse_local_intent(text: str, channel: str = "web") -> Dict[str, Any]:
             }
         }
 
-    # ---------------- 9. 宽泛病名且未指定治疗方案阻断 ----------------
-    # 例如只输入“68岁职工膝关节病”，未给明确编码也未指定保守还是手术
-    if not has_explicit_icd and disease == "膝关节病" and op_keyword is None:
-        return {
-            "intent": "need_clarification",
-            "reply": (
-                "【需要明确具体诊断或治疗方案】\n"
-                "检测到您输入了宽泛病名“膝关节病”，未提供明确 ICD 编码或治疗方案（保守治疗 / 关节镜手术等）。\n"
-                "根据院内 DIP 目录，膝关节病存在多种可能分组候选：\n"
-                "• 保守治疗分组（如 M17.9 未特指的膝关节病 保守治疗/中医优势）\n"
-                "• 手术操作分组（如关节镜下探查术、清理术或松解术）\n"
-                "在未明确具体治疗方案前，系统按合规要求暂不测算并暂不输出金额，请补充具体的临床诊断编码或明确治疗方式（保守或手术操作）。"
-            ),
-            "data": {
-                "matched": False,
-                "status": "PENDING",
-                "pending_reason": "AMBIGUOUS_BROAD_DIAGNOSIS",
-                "disease": disease,
-                "age": age,
-                "ins_type": ins_type,
-                "candidates": [
-                    {"group_name": "未特指的膝关节病:核心病种-保守治疗", "treatment": "保守治疗"},
-                    {"group_name": "未特指的膝关节病:核心病种-保守治疗&中医优势", "treatment": "中医优势保守治疗"},
-                    {"group_name": "膝关节病:手术操作组", "treatment": "关节镜/手术操作"}
-                ]
-            }
-        }
-
-    # ---------------- 10. 调用规则计算核心引擎 ----------------
+    # ---------------- 9. 调用规则计算核心引擎 ----------------
+    # 宽泛病名未指定方案、年龄区分、床日天数及参保类型合规等均由 match_dip_rule 核心引擎动态判定
+    # 彻底杜绝在路由层硬编码规则分组、分值与金额，完全依赖数据库生效规则
     res = match_dip_rule(
         disease=disease,
         age=age,
@@ -244,7 +217,13 @@ def parse_local_intent(text: str, channel: str = "web") -> Dict[str, Any]:
         if res.get("candidates"):
             reply += "候选分组列表：\n"
             for c in res["candidates"]:
-                reply += f"• #{c['rule_id']} {c['dip_group_name']} (分值: {c['dip_score']})\n"
+                grp_name = c.get('dip_group_name') or ''
+                op_name = c.get('op_name') or ''
+                aux = c.get('aux_detail') or ''
+                details = " | ".join([x for x in [op_name, aux] if x])
+                detail_str = f"（{details}）" if details else ""
+                reply += f"• #{c['rule_id']} {grp_name}{detail_str}\n"
+            reply += "在未明确具体治疗方案前，系统按合规要求暂不测算并暂不输出金额，请补充具体的临床诊断编码或明确治疗方式（保守或手术操作）。"
         reply += reimburse_clarification
         return {
             "intent": "need_clarification",

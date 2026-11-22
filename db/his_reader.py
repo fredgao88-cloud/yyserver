@@ -108,31 +108,70 @@ class HISReader:
     def get_case_fee_detail(self, lsh: str, settlement_id: Optional[str] = None) -> Dict[str, Any]:
         """
         Retrieve complete fee breakdown for reconciliation:
-        - his_zyjz master record
+        - his_zyjz master record (or aggregated admission-level settlements)
         - his_zycjz category amounts
         - his_zycz clinical items (sum & refund)
         - his_cfmain_fyjl pharmacy dispensing sum (sum & refund)
+        - reconciliation_scope: 'SINGLE_SETTLEMENT' or 'ADMISSION_LEVEL'
         """
         conn = self.get_connection()
         cur = conn.cursor(as_dict=True)
         try:
-            # 1. his_zyjz master
-            if settlement_id:
-                cur.execute("SELECT * FROM dbo.his_zyjz WHERE lsh = %s AND id = %s", (lsh, settlement_id))
-            else:
-                cur.execute("SELECT TOP 1 * FROM dbo.his_zyjz WHERE lsh = %s AND iszf = 0 ORDER BY jzrq DESC", (lsh,))
-            zyjz_record = cur.fetchone()
-            if not zyjz_record:
+            # 1. Query valid settlements for lsh
+            cur.execute("SELECT * FROM dbo.his_zyjz WHERE lsh = %s AND iszf = 0 ORDER BY jzrq ASC", (lsh,))
+            valid_settlements = cur.fetchall()
+            if not valid_settlements:
                 return {}
 
-            active_id = zyjz_record['id']
+            if settlement_id:
+                # Targeted single settlement reconciliation
+                cur.execute("SELECT * FROM dbo.his_zyjz WHERE lsh = %s AND id = %s", (lsh, settlement_id))
+                target_rec = cur.fetchone()
+                if not target_rec:
+                    return {}
+                zyjz_record = target_rec
+                active_ids = [target_rec['id']]
+                reconciliation_scope = "SINGLE_SETTLEMENT"
+            else:
+                if len(valid_settlements) == 1:
+                    zyjz_record = valid_settlements[0]
+                    active_ids = [zyjz_record['id']]
+                    reconciliation_scope = "SINGLE_SETTLEMENT"
+                else:
+                    # Multi-settlement case: clinical and pharmacy items are admission-level (linked by lsh).
+                    # Aggregate category ledgers and settlement master amounts across all valid settlements.
+                    reconciliation_scope = "ADMISSION_LEVEL"
+                    active_ids = [s['id'] for s in valid_settlements]
+                    total_amoney = sum((Decimal(str(s['amoney'])) for s in valid_settlements), Decimal('0'))
+                    total_czmoney = sum((Decimal(str(s.get('czmoney') or 0)) for s in valid_settlements), Decimal('0'))
+                    total_yjmoney = sum((Decimal(str(s.get('yjmoney') or 0)) for s in valid_settlements), Decimal('0'))
+                    total_yfmoney = sum((Decimal(str(s.get('yfmoney') or 0)) for s in valid_settlements), Decimal('0'))
+                    zyjz_record = {
+                        'lsh': lsh,
+                        'id': ','.join(str(i) for i in active_ids),
+                        'amoney': total_amoney,
+                        'czmoney': total_czmoney,
+                        'yjmoney': total_yjmoney,
+                        'yfmoney': total_yfmoney,
+                        'settlement_count': len(valid_settlements),
+                        'multi_settlements': valid_settlements
+                    }
 
             # 2. Category ledger (his_zycjz)
-            cur.execute("""
-            SELECT xmsflxid, amoney, ssmoney 
-            FROM dbo.his_zycjz 
-            WHERE lsh = %s AND id = %s
-            """, (lsh, active_id))
+            if len(active_ids) == 1:
+                cur.execute("""
+                SELECT xmsflxid, amoney, ssmoney 
+                FROM dbo.his_zycjz 
+                WHERE lsh = %s AND id = %s
+                """, (lsh, active_ids[0]))
+            else:
+                placeholders = ','.join(['%s'] * len(active_ids))
+                cur.execute(f"""
+                SELECT xmsflxid, SUM(amoney) as amoney, SUM(ssmoney) as ssmoney 
+                FROM dbo.his_zycjz 
+                WHERE lsh = %s AND id IN ({placeholders})
+                GROUP BY xmsflxid
+                """, [lsh] + active_ids)
             category_rows = cur.fetchall()
             category_sum = sum((Decimal(str(r['amoney'])) for r in category_rows), Decimal('0'))
 
@@ -161,6 +200,8 @@ class HISReader:
             fy_stat = cur.fetchone()
 
             return {
+                'reconciliation_scope': reconciliation_scope,
+                'settlement_count': len(valid_settlements),
                 'zyjz': zyjz_record,
                 'categories': category_rows,
                 'category_sum': category_sum,

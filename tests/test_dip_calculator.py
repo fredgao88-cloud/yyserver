@@ -126,8 +126,21 @@ def run_tests():
     assert m_self["status"] == "NOT_APPLICABLE", f"Expected NOT_APPLICABLE, got {m_self['status']}"
     print(f"PASS: M17.9 自费患者匹配 -> status={m_self['status']}, message={m_self['message']}")
 
+    # Case I: 未支持参保类型（如公费医疗、工伤），严禁套用居民标准，统一标 PENDING
+    print("\n--- [Test 4] 未支持参保类型合规拦截测试 ---")
+    m_gongfei = match_dip_rule("M17.9", age=68, ins_type="公费医疗", op_keyword="保守")
+    assert m_gongfei["status"] == "PENDING", f"Expected PENDING, got {m_gongfei['status']}"
+    assert m_gongfei["pending_reason"] == "UNSUPPORTED_INS_TYPE:公费医疗"
+    assert "benchmark_amount" not in m_gongfei
+    print(f"PASS: 公费医疗拦截 -> status={m_gongfei['status']}, reason={m_gongfei['pending_reason']}")
+
+    m_gongshang = match_dip_rule("M17.9", age=68, ins_type="工伤保险", op_keyword="保守")
+    assert m_gongshang["status"] == "PENDING", f"Expected PENDING, got {m_gongshang['status']}"
+    assert m_gongshang["pending_reason"] == "UNSUPPORTED_INS_TYPE:工伤保险"
+    print(f"PASS: 工伤保险拦截 -> status={m_gongshang['status']}, reason={m_gongshang['pending_reason']}")
+
     print("\n" + "=" * 60)
-    print(">>> 恭喜！全部 8 类核心测试用例 100% 通过！ <<<")
+    print(">>> 恭喜！全部 9 类核心测试用例 100% 通过！ <<<")
     print("=" * 60)
 
 if __name__ == "__main__":

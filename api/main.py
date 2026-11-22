@@ -14,6 +14,7 @@ from typing import Optional, List, Dict, Any
 from decimal import Decimal
 import sys
 import os
+import re
 
 # 确保能加载项目内部模块
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -44,7 +45,7 @@ class CheckPatientDipRequest(BaseModel):
     disease: str = Field(..., description="主要诊断编码或名称")
     current_cost: float = Field(..., description="当前住院累计费用（元）")
     age: Optional[int] = Field(None, description="患者周岁年龄")
-    ins_type: Optional[str] = Field("职工", description="参保类型：职工/居民/自费")
+    ins_type: Optional[str] = Field(None, description="参保类型：职工/居民/自费，缺失时触发待定追问")
     operation: Optional[str] = Field(None, description="已完成手术或操作名称")
     bed_days: Optional[int] = Field(None, description="在院床日天数（按床日付费必填）")
     rule_version: str = Field("2026_SAMPLE_V1", description="DIP 规则版本号")
@@ -74,8 +75,13 @@ async def query_dip_rule(req: QueryDipRuleRequest, x_operator_id: Optional[str] 
         rule_version=req.rule_version
     )
     
-    # 严格合规审计日志：仅记录清洗后的编码标识，绝不记录任何自由文本
-    clean_target = f"ICD:{req.disease.strip().upper()[:20]}"
+    # 严格合规审计日志：仅记录校验通过的标准规则ID或标准ICD，绝不截取记录用户自由文本
+    if result.get("matched"):
+        clean_target = f"RULE_ID:{result.get('rule_id')}"
+    elif result.get("disease_code"):
+        clean_target = f"ICD:{result['disease_code']}"
+    else:
+        clean_target = "QUERY:UNMATCHED"
     record_audit_log(
         operator_id=x_operator_id,
         role_type="DOCTOR",
@@ -102,8 +108,13 @@ async def check_patient_dip(req: CheckPatientDipRequest, x_operator_id: Optional
         rule_version=req.rule_version
     )
     
-    # 严格合规审计日志：仅记录去标识化患者唯一流水号，绝不记录任何患者文本
-    clean_target = f"PATIENT:{req.patient_id or 'UNSPECIFIED'}"
+    # 严格合规审计日志：仅记录去标识化患者唯一流水号或规则ID，绝不记录任何患者文本
+    if req.patient_id:
+        clean_target = f"PATIENT:{re.sub(r'[^a-zA-Z0-9_-]', '', req.patient_id)[:30]}"
+    elif rule_res.get("matched"):
+        clean_target = f"RULE_ID:{rule_res.get('rule_id')}"
+    else:
+        clean_target = "PATIENT:UNSPECIFIED"
     record_audit_log(
         operator_id=x_operator_id,
         role_type="DOCTOR",
@@ -165,7 +176,7 @@ async def check_patient_dip(req: CheckPatientDipRequest, x_operator_id: Optional
         benchmark=bm,
         low_threshold=low_th,
         high_threshold=high_th,
-        ins_type=req.ins_type or "职工"
+        ins_type=rule_res.get("ins_type") or "职工"
     )
     
     return {

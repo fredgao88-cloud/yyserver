@@ -58,7 +58,9 @@ def run_phase1_tests():
     assert "医院端 DIP 医保统筹支付基准" in res_3["reply"]
     # 澄清前严禁提前输出预估基准金额
     assert "2790.90" not in res_3["reply"]
-    print(f"PASS [Case 3]: 医生询问“能报多少” -> 成功前置澄清个人报销与医院DIP统筹口径，暂扣支付金额")
+    # 隐私防泄漏断言：严禁在 data 中回显原始 query
+    assert "query" not in res_3["data"]
+    print(f"PASS [Case 3]: 医生询问“能报多少” -> 成功前置澄清个人报销与医院DIP统筹口径，暂扣支付金额，且零患者原词泄漏")
 
     # ---------------- 用例 4: 参保类型缺失阻断 ----------------
     print("\n--- [Case 4] 参保类型缺失阻断 (严禁默认职工) ---")
@@ -101,15 +103,17 @@ def run_phase1_tests():
     assert res_5c["data"]["score"] == 602.5
     print(f"PASS [Case 5c]: 已完成操作 -> 命中手术分组 #{res_5c['data']['rule_id']} (分值: {res_5c['data']['score']})")
 
-    # ---------------- 用例 6: 钉钉渠道外部移动端隐私盾牌 ----------------
-    print("\n--- [Case 6] 钉钉渠道外部移动端隐私盾牌 ---")
+    # ---------------- 用例 6: 钉钉渠道外部移动端隐私盾牌 (含 DINGTALK_GROUP) ----------------
+    print("\n--- [Case 6] 钉钉渠道外部移动端隐私盾牌 (含 DINGTALK_GROUP) ---")
     query_6 = "帮我查一下3床张大爷现在花了多少钱"
-    res_6_ding = parse_local_intent(query_6, channel="dingtalk")
-    assert res_6_ding["intent"] == "privacy_shielded"
-    assert "https://hospital-internal.local/inpatient" in res_6_ding["reply"]
-    assert "张大爷" not in res_6_ding["reply"]
-    assert "3床" not in res_6_ding["reply"]
-    print(f"PASS [Case 6]: 钉钉端查床(帮我查一下3床张大爷现在花了多少钱) -> 成功触发隐私盾牌，仅返回院内入口，绝不回显患者私密信息")
+    for ch in ("dingtalk", "DINGTALK_GROUP", "dingtalk_group", "DINGTALK"):
+        res_6_ding = parse_local_intent(query_6, channel=ch)
+        assert res_6_ding["intent"] == "privacy_shielded"
+        assert "https://hospital-internal.local/inpatient" in res_6_ding["reply"]
+        assert "张大爷" not in res_6_ding["reply"]
+        assert "3床" not in res_6_ding["reply"]
+        assert "query" not in res_6_ding["data"]
+    print(f"PASS [Case 6]: 钉钉端/钉钉群聊查床(帮我查一下3床张大爷现在花了多少钱) -> 成功触发隐私盾牌，仅返回院内入口，绝不回显患者私密信息")
 
     print("\n" + "=" * 70)
     print(">>> 恭喜！Phase 1 验收回归测试套件 6 大关键测试集全部 100% 通过！ <<<")

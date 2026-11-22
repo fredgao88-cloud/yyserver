@@ -41,12 +41,17 @@ class InpatientScanner:
     def map_insurance_type(self, ylzffs: Optional[str], fylx: Optional[str]) -> str:
         """Map HIS payment/insurance codes to standard insurance category."""
         if fylx:
-            if "自费" in fylx:
+            fylx_s = str(fylx).strip()
+            if "自费" in fylx_s:
                 return "自费"
-            if "职工" in fylx:
+            if "职工" in fylx_s or "城镇" in fylx_s:
                 return "职工"
-            if "居民" in fylx or "新农合" in fylx:
+            if "居民" in fylx_s or "新农合" in fylx_s or "城乡" in fylx_s or "农合" in fylx_s:
                 return "居民"
+            if "公费" in fylx_s:
+                return "公费医疗"
+            if fylx_s:
+                return fylx_s
 
         if ylzffs:
             s = str(ylzffs).strip()
@@ -58,6 +63,7 @@ class InpatientScanner:
                 return "自费"
             if s == "3":
                 return "公费医疗"
+            return f"OTHER_{s}"
 
         return "UNKNOWN"
 
@@ -170,12 +176,18 @@ class InpatientScanner:
                 alert_level = "PENDING"
                 pending_reason = None
 
+                is_employee = bool("职工" in ins_type or "城镇" in ins_type)
+                is_resident = bool("居民" in ins_type or "城乡" in ins_type or "农合" in ins_type)
+
                 if ins_type == "自费":
                     alert_level = "NOT_APPLICABLE"
                     pending_reason = "SELF_PAY"
                 elif ins_type == "UNKNOWN":
                     alert_level = "PENDING"
                     pending_reason = "MISSING_INS_TYPE"
+                elif not is_employee and not is_resident:
+                    alert_level = "PENDING"
+                    pending_reason = f"UNSUPPORTED_INS_TYPE:{ins_type}"
                 elif not diag_code and not diag_name and not op_kw:
                     alert_level = "PENDING"
                     pending_reason = "MISSING_DIAGNOSIS"
@@ -196,31 +208,37 @@ class InpatientScanner:
 
                     if match_res.get("matched"):
                         matched_rule_id = match_res.get("rule_id")
-                        target_base = Decimal(str(match_res["benchmark_amount"]))
+                        bench_val = match_res.get("benchmark_amount")
+                        target_base = Decimal(str(bench_val)) if bench_val is not None else None
 
-                        low_th = Decimal(str(match_res.get("low_threshold") or "0.9000"))
-                        high_th = Decimal(str(match_res.get("high_threshold") or "1.1000"))
-
-                        eval_res = evaluate_traffic_light(
-                            current_cost=current_fee,
-                            benchmark=target_base,
-                            low_threshold=low_th,
-                            high_threshold=high_th,
-                            ins_type=ins_type
-                        )
-
-                        light = eval_res.get("light")
-                        if light == "绿灯":
-                            alert_level = "GREEN"
-                        elif light == "黄灯":
-                            alert_level = "YELLOW"
-                        elif light == "红灯":
-                            alert_level = "RED"
-                        else:
+                        if target_base is None or target_base <= Decimal('0'):
                             alert_level = "PENDING"
+                            pending_reason = "INVALID_BENCHMARK"
+                            fee_ratio = None
+                        else:
+                            low_th = Decimal(str(match_res.get("low_threshold") or "0.9000"))
+                            high_th = Decimal(str(match_res.get("high_threshold") or "1.1000"))
 
-                        fee_ratio = (current_fee / target_base).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
-                        pending_reason = eval_res.get("boundary_note")
+                            eval_res = evaluate_traffic_light(
+                                current_cost=current_fee,
+                                benchmark=target_base,
+                                low_threshold=low_th,
+                                high_threshold=high_th,
+                                ins_type=ins_type
+                            )
+
+                            light = eval_res.get("light")
+                            if light == "绿灯":
+                                alert_level = "GREEN"
+                            elif light == "黄灯":
+                                alert_level = "YELLOW"
+                            elif light == "红灯":
+                                alert_level = "RED"
+                            else:
+                                alert_level = "PENDING"
+
+                            fee_ratio = (current_fee / target_base).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+                            pending_reason = eval_res.get("boundary_note")
                     else:
                         alert_level = "PENDING"
                         pending_reason = match_res.get("pending_reason", match_res.get("status", "UNMATCHED"))
@@ -288,8 +306,8 @@ class InpatientScanner:
                     'ins_type': ins_type,
                     'primary_icd': diag_code,
                     'current_fee': float(current_fee),
-                    'target_base': float(target_base) if target_base else None,
-                    'fee_ratio': float(fee_ratio) if fee_ratio else None,
+                    'target_base': float(target_base) if target_base is not None else None,
+                    'fee_ratio': float(fee_ratio) if fee_ratio is not None else None,
                     'alert_level': alert_level,
                     'pending_reason': pending_reason
                 })

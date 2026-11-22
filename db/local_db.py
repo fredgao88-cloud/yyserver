@@ -5,7 +5,11 @@
 支持容器内与宿主机环境无缝切换，提供规则库检索、在院快照保存与合规审计日志记录
 """
 import os
-import pymssql
+try:
+    import pymssql
+except ImportError:
+    pymssql = None
+
 from decimal import Decimal
 from typing import List, Dict, Any, Optional, Tuple
 from dotenv import load_dotenv
@@ -18,16 +22,18 @@ if os.path.exists(dotenv_path):
 LOCAL_DB_HOST = os.getenv("LOCAL_DB_HOST", "sqlserver")
 LOCAL_DB_PORT = int(os.getenv("LOCAL_DB_PORT", "1433"))
 LOCAL_DB_USER = os.getenv("LOCAL_DB_USER", "sa")
-LOCAL_DB_PASS = os.getenv("LOCAL_DB_PASS")
-if not LOCAL_DB_PASS:
-    raise ValueError("LOCAL_DB_PASS environment variable must be explicitly configured and non-empty.")
+LOCAL_DB_PASS = os.getenv("LOCAL_DB_PASS", "")
 LOCAL_DB_NAME = os.getenv("LOCAL_DB_NAME", "his_agent_db")
 
-def get_local_db_connection(as_dict: bool = True) -> Tuple[Any, pymssql.Connection]:
+def get_local_db_connection(as_dict: bool = True) -> Tuple[Any, Any]:
     """
     获取 his_agent_db 数据库连接。
     具备自适应宿主机与容器环境能力：优先尝试环境变量配置的 HOST，若连接失败则自动尝试回退地址
     """
+    if pymssql is None:
+        raise RuntimeError("pymssql is not installed.")
+    if not LOCAL_DB_PASS:
+        raise ValueError("LOCAL_DB_PASS environment variable must be explicitly configured and non-empty.")
     candidates = [LOCAL_DB_HOST]
     for fallback in ["127.0.0.1", "localhost", "sqlserver"]:
         if fallback not in candidates:

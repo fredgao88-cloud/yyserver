@@ -212,6 +212,173 @@ def run_inpatient_scanner_test_suite():
     assert res_e['status'] == "NOT_APPLICABLE"
     print("  [PASS] Test 2 精确判灯端点全部通过。")
 
+    # -----------------------------------------------------------------
+    # Test 3: 零基准容错测试 (单批次包含零基准病例与正常病例，两者均成功入库，绝不崩溃)
+    # -----------------------------------------------------------------
+    print("\n[Test 3] 验证零基准防崩机制 (同一批次第1条零基准、第2条正常，两者均成功写入快照)...")
+    import tools.inpatient_scanner as scanner_module
+    orig_match = scanner_module.match_dip_rule
+
+    zero_batch_id = "BATCH_ZERO_BENCHMARK_TEST_001"
+    cases_test3 = [
+        {
+            'zyh': 'SYNTH_ZERO_BENCH_01',
+            'patient_name': '零基准患者',
+            'gender': '男',
+            'age': '68',
+            'current_dept': '骨伤科',
+            'current_bed': '02床',
+            'admission_time': '2026-11-20 08:30:00',
+            'current_stay_days': '3',
+            'attending_doctor': '测试医生',
+            'dept_director': '测试主任',
+            'admission_diag_code': 'M17.9',
+            'admission_diag_name': '未特指的膝关节病',
+            'ssmc1': '保守治疗',
+            'ylzffs': '01',
+            'insurance_type': '职工'
+        },
+        {
+            'zyh': 'SYNTH_NORMAL_CASE_02',
+            'patient_name': '正常患者',
+            'gender': '女',
+            'age': '68',
+            'current_dept': '骨伤科',
+            'current_bed': '03床',
+            'admission_time': '2026-11-20 08:30:00',
+            'current_stay_days': '3',
+            'attending_doctor': '测试医生',
+            'dept_director': '测试主任',
+            'admission_diag_code': 'M17.9',
+            'admission_diag_name': '未特指的膝关节病',
+            'ssmc1': '保守治疗',
+            'ylzffs': '01',
+            'insurance_type': '职工'
+        }
+    ]
+
+    class MockMultiCaseHISReader(HISReader):
+        def __init__(self, cases):
+            self._cases = cases
+        def get_active_inpatients(self, department=None, limit=None):
+            return self._cases
+        def get_active_patient_fee(self, lsh, cutoff_time=None):
+            return {
+                'lsh': lsh,
+                'has_activity': True,
+                'cz_count': 5,
+                'fy_count': 1,
+                'cz_total': Decimal('2000.00'),
+                'fy_total': Decimal('450.00'),
+                'total_fee': Decimal('2450.00'),
+                'cz_stat': {'count': 5, 'total': Decimal('2000.00'), 'refund': Decimal('0'), 'positive': Decimal('2000.00')},
+                'fy_stat': {'count': 1, 'total': Decimal('450.00'), 'refund': Decimal('0'), 'positive': Decimal('450.00')}
+            }
+        def get_settled_cases(self, limit=50, department=None):
+            return []
+
+    mock_r3 = MockMultiCaseHISReader(cases_test3)
+    s3 = InpatientScanner(rule_version="2026_SAMPLE_V1")
+    s3.his_reader = mock_r3
+
+    call_tracker = {'count': 0}
+    def mock_match_dip(disease, **kwargs):
+        call_tracker['count'] += 1
+        res = orig_match(disease, **kwargs)
+        if call_tracker['count'] == 1:
+            res_zero = dict(res)
+            res_zero["benchmark_amount"] = 0.0
+            return res_zero
+        return res
+
+    scanner_module.match_dip_rule = mock_match_dip
+    try:
+        res_batch3 = s3.scan_and_snapshot(batch_id=zero_batch_id, include_recent_settled=False)
+        assert res_batch3['total_scanned'] == 2, f"Expected 2 scanned, got {res_batch3['total_scanned']}"
+        assert res_batch3['PENDING'] == 1, f"Expected 1 PENDING, got {res_batch3['PENDING']}"
+        assert res_batch3['GREEN'] == 1, f"Expected 1 GREEN, got {res_batch3['GREEN']}"
+
+        cur, conn = get_local_db_connection(as_dict=True)
+        try:
+            cur.execute("""
+            SELECT visit_id, target_base, fee_ratio, alert_level, pending_reason
+            FROM dbo.inpatient_dip_snapshot
+            WHERE batch_id = %s
+            ORDER BY visit_id
+            """, (zero_batch_id,))
+            rows = cur.fetchall()
+            assert len(rows) == 2, f"Expected 2 rows in DB snapshot, got {len(rows)}"
+            
+            normal_row = [r for r in rows if r['visit_id'] == 'SYNTH_NORMAL_CASE_02'][0]
+            assert normal_row['alert_level'] == 'GREEN'
+            assert normal_row['target_base'] == Decimal('2790.90')
+            assert normal_row['fee_ratio'] is not None
+
+            zero_row = [r for r in rows if r['visit_id'] == 'SYNTH_ZERO_BENCH_01'][0]
+            assert zero_row['alert_level'] == 'PENDING'
+            assert zero_row['pending_reason'] == 'INVALID_BENCHMARK'
+            assert zero_row['fee_ratio'] is None
+            print("  -> Zero-benchmark case successfully marked PENDING (INVALID_BENCHMARK) without DivisionByZero crash.")
+            print("  -> Both cases successfully persisted to dbo.inpatient_dip_snapshot.")
+
+            cur.execute("DELETE FROM dbo.inpatient_dip_snapshot WHERE batch_id = %s", (zero_batch_id,))
+            conn.commit()
+        finally:
+            conn.close()
+    finally:
+        scanner_module.match_dip_rule = orig_match
+    print("  [PASS] Test 3 零基准防崩与批次双用例完整落库测试通过！")
+
+    # -----------------------------------------------------------------
+    # Test 4: 公费医疗等未支持参保类型合规拦截测试
+    # -----------------------------------------------------------------
+    print("\n[Test 4] 验证公费医疗拦截 (严禁套用居民标准，统一标记 PENDING)...")
+    gongfei_batch_id = "BATCH_GONGFEI_TEST_001"
+    cases_test4 = [{
+        'zyh': 'SYNTH_GONGFEI_01',
+        'patient_name': '公费医疗患者',
+        'gender': '男',
+        'age': '68',
+        'current_dept': '骨伤科',
+        'current_bed': '05床',
+        'admission_time': '2026-11-20 08:30:00',
+        'current_stay_days': '3',
+        'attending_doctor': '测试医生',
+        'dept_director': '测试主任',
+        'admission_diag_code': 'M17.9',
+        'admission_diag_name': '未特指的膝关节病',
+        'ssmc1': '保守治疗',
+        'ylzffs': '3',
+        'insurance_type': '公费医疗'
+    }]
+    mock_r4 = MockMultiCaseHISReader(cases_test4)
+    s4 = InpatientScanner(rule_version="2026_SAMPLE_V1")
+    s4.his_reader = mock_r4
+
+    res_batch4 = s4.scan_and_snapshot(batch_id=gongfei_batch_id, include_recent_settled=False)
+    assert res_batch4['total_scanned'] == 1
+    assert res_batch4['PENDING'] == 1, f"Expected 1 PENDING, got {res_batch4}"
+    
+    cur, conn = get_local_db_connection(as_dict=True)
+    try:
+        cur.execute("""
+        SELECT visit_id, ins_type, target_base, alert_level, pending_reason
+        FROM dbo.inpatient_dip_snapshot
+        WHERE batch_id = %s
+        """, (gongfei_batch_id,))
+        r_gf = cur.fetchone()
+        assert r_gf is not None
+        assert r_gf['ins_type'] == '公费医疗'
+        assert r_gf['alert_level'] == 'PENDING'
+        assert 'UNSUPPORTED_INS_TYPE' in r_gf['pending_reason']
+        print(f"  -> 公费医疗患者: ins_type={r_gf['ins_type']}, alert_level={r_gf['alert_level']}, reason={r_gf['pending_reason']}")
+
+        cur.execute("DELETE FROM dbo.inpatient_dip_snapshot WHERE batch_id = %s", (gongfei_batch_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    print("  [PASS] Test 4 公费医疗合规拦截测试通过！")
+
     print("\n" + "=" * 70)
     print("  ALL INPATIENT SCANNER TESTS PASSED (100% COMPLIANT WITH v1.2)")
     print("=" * 70)
