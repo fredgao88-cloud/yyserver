@@ -48,18 +48,32 @@ NEGATION_PREFIXES = r'(?:非|不按|未按|不采用|未采用|排除|除外|不
 # 项目级范围限定词（前置出现时说明自费仅限具体项目，非整单险种）
 ITEM_SCOPE_PREFIXES = r'(?:耗材|材料|药品|西药|中药|草药|药|检查|检验|化验|治疗|手术耗材|特需|服务|部分项目|项目|部分|目录外|丙类)'
 
+# 整单范围词：出现在项目范围词与“自费”之间时，说明是整单自费指令而非项目级自费
+WHOLE_BILL_SCOPE = r'(?:本次住院|整次住院|住院费用|整单|整次|本次费用)'
+
+def has_whole_bill_self_pay(c: str) -> bool:
+    """整单自费判定：项目范围词（如“检查”）后出现“本次住院/整单”等整单范围词再接自费结算，
+    则该指令作用于整次住院（如“经检查本次住院按自费结算”），而非项目级自费。
+    整单范围词的优先级高于词语距离。"""
+    return bool(re.search(
+        r'(?:' + ITEM_SCOPE_PREFIXES + r')[^，。；,;]{0,8}?' + WHOLE_BILL_SCOPE + r'[^，。；,;]{0,6}?(?:按|以|属于|采用)\s*自费',
+        c
+    ))
+
 def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
     """
-    统一参保类型归一化与前置合规审查核心函数 (Round 11 优化版)：
+    统一参保类型归一化与前置合规审查核心函数 (Round 12 优化版)：
     1. 统一别名库：否定匹配与肯定匹配 100% 共享相同别名表，精准支持“城乡居民”等复合险种；
     2. 针对性选择疑问句识别：仅当选择词连接的是两类及以上不同险种时触发 AMBIGUOUS_INS_TYPE，
        若用户已确认险种而后文仅询问临床方案（如“保守还是手术”），绝不误判险种歧义；
        且选择词判定只在非历史、非否定的活跃分句内进行，历史疑问不压制当前确认；
     3. “更正为/修改为/调整为”明确覆盖：后置更正指令强力覆盖既往/前置指令；
-       但“暂不更正/不更正/无需更正”等明确否定保留原险种；“是否需要更正为…”等询问形式
-       一律先澄清（CORRECTION_UNCONFIRMED），绝不擅自更改测算口径；
+       但“暂不更正/不更正/无需更正”等明确否定保留原险种；“是否需要更正为…”“需要更正为…吗”
+       等询问形式（含句尾“吗/呢/吧”疑问标记）一律先澄清（CORRECTION_UNCONFIRMED），绝不擅自更改测算口径；
+       多次更正并存时按语句先后判断最后一次更正请求的状态：询问在后则澄清，确认在后则以确认更正为准；
     4. 支付范围前置隔离：“耗材按自费项目结算”“进口耗材单独按自费项目结算”精准判定为
        项目级自费（范围词与动词间允许“单独/需要”等填充词），整单按基本医保正常测算；
+       但“经检查本次住院按自费结算”等含整单范围词（本次住院/整单）的指令优先于词语距离，按整单自费处理；
     5. 待查多符号与多字段解耦：冒号、破折号无缝支持，参保待查与病理待查互不干扰；
     6. 仅有否定险种强力拦截并省略金额。
     """
@@ -100,12 +114,13 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
         # 检查是否属于项目级自费
         # 包含：明确词“部分项目自费/自费项目”或者“<项目范围>按自费/自费结算”
         # 范围词与动词之间允许少量填充词（如“单独/需要/均”），如“进口耗材单独按自费项目结算”
+        # 但若范围词与自费动词之间出现“本次住院/整单”等整单范围词，则属于整单自费（如“经检查本次住院按自费结算”）
         is_item_level_self_pay = False
         if re.search(r'(?:部分项目自费|项目自费|自费项目|部分自费|自费药品|自费耗材|自费药|自费部分|目录外自费)', c):
             is_item_level_self_pay = True
-        elif re.search(ITEM_SCOPE_PREFIXES + r'[^\w\s]*(?:按|以|属于|采用)?\s*自费', c):
+        elif not has_whole_bill_self_pay(c) and re.search(ITEM_SCOPE_PREFIXES + r'[^\w\s]*(?:按|以|属于|采用)?\s*自费', c):
             is_item_level_self_pay = True
-        elif re.search(ITEM_SCOPE_PREFIXES + r'[^，。；,;、\s]{1,6}(?:按|以|属于|采用)\s*自费', c):
+        elif not has_whole_bill_self_pay(c) and re.search(ITEM_SCOPE_PREFIXES + r'[^，。；,;、\s]{1,6}(?:按|以|属于|采用)\s*自费', c):
             is_item_level_self_pay = True
 
         clause_info.append({
@@ -143,6 +158,7 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
     # 注意：若指令前存在“耗材/药品/检查”等项目修饰词，属于项目自费，严禁提取为整单结算指令！
     directive_records = []  # 记录 (category, is_correction, clause_index)
     correction_question_target = None  # “是否需要更正为X”等询问形式的目标险种（先澄清，绝不擅自更改）
+    correction_question_clause_idx = -1  # 更正询问所在分句序号（用于按语句先后判断最后一次更正请求的状态）
 
     # 指令匹配正则：支持“本次按/采用/转为/以”以及更正词“更正为/修改为/调整为”
     # 使用统一别名表 INS_ALIAS_COMBINED
@@ -152,7 +168,7 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
 
     # 更正动词前置否定/疑问识别（如“暂不更正为居民医保”/“是否需要更正为居民医保？”）
     corr_neg_pre = re.compile(r'(?:暂不|不需要|无需|无须|不予|勿|别|不|未)$')
-    corr_question_pre = re.compile(r'(?:是否需要|要不要|能否|可否|可不可以|是否)$')
+    corr_question_pre = re.compile(r'(?:是否需要|要不要|需要|能否|可否|可不可以|是否)$')
 
     for idx, ci in enumerate(clause_info):
         if ci['is_historical'] or ci['is_negated']:
@@ -171,8 +187,11 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
             if is_corr_verb and corr_neg_pre.search(pre_text):
                 continue
 
-            # 疑问形式的更正询问（“是否需要更正为居民医保？”）：先澄清，绝不擅自更改口径
-            if is_corr_verb and corr_question_pre.search(pre_text):
+            # 疑问形式的更正询问（“是否需要更正为居民医保？”/“需要更正为居民医保吗？”）：先澄清，绝不擅自更改口径
+            # 除动词前的疑问词外，句尾“吗/呢/吧”等疑问语气标记同样表明更正处于询问状态，确认前严禁执行
+            post_text = c[m.end():].strip()
+            is_question_form = bool(corr_question_pre.search(pre_text)) or bool(re.search(r'(?:吗|嘛|么|呢|吧)$', post_text))
+            if is_corr_verb and is_question_form:
                 q_t = raw_tgt
                 if re.search(INS_ALIAS_GF, q_t):
                     correction_question_target = '公费医疗'
@@ -184,13 +203,16 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
                     correction_question_target = '居民'
                 elif re.search(INS_ALIAS_EMP, q_t):
                     correction_question_target = '职工'
+                correction_question_clause_idx = idx
                 continue
 
             # 检查指令前面是否紧挨着“耗材/药品/检查”等项目范围限定词
             # 如“耗材按自费项目结算”中的“按自费”；
             # 范围词与动词之间允许少量填充词（如“进口耗材单独按自费项目结算”），仅对自费目标生效
             is_self_pay_target = bool(re.search(INS_ALIAS_ZF, raw_tgt))
-            if is_self_pay_target and re.search(ITEM_SCOPE_PREFIXES + r'[^，。；,;、\s]{0,6}$', pre_text):
+            # 项目范围词守卫不适用于整单自费指令：“本次住院/整单”等整单范围词优先于词语距离
+            # （如“经检查本次住院按自费结算”中虽有“检查”，但明确作用于整次住院，绝不跳过）
+            if is_self_pay_target and not has_whole_bill_self_pay(c) and re.search(ITEM_SCOPE_PREFIXES + r'[^，。；,;、\s]{0,6}$', pre_text):
                 # 属于项目范围自费，绝不作为整单住院指令！
                 continue
             if not is_self_pay_target and re.search(ITEM_SCOPE_PREFIXES + r'[^\w\s]*$', pre_text):
@@ -218,7 +240,10 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
                 })
 
     # 3.0 更正询问未确认：先澄清，保留当前口径，绝不擅自更改险种
-    if correction_question_target and not any(d['is_correction'] for d in directive_records):
+    # 按语句先后判断最后一次更正请求的状态：仅当更正询问出现在最后一次已确认更正之后时才阻断；
+    # 若询问之后已有明确确认更正（如“是否需要更正为居民？已确认更正为职工”），以确认的更正为准
+    last_confirmed_corr_idx = max((d['clause_idx'] for d in directive_records if d['is_correction']), default=-1)
+    if correction_question_target and correction_question_clause_idx > last_confirmed_corr_idx:
         return {
             'valid': False,
             'category': None,
