@@ -6,6 +6,7 @@ services:
     restart: unless-stopped
     networks:
       - hospital_internal
+      - hospital_edge
     ports:
       - "127.0.0.1:8000:8000"
     env_file:
