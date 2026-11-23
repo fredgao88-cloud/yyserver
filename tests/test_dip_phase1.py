@@ -229,8 +229,65 @@ def run_phase1_tests():
     assert "2790.90" in res_9e["reply"]
     print("PASS [Case 9e]: “原参保类型待查，现已确认本次按职工医保结算” -> 历史待查不压制当前确认 ￥2790.90")
 
+    # ---------------- 用例 10: Round 9 审查验收 (否定险种不回退确定结果、待查冒号与多字段解耦、选择疑问句与项目自费) ----------------
+    print("\n--- [Case 10] Round 9 审查验收 (否定险种追问、待查冒号与多字段解耦、选择疑问句与项目自费) ---")
+    # 10a. 本次未按职工医保结算 -> 仅排除险种未说明实际险种，严禁回退为职工，必须追问并省略金额
+    q_10a = "68岁，本次未按职工医保结算，M17.9，保守治疗"
+    res_10a = parse_local_intent(q_10a)
+    assert res_10a["intent"] == "need_clarification"
+    assert res_10a["data"]["status"] == "PENDING"
+    assert res_10a["data"]["pending_reason"] == "MISSING_INS_TYPE"
+    assert "2790.90" not in res_10a["reply"]
+    print("PASS [Case 10a]: “本次未按职工医保结算” -> 仅有否定险种，拦截并追问，彻底省略金额")
+
+    # 10b. 本次不采用居民医保 -> 仅排除险种未说明实际险种，严禁回退为居民，必须追问并省略金额
+    q_10b = "68岁，本次不采用居民医保，M17.9，保守治疗"
+    res_10b = parse_local_intent(q_10b)
+    assert res_10b["intent"] == "need_clarification"
+    assert res_10b["data"]["status"] == "PENDING"
+    assert res_10b["data"]["pending_reason"] == "MISSING_INS_TYPE"
+    assert "2604.84" not in res_10b["reply"]
+    print("PASS [Case 10b]: “本次不采用居民医保” -> 仅有否定险种，拦截并追问，彻底省略金额")
+
+    # 10c. 企业职工，参保类型：待查 (含中文冒号) -> 精准识别待查，拦截并追问
+    q_10c = "68岁，企业职工，参保类型：待查，M17.9，保守治疗"
+    res_10c = parse_local_intent(q_10c)
+    assert res_10c["intent"] == "need_clarification"
+    assert res_10c["data"]["status"] == "PENDING"
+    assert res_10c["data"]["pending_reason"] == "MISSING_INS_TYPE"
+    assert "2790.90" not in res_10c["reply"]
+    print("PASS [Case 10c]: “企业职工，参保类型：待查”(含冒号) -> 正确识别待查，阻断测算")
+
+    # 10d. 企业职工，病理类型待查且参保类型待查 -> 多字段待查完全解耦，不屏蔽参保待查
+    q_10d = "68岁，企业职工，病理类型待查且参保类型待查，M17.9，保守治疗"
+    res_10d = parse_local_intent(q_10d)
+    assert res_10d["intent"] == "need_clarification"
+    assert res_10d["data"]["status"] == "PENDING"
+    assert res_10d["data"]["pending_reason"] == "MISSING_INS_TYPE"
+    assert "2790.90" not in res_10d["reply"]
+    print("PASS [Case 10d]: “企业职工，病理类型待查且参保类型待查” -> 字段解耦，拦截并追问")
+
+    # 10e. 按职工医保还是按居民医保结算？ -> 选择疑问句消歧，标记 AMBIGUOUS_INS_TYPE 追问
+    q_10e = "68岁，按职工医保还是按居民医保结算？M17.9，保守治疗"
+    res_10e = parse_local_intent(q_10e)
+    assert res_10e["intent"] == "need_clarification"
+    assert res_10e["data"]["status"] == "PENDING"
+    assert res_10e["data"]["pending_reason"] == "AMBIGUOUS_INS_TYPE"
+    assert "2790.90" not in res_10e["reply"]
+    assert "2604.84" not in res_10e["reply"]
+    print("PASS [Case 10e]: “按职工医保还是按居民医保结算？” -> 识别选择疑问句，拦截追问")
+
+    # 10f. 职工医保，部分项目自费 -> 项目级自费不拦截整单医保测算，正常测算职工基准 ￥2790.90
+    q_10f = "68岁，职工医保，部分项目自费，M17.9，保守治疗"
+    res_10f = parse_local_intent(q_10f)
+    assert res_10f["intent"] == "query_dip_rule"
+    assert res_10f["data"]["matched"] is True
+    assert res_10f["data"]["benchmark_amount"] == 2790.90
+    assert "2790.90" in res_10f["reply"]
+    print("PASS [Case 10f]: “职工医保，部分项目自费” -> 项目级自费兼容，正常测算职工基准 ￥2790.90")
+
     print("\n" + "=" * 70)
-    print(">>> 恭喜！Phase 1 验收回归测试套件全部 9 大关键测试集 100% 通过！ <<<")
+    print(">>> 恭喜！Phase 1 验收回归测试套件全部 10 大关键测试集 100% 通过！ <<<")
     print("=" * 70)
 
 if __name__ == "__main__":

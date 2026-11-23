@@ -54,23 +54,34 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
         }
 
     import re
-    # 分句拆分：按中英文逗号、句号、分号、换行符分割，支持分句时态与否定消歧
-    clauses = [c.strip() for c in re.split(r'[,，;；。\n]+', s) if c.strip()]
+
+    # 检查是否包含选择疑问句关键词 (如 "还是", "或者", "或")
+    is_choice_question = bool(re.search(r'(?:还是|或者|亦或|[与和]\s*.*(?:哪个|哪种))', s))
+
+    # 1. 分句拆分：按中英文逗号、句号、分号、问号、感叹号、换行符分割
+    clauses = [c.strip() for c in re.split(r'[,，;；。?!？！\n]+', s) if c.strip()]
     clause_info = []
+
+    # 否定模式前缀正则
+    negation_prefix_pattern = r'(?:非|不按|未按|不采用|未采用|排除|除外|不是|不属于|否认|不使用|未使用|不以|未以)'
+
     for c in clauses:
         is_historical = bool(re.search(r'(?:原|既往|过去|曾|之前|既往的)', c))
-        is_negated = bool(re.search(r'(?:非|不按|不采用|排除|除外|不是|不属于|否认|未按)', c))
+        is_negated = bool(re.search(negation_prefix_pattern, c))
         is_closed = bool(re.search(r'(?:已结案|已结清|结案|已终结)', c))
         is_current_directive = bool(re.search(r'(?:本次|现|当前|此次|现已|确认|转为|以|按)', c))
 
-        # 检查参保待查：严格限定为参保/险种/医保字段（允许中间含任意空白字符，如'参保类型 待查'）
-        # 且显式排除'病理类型'、'手术类型'、'组织类型'、'诊断类型'等非医保字段待查
+        # 检查参保类型待查：
+        # 支持冒号（中文全角 ： 与英文半角 :）、空格、破折号、等号、“为”
+        # 且与病理/手术/诊断等临床类型完全解耦，独立匹配
         has_ins_pending = False
-        if not re.search(r'(?:病理|手术|组织|诊断|骨折|病种|治疗)类型', c):
-            if re.search(r'(?:参保类型|参保|险种类型|险种|医保类型|医保)\s*(?:待查|待定|未定|未知|不详|不清|未明确|暂不知)', c):
-                has_ins_pending = True
-            elif re.search(r'^(?:待查|待定|未定|未知|未明确)$', c):
-                has_ins_pending = True
+        if re.search(r'(?:参保类型|参保险种|险种类型|医保类型|参保身份|参保|险种|医保)[：:\s\-为=是]*(?:待查|待定|未定|未知|不详|不清|未明确|暂不知|暂未确定|未确定)', c):
+            has_ins_pending = True
+        elif re.search(r'^(?:待查|待定|未定|未知|未明确|不详)$', c) and any(k in s for k in ('参保', '险种', '医保类型')):
+            has_ins_pending = True
+
+        # 检查是否属于项目级自费 (部分项目自费/自费项目/自费药品等)
+        is_item_level_self_pay = bool(re.search(r'(?:部分项目自费|项目自费|自费项目|部分自费|自费药品|自费耗材|自费药|自费部分|目录外自费)', c))
 
         clause_info.append({
             'text': c,
@@ -78,10 +89,11 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
             'is_negated': is_negated,
             'is_closed': is_closed,
             'is_current': is_current_directive,
-            'has_ins_pending': has_ins_pending
+            'has_ins_pending': has_ins_pending,
+            'is_item_self_pay': is_item_level_self_pay
         })
 
-    # 检查是否存在活跃的待查表述（历史时态的'原参保类型待查'若伴随当前确认，不压制当前确认）
+    # 2. 检查是否存在活跃的待查表述（历史时态的'原参保类型待查'若伴随当前确认指令，不压制当前确认）
     has_active_current_confirm = any(
         ci['is_current'] and not ci['is_negated'] and not ci['is_historical'] and not ci['has_ins_pending']
         and any(k in ci['text'] for k in ('职工', '居民', '公费', '工伤', '自费'))
@@ -101,60 +113,122 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
             'message': f"检测到参保类型待查（{active_pending_clauses[0]['text']}），需明确参保类型后测算"
         }
 
-    # 优先提取当前肯定结算指令（排除既往与否定分句，例如'既往按居民医保结算，本次按职工医保结算'）
+    # 3. 提取所有非历史、非否定的结算指令 (指令收集与选择疑问句消歧)
+    directive_targets = []
+    directive_pattern = r'(?:本次|现|当前|此次|现已|确认|转为)?\s*(?:按|以|采用|转为)\s*(?:城镇)?(职工|居民|公费医疗|公费|工伤保险|工伤|自费)(?:医保)?(?:结算)?'
+
     for ci in clause_info:
         if ci['is_historical'] or ci['is_negated']:
             continue
         c = ci['text']
-        m = re.search(r'(?:本次|现|当前|此次|现已|确认|转为)?\s*(?:按|以|采用|转为)\s*(?:城镇)?(职工|居民|公费医疗|公费|工伤保险|工伤|自费)(?:医保)?(?:结算)?', c)
-        if m:
-            tgt = m.group(1)
-            if '公费' in tgt:
-                return {
-                    'valid': False,
-                    'category': None,
-                    'status': 'PENDING',
-                    'reason': 'UNSUPPORTED_INS_TYPE:公费医疗',
-                    'pending_reason': 'UNSUPPORTED_INS_TYPE:公费医疗',
-                    'message': '公费医疗统筹区尚未核准 DIP 映射，不适用基本医保 DIP 测算基准，需人工核实'
-                }
-            elif '工伤' in tgt:
-                return {
-                    'valid': False,
-                    'category': None,
-                    'status': 'PENDING',
-                    'reason': 'UNSUPPORTED_INS_TYPE:工伤保险',
-                    'pending_reason': 'UNSUPPORTED_INS_TYPE:工伤保险',
-                    'message': '工伤保险由工伤保险基金单独支付，不适用基本医保 DIP 分值付费测算'
-                }
-            elif '自费' in tgt:
-                return {
-                    'valid': True,
-                    'category': '自费',
-                    'status': 'NOT_APPLICABLE',
-                    'reason': 'SELF_PAY',
-                    'pending_reason': 'SELF_PAY',
-                    'message': '自费患者不适用医保 DIP 支付规则'
-                }
-            elif '居民' in tgt:
-                return {'valid': True, 'category': '居民', 'status': 'MATCHED', 'reason': None, 'pending_reason': None, 'message': None}
-            elif '职工' in tgt:
-                return {'valid': True, 'category': '职工', 'status': 'MATCHED', 'reason': None, 'pending_reason': None, 'message': None}
+        # 在同一个分句内可能出现多个指令，例如 "按职工医保还是按居民医保结算"
+        for m in re.finditer(directive_pattern, c):
+            raw_tgt = m.group(1)
+            if '公费' in raw_tgt:
+                directive_targets.append('公费医疗')
+            elif '工伤' in raw_tgt:
+                directive_targets.append('工伤保险')
+            elif '自费' in raw_tgt:
+                directive_targets.append('自费')
+            elif any(k in raw_tgt for k in ('居民', '农合')):
+                directive_targets.append('居民')
+            elif '职工' in raw_tgt:
+                directive_targets.append('职工')
 
-    # 收集非历史、排除否定与结案短语后的活跃险种
+    distinct_directives = list(dict.fromkeys(directive_targets))
+
+    # 3.1 若存在多个不同的结算指令，或者包含选择疑问词且指令/候选多于1个 -> 触发 AMBIGUOUS_INS_TYPE 追问
+    if len(distinct_directives) > 1 or (is_choice_question and len(distinct_directives) >= 1):
+        return {
+            'valid': False,
+            'category': None,
+            'status': 'PENDING',
+            'reason': 'AMBIGUOUS_INS_TYPE',
+            'pending_reason': 'AMBIGUOUS_INS_TYPE',
+            'message': '输入包含选择性或冲突的参保结算指令（如“按职工还是按居民”），请明确患者本次住院具体按哪类险种结算（城镇职工 / 城乡居民）'
+        }
+
+    # 3.2 若恰好有唯一确定的肯定结算指令，直接按该指令执行
+    if len(distinct_directives) == 1:
+        single_dir = distinct_directives[0]
+        if single_dir == '公费医疗':
+            return {
+                'valid': False,
+                'category': None,
+                'status': 'PENDING',
+                'reason': 'UNSUPPORTED_INS_TYPE:公费医疗',
+                'pending_reason': 'UNSUPPORTED_INS_TYPE:公费医疗',
+                'message': '公费医疗统筹区尚未核准 DIP 映射，不适用基本医保 DIP 测算基准，需人工核实'
+            }
+        elif single_dir == '工伤保险':
+            return {
+                'valid': False,
+                'category': None,
+                'status': 'PENDING',
+                'reason': 'UNSUPPORTED_INS_TYPE:工伤保险',
+                'pending_reason': 'UNSUPPORTED_INS_TYPE:工伤保险',
+                'message': '工伤保险由工伤保险基金单独支付，不适用基本医保 DIP 分值付费测算'
+            }
+        elif single_dir == '自费':
+            return {
+                'valid': True,
+                'category': '自费',
+                'status': 'NOT_APPLICABLE',
+                'reason': 'SELF_PAY',
+                'pending_reason': 'SELF_PAY',
+                'message': '自费患者不适用医保 DIP 支付规则'
+            }
+        elif single_dir in ('居民', '职工'):
+            return {
+                'valid': True,
+                'category': single_dir,
+                'status': 'MATCHED',
+                'reason': None,
+                'pending_reason': None,
+                'message': None
+            }
+
+    # 4. 收集非历史、排除否定与结案短语后的活跃候选险种
     active_tokens = []
+    negated_tokens = []
     has_ambiguous_urban = False
     has_occupation_only = False
+    has_pure_self_pay = False
 
     for ci in clause_info:
         if ci['is_historical']:
             continue
         c = ci['text']
-        c_clean = re.sub(r'(?:非|排除|除外|不属于|不是|否认|不按)\s*(?:工伤(?:保险)?|公费(?:医疗)?|职工(?:医保)?|居民(?:医保)?)', '', c)
+
+        # 记录被明确否定的险种
+        for neg_m in re.finditer(negation_prefix_pattern + r'\s*(?:城镇)?(工伤(?:保险)?|公费(?:医疗)?|职工(?:医保)?|居民(?:医保)?|新农合|自费)', c):
+            neg_tgt = neg_m.group(1)
+            if '职工' in neg_tgt:
+                negated_tokens.append('职工')
+            elif any(k in neg_tgt for k in ('居民', '农合')):
+                negated_tokens.append('居民')
+            elif '公费' in neg_tgt:
+                negated_tokens.append('公费医疗')
+            elif '工伤' in neg_tgt:
+                negated_tokens.append('工伤保险')
+            elif '自费' in neg_tgt:
+                negated_tokens.append('自费')
+
+        # 清除所有否定短语与已结案工伤
+        c_clean = re.sub(negation_prefix_pattern + r'\s*(?:城镇)?(?:工伤(?:保险)?|公费(?:医疗)?|职工(?:医保)?|居民(?:医保)?|新农合|自费)', '', c)
         c_clean = re.sub(r'工伤(?:已结案|已结清|结案)', '', c_clean)
 
-        if '自费' in c_clean:
+        # 检查项目级自费：若包含“部分项目自费/自费项目/部分自费”，则剔除该自费短语，不作为整单险种
+        if ci['is_item_self_pay']:
+            c_clean = re.sub(r'(?:部分项目自费|项目自费|自费项目|部分自费|自费药品|自费耗材|自费药|自费部分|目录外自费)', '', c_clean)
+
+        # 提取活跃险种词
+        if any(k in c_clean for k in ('全额自费', '纯自费', '全自费', '自费患者', '无医保')):
             active_tokens.append('自费')
+            has_pure_self_pay = True
+        elif '自费' in c_clean and not ci['is_item_self_pay']:
+            active_tokens.append('自费')
+
         if '公费' in c_clean:
             active_tokens.append('公费医疗')
         if '工伤' in c_clean:
@@ -168,15 +242,80 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
         if any(k in c_clean for k in ('退休', '在职', '已退休', '离休', '无业', '待业', '务农', '学生')) and not any(k in c_clean for k in ('职工', '居民', '公费', '工伤', '自费')):
             has_occupation_only = True
 
-    if '自费' in active_tokens:
-        return {'valid': True, 'category': '自费', 'status': 'NOT_APPLICABLE', 'reason': 'SELF_PAY', 'pending_reason': 'SELF_PAY', 'message': '自费患者不适用医保 DIP 支付规则'}
-    if '公费医疗' in active_tokens:
-        return {'valid': False, 'category': None, 'status': 'PENDING', 'reason': 'UNSUPPORTED_INS_TYPE:公费医疗', 'pending_reason': 'UNSUPPORTED_INS_TYPE:公费医疗', 'message': '公费医疗统筹区尚未核准 DIP 映射，不适用基本医保 DIP 测算基准，需人工核实'}
-    if '工伤保险' in active_tokens:
-        return {'valid': False, 'category': None, 'status': 'PENDING', 'reason': 'UNSUPPORTED_INS_TYPE:工伤保险', 'pending_reason': 'UNSUPPORTED_INS_TYPE:工伤保险', 'message': '工伤保险由工伤保险基金单独支付，不适用基本医保 DIP 分值付费测算'}
+    # 4.1 若整个输入只排除了某种险种，而未提供任何正向有效险种（例如“本次未按职工医保结算”/“本次不采用居民医保”）
+    # 强制进入 PENDING 追问，严禁将否定险种作为确定结果输出
+    if not active_tokens and negated_tokens:
+        neg_str = "、".join(list(dict.fromkeys(negated_tokens)))
+        return {
+            'valid': False,
+            'category': None,
+            'status': 'PENDING',
+            'reason': 'MISSING_INS_TYPE',
+            'pending_reason': 'MISSING_INS_TYPE',
+            'message': f"检测到输入排除了【{neg_str}】，但未说明实际参保类型，请明确本次住院按哪类险种结算（城镇职工 / 城乡居民 / 自费）"
+        }
 
+    # 4.2 若包含选择疑问句（如“职工医保还是居民医保？”）且同时出现多个候选
     has_res = '居民' in active_tokens
     has_emp = '职工' in active_tokens
+    if is_choice_question and (has_res or has_emp):
+        return {
+            'valid': False,
+            'category': None,
+            'status': 'PENDING',
+            'reason': 'AMBIGUOUS_INS_TYPE',
+            'pending_reason': 'AMBIGUOUS_INS_TYPE',
+            'message': '输入包含选择性险种提问（如“职工医保还是居民医保”），请明确患者本次住院具体按哪类险种结算（城镇职工 / 城乡居民）'
+        }
+
+    # 4.3 特殊险种（公费医疗、工伤保险）优先阻断拦截，严禁误判为职工医保
+    if '公费医疗' in active_tokens:
+        return {
+            'valid': False,
+            'category': None,
+            'status': 'PENDING',
+            'reason': 'UNSUPPORTED_INS_TYPE:公费医疗',
+            'pending_reason': 'UNSUPPORTED_INS_TYPE:公费医疗',
+            'message': '公费医疗统筹区尚未核准 DIP 映射，不适用基本医保 DIP 测算基准，需人工核实'
+        }
+    if '工伤保险' in active_tokens:
+        return {
+            'valid': False,
+            'category': None,
+            'status': 'PENDING',
+            'reason': 'UNSUPPORTED_INS_TYPE:工伤保险',
+            'pending_reason': 'UNSUPPORTED_INS_TYPE:工伤保险',
+            'message': '工伤保险由工伤保险基金单独支付，不适用基本医保 DIP 分值付费测算'
+        }
+
+    # 4.4 判定具有基本医保（职工/居民）时的项目自费兼容：
+    # 若已有职工或居民医保，且未指定全额纯自费，则整单按职工或居民医保计算，项目自费不拦截整单医保
+    if (has_emp or has_res) and not has_pure_self_pay:
+        if has_res and has_emp:
+            return {
+                'valid': False,
+                'category': None,
+                'status': 'PENDING',
+                'reason': 'AMBIGUOUS_INS_TYPE',
+                'pending_reason': 'AMBIGUOUS_INS_TYPE',
+                'message': '同时存在职工与居民医保且未指明结算口径，请明确患者本次住院按哪类险种结算'
+            }
+        if has_emp:
+            return {'valid': True, 'category': '职工', 'status': 'MATCHED', 'reason': None, 'pending_reason': None, 'message': None}
+        if has_res:
+            return {'valid': True, 'category': '居民', 'status': 'MATCHED', 'reason': None, 'pending_reason': None, 'message': None}
+
+    # 4.5 纯自费处理
+    if '自费' in active_tokens:
+        return {
+            'valid': True,
+            'category': '自费',
+            'status': 'NOT_APPLICABLE',
+            'reason': 'SELF_PAY',
+            'pending_reason': 'SELF_PAY',
+            'message': '自费患者不适用医保 DIP 支付规则'
+        }
+
     if has_res and has_emp:
         return {'valid': False, 'category': None, 'status': 'PENDING', 'reason': 'AMBIGUOUS_INS_TYPE', 'pending_reason': 'AMBIGUOUS_INS_TYPE', 'message': '同时存在职工与居民医保且未指明结算口径，请明确患者本次住院按哪类险种结算'}
     if has_res:

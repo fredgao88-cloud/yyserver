@@ -66,12 +66,12 @@ def parse_local_intent(text: str, channel: str = "web") -> Dict[str, Any]:
     # 统一调用 normalize_insurance_type，确保与 match_dip_rule 共享同一套分句时态与修饰判定
     norm_ins = normalize_insurance_type(text_clean)
     
-    # 5.1 检查是否显式包含活跃的“参保类型待查/未定”等表述（例如：“企业职工，参保类型 待查”）
-    # 凡输入明确指明参保待查，严禁按企业职工假定险种，一律阻断追问并省略金额
-    if not norm_ins["valid"] and norm_ins.get("reason") == "MISSING_INS_TYPE" and "待查" in (norm_ins.get("message") or ""):
+    # 5.1 检查是否显式包含活跃的“参保类型待查/未定”或“仅有否定险种”等表述（例如：“企业职工，参保类型 待查” / “本次未按职工医保结算”）
+    # 凡输入明确指明参保待查或仅有否定险种，严禁按企业职工假定险种，一律阻断追问并省略金额
+    if not norm_ins["valid"] and norm_ins.get("reason") == "MISSING_INS_TYPE" and any(k in (norm_ins.get("message") or "") for k in ("待查", "排除", "未说明实际参保类型")):
         return {
             "intent": "need_clarification",
-            "reply": "【需要明确参保类型】\n检测到输入包含“参保类型待查/未定”，当前医保类型未知。由于城镇职工与城乡居民的 DIP 点值与基准不同，在明确参保类型前系统依规暂不测算金额，请补充患者的具体险种（城镇职工 / 城乡居民 / 自费）。" + reimburse_clarification,
+            "reply": f"【需要明确参保类型】\n{norm_ins.get('message', '当前医保参保类型未明确')}。由于城镇职工与城乡居民的 DIP 点值与基准不同，在明确参保类型前系统依规暂不测算金额，请补充患者的具体险种（城镇职工 / 城乡居民 / 自费）。" + reimburse_clarification,
             "data": {
                 "matched": False,
                 "status": "PENDING",

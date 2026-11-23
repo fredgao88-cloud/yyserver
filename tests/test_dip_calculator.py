@@ -216,8 +216,51 @@ def run_tests():
     assert m_neg["benchmark_amount"] == 2790.90
     print(f"PASS: “本次按职工医保结算”及“职工医保，非工伤”均正确按职工基准 ￥2790.90 测算")
 
+    # --- [Test 6] Round 9 审查验收 (否定险种不回退确定结果、待查冒号与多字段解耦、选择疑问句与项目自费) ---
+    print("\n--- [Test 6] Round 9 审查验收 (否定险种追问、待查冒号与多字段解耦、选择疑问句与项目自费) ---")
+    # 6a. 本次未按职工医保结算 -> 仅有否定险种，严禁回退为职工，必须追问并省略金额
+    m_6a = match_dip_rule("M17.9", age=68, ins_type="本次未按职工医保结算", op_keyword="保守")
+    assert m_6a["status"] == "PENDING"
+    assert m_6a["pending_reason"] == "MISSING_INS_TYPE"
+    assert m_6a.get("benchmark_amount") is None
+    print("PASS: “本次未按职工医保结算” -> 拦截否定险种并标记 PENDING / MISSING_INS_TYPE，零金额输出")
+
+    # 6b. 本次不采用居民医保 -> 仅有否定险种，严禁回退为居民，必须追问并省略金额
+    m_6b = match_dip_rule("M17.9", age=68, ins_type="本次不采用居民医保", op_keyword="保守")
+    assert m_6b["status"] == "PENDING"
+    assert m_6b["pending_reason"] == "MISSING_INS_TYPE"
+    assert m_6b.get("benchmark_amount") is None
+    print("PASS: “本次不采用居民医保” -> 拦截否定险种并标记 PENDING / MISSING_INS_TYPE，零金额输出")
+
+    # 6c. 企业职工，参保类型：待查 (含中文冒号) -> 精准识别待查，标记 PENDING
+    m_6c = match_dip_rule("M17.9", age=68, ins_type="企业职工，参保类型：待查", op_keyword="保守")
+    assert m_6c["status"] == "PENDING"
+    assert m_6c["pending_reason"] == "MISSING_INS_TYPE"
+    assert m_6c.get("benchmark_amount") is None
+    print("PASS: “企业职工，参保类型：待查”(含冒号) -> 精确识别参保待查，阻断测算")
+
+    # 6d. 企业职工，病理类型待查且参保类型待查 -> 多字段待查完全解耦，不屏蔽参保待查
+    m_6d = match_dip_rule("M17.9", age=68, ins_type="企业职工，病理类型待查且参保类型待查", op_keyword="保守")
+    assert m_6d["status"] == "PENDING"
+    assert m_6d["pending_reason"] == "MISSING_INS_TYPE"
+    assert m_6d.get("benchmark_amount") is None
+    print("PASS: “企业职工，病理类型待查且参保类型待查” -> 字段解耦，正确识别参保待查")
+
+    # 6e. 按职工医保还是按居民医保结算？ -> 选择疑问句消歧，标记 AMBIGUOUS_INS_TYPE 追问
+    m_6e = match_dip_rule("M17.9", age=68, ins_type="按职工医保还是按居民医保结算？", op_keyword="保守")
+    assert m_6e["status"] == "PENDING"
+    assert m_6e["pending_reason"] == "AMBIGUOUS_INS_TYPE"
+    assert m_6e.get("benchmark_amount") is None
+    print("PASS: “按职工医保还是按居民医保结算？” -> 识别选择疑问句，标记 AMBIGUOUS_INS_TYPE")
+
+    # 6f. 职工医保，部分项目自费 -> 项目级自费不拦截整单医保测算，正常测算职工基准 ￥2790.90
+    m_6f = match_dip_rule("M17.9", age=68, ins_type="职工医保，部分项目自费", op_keyword="保守")
+    assert m_6f["status"] == "MATCHED"
+    assert m_6f["benchmark_amount"] == 2790.90
+    print("PASS: “职工医保，部分项目自费” -> 项目级自费兼容，正常测算职工基准 ￥2790.90")
+
     print("\n" + "=" * 60)
-    print(">>> 恭喜！全部 12 类核心测试用例 100% 通过！ <<<")
+    print(">>> 恭喜！全部 13 类核心测试用例 100% 通过！ <<<")
     print("=" * 60)
 
 if __name__ == "__main__":

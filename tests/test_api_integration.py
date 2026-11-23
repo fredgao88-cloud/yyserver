@@ -277,6 +277,144 @@ assert res22["data"]["benchmark_amount"] == 2790.90
 assert "2790.90" in res22.get("reply", "")
 print("PASS [Round 8 P2 对齐]: “原参保类型待查，现已确认本次按职工医保结算” 历史待查不压制当前确认 ￥2790.90！")
 
+print("\n=== 23. 【审查关键验收 P1 (Round 9)】本次未按职工医保结算 仅有否定险种双接口拦截 ===")
+res23_chat = post("https://127.0.0.1/api/chat", {
+    "text": "68岁，本次未按职工医保结算，M17.9，保守治疗"
+})
+print("[23 chat] Intent:", res23_chat.get("intent"), "Status:", res23_chat.get("data", {}).get("status"), "PendingReason:", res23_chat.get("data", {}).get("pending_reason"))
+assert res23_chat["intent"] == "need_clarification"
+assert res23_chat["data"]["status"] == "PENDING"
+assert res23_chat["data"]["pending_reason"] == "MISSING_INS_TYPE"
+assert "2790.90" not in res23_chat.get("reply", "")
+
+res23_rule = post("https://127.0.0.1/api/tools/query_dip_rule", {
+    "disease": "M17.9",
+    "age": 68,
+    "ins_type": "本次未按职工医保结算",
+    "operation": "保守治疗"
+})
+print("[23 tool] Matched:", res23_rule.get("matched"), "Status:", res23_rule.get("status"), "PendingReason:", res23_rule.get("pending_reason"))
+assert res23_rule["matched"] is False
+assert res23_rule["status"] == "PENDING"
+assert res23_rule["pending_reason"] == "MISSING_INS_TYPE"
+assert res23_rule.get("benchmark_amount") is None
+print("PASS [Round 9 P1 对齐]: “本次未按职工医保结算” 双接口拦截并省略金额！")
+
+print("\n=== 24. 【审查关键验收 P1 (Round 9)】本次不采用居民医保 仅有否定险种双接口拦截 ===")
+res24_chat = post("https://127.0.0.1/api/chat", {
+    "text": "68岁，本次不采用居民医保，M17.9，保守治疗"
+})
+print("[24 chat] Intent:", res24_chat.get("intent"), "Status:", res24_chat.get("data", {}).get("status"), "PendingReason:", res24_chat.get("data", {}).get("pending_reason"))
+assert res24_chat["intent"] == "need_clarification"
+assert res24_chat["data"]["status"] == "PENDING"
+assert res24_chat["data"]["pending_reason"] == "MISSING_INS_TYPE"
+assert "2604.84" not in res24_chat.get("reply", "")
+
+res24_rule = post("https://127.0.0.1/api/tools/query_dip_rule", {
+    "disease": "M17.9",
+    "age": 68,
+    "ins_type": "本次不采用居民医保",
+    "operation": "保守治疗"
+})
+print("[24 tool] Matched:", res24_rule.get("matched"), "Status:", res24_rule.get("status"), "PendingReason:", res24_rule.get("pending_reason"))
+assert res24_rule["matched"] is False
+assert res24_rule["status"] == "PENDING"
+assert res24_rule["pending_reason"] == "MISSING_INS_TYPE"
+assert res24_rule.get("benchmark_amount") is None
+print("PASS [Round 9 P1 对齐]: “本次不采用居民医保” 双接口拦截并省略金额！")
+
+print("\n=== 25. 【审查关键验收 P1 (Round 9)】待查含中文冒号：企业职工，参保类型：待查 ===")
+res25_chat = post("https://127.0.0.1/api/chat", {
+    "text": "68岁，企业职工，参保类型：待查，M17.9，保守治疗"
+})
+print("[25 chat] Intent:", res25_chat.get("intent"), "Status:", res25_chat.get("data", {}).get("status"), "PendingReason:", res25_chat.get("data", {}).get("pending_reason"))
+assert res25_chat["intent"] == "need_clarification"
+assert res25_chat["data"]["status"] == "PENDING"
+assert res25_chat["data"]["pending_reason"] == "MISSING_INS_TYPE"
+assert "2790.90" not in res25_chat.get("reply", "")
+
+res25_rule = post("https://127.0.0.1/api/tools/query_dip_rule", {
+    "disease": "M17.9",
+    "age": 68,
+    "ins_type": "企业职工，参保类型：待查",
+    "operation": "保守治疗"
+})
+print("[25 tool] Matched:", res25_rule.get("matched"), "Status:", res25_rule.get("status"), "PendingReason:", res25_rule.get("pending_reason"))
+assert res25_rule["matched"] is False
+assert res25_rule["status"] == "PENDING"
+assert res25_rule["pending_reason"] == "MISSING_INS_TYPE"
+assert res25_rule.get("benchmark_amount") is None
+print("PASS [Round 9 P1 对齐]: “企业职工，参保类型：待查”(含冒号) 双接口严格拦截！")
+
+print("\n=== 26. 【审查关键验收 P1 (Round 9)】多字段待查解耦：企业职工，病理类型待查且参保类型待查 ===")
+res26_chat = post("https://127.0.0.1/api/chat", {
+    "text": "68岁，企业职工，病理类型待查且参保类型待查，M17.9，保守治疗"
+})
+print("[26 chat] Intent:", res26_chat.get("intent"), "Status:", res26_chat.get("data", {}).get("status"), "PendingReason:", res26_chat.get("data", {}).get("pending_reason"))
+assert res26_chat["intent"] == "need_clarification"
+assert res26_chat["data"]["status"] == "PENDING"
+assert res26_chat["data"]["pending_reason"] == "MISSING_INS_TYPE"
+assert "2790.90" not in res26_chat.get("reply", "")
+
+res26_rule = post("https://127.0.0.1/api/tools/query_dip_rule", {
+    "disease": "M17.9",
+    "age": 68,
+    "ins_type": "企业职工，病理类型待查且参保类型待查",
+    "operation": "保守治疗"
+})
+print("[26 tool] Matched:", res26_rule.get("matched"), "Status:", res26_rule.get("status"), "PendingReason:", res26_rule.get("pending_reason"))
+assert res26_rule["matched"] is False
+assert res26_rule["status"] == "PENDING"
+assert res26_rule["pending_reason"] == "MISSING_INS_TYPE"
+assert res26_rule.get("benchmark_amount") is None
+print("PASS [Round 9 P1 对齐]: “企业职工，病理类型待查且参保类型待查” 多字段解耦，参保待查不被屏蔽！")
+
+print("\n=== 27. 【审查关键验收 P1 (Round 9)】选择疑问句消歧：按职工医保还是按居民医保结算？ ===")
+res27_chat = post("https://127.0.0.1/api/chat", {
+    "text": "68岁，按职工医保还是按居民医保结算？M17.9，保守治疗"
+})
+print("[27 chat] Intent:", res27_chat.get("intent"), "Status:", res27_chat.get("data", {}).get("status"), "PendingReason:", res27_chat.get("data", {}).get("pending_reason"))
+assert res27_chat["intent"] == "need_clarification"
+assert res27_chat["data"]["status"] == "PENDING"
+assert res27_chat["data"]["pending_reason"] == "AMBIGUOUS_INS_TYPE"
+assert "2790.90" not in res27_chat.get("reply", "")
+assert "2604.84" not in res27_chat.get("reply", "")
+
+res27_rule = post("https://127.0.0.1/api/tools/query_dip_rule", {
+    "disease": "M17.9",
+    "age": 68,
+    "ins_type": "按职工医保还是按居民医保结算？",
+    "operation": "保守治疗"
+})
+print("[27 tool] Matched:", res27_rule.get("matched"), "Status:", res27_rule.get("status"), "PendingReason:", res27_rule.get("pending_reason"))
+assert res27_rule["matched"] is False
+assert res27_rule["status"] == "PENDING"
+assert res27_rule["pending_reason"] == "AMBIGUOUS_INS_TYPE"
+assert res27_rule.get("benchmark_amount") is None
+print("PASS [Round 9 P1 对齐]: “按职工医保还是按居民医保结算？” 识别选择疑问句并进入 PENDING！")
+
+print("\n=== 28. 【审查关键验收 P2 (Round 9)】项目级自费兼容：职工医保，部分项目自费 ===")
+res28_chat = post("https://127.0.0.1/api/chat", {
+    "text": "68岁，职工医保，部分项目自费，M17.9，保守治疗"
+})
+print("[28 chat] Intent:", res28_chat.get("intent"), "Status:", res28_chat.get("data", {}).get("status"), "Benchmark:", res28_chat.get("data", {}).get("benchmark_amount"))
+assert res28_chat["intent"] == "query_dip_rule"
+assert res28_chat["data"]["matched"] is True
+assert res28_chat["data"]["benchmark_amount"] == 2790.90
+assert "2790.90" in res28_chat.get("reply", "")
+
+res28_rule = post("https://127.0.0.1/api/tools/query_dip_rule", {
+    "disease": "M17.9",
+    "age": 68,
+    "ins_type": "职工医保，部分项目自费",
+    "operation": "保守治疗"
+})
+print("[28 tool] Matched:", res28_rule.get("matched"), "Status:", res28_rule.get("status"), "Benchmark:", res28_rule.get("benchmark_amount"))
+assert res28_rule["matched"] is True
+assert res28_rule["status"] == "MATCHED"
+assert res28_rule["benchmark_amount"] == 2790.90
+print("PASS [Round 9 P2 对齐]: “职工医保，部分项目自费” 项目级自费不拦截整单医保，正常测算 ￥2790.90！")
+
 print("\n" + "=" * 60)
-print(">>> ALL 22 API INTEGRATION TESTS PASSED (100% COMPLIANT) <<<")
+print(">>> ALL 28 API INTEGRATION TESTS PASSED (100% COMPLIANT) <<<")
 print("=" * 60)
