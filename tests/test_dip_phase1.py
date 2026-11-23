@@ -115,6 +115,35 @@ def run_phase1_tests():
         assert "query" not in res_6_ding["data"]
     print(f"PASS [Case 6]: 钉钉端/钉钉群聊查床(帮我查一下3床张大爷现在花了多少钱) -> 成功触发隐私盾牌，仅返回院内入口，绝不回显患者私密信息")
 
+    # ---------------- 用例 7: 职业状态与特殊险种优先识别 (审查 P1 关键验收) ----------------
+    print("\n--- [Case 7] 职业状态与特殊险种优先识别 ---")
+    # 7a. 退休+公费医疗 -> 必须识别为公费医疗，触发 PENDING，绝不误判为职工医保，绝不输出 2790.90
+    q_7a = "68岁，退休，公费医疗，M17.9，保守治疗，请查询医院 DIP 预估支付额"
+    res_7a = parse_local_intent(q_7a)
+    assert res_7a["intent"] == "need_clarification"
+    assert res_7a["data"]["status"] == "PENDING"
+    assert "2790.90" not in res_7a["reply"]
+    assert "UNSUPPORTED_INS_TYPE:公费医疗" in res_7a["data"]["pending_reason"]
+    print("PASS [Case 7a]: 退休+公费医疗 -> 识别为公费医疗并进入 PENDING，绝不误判为职工医保，零金额回传")
+
+    # 7b. 仅输入职业状态“已退休” -> 主动追问险种，绝不擅自假定为职工
+    q_7b = "68岁，已退休，M17.9 保守治疗"
+    res_7b = parse_local_intent(q_7b)
+    assert res_7b["intent"] == "need_clarification"
+    assert res_7b["data"]["status"] == "PENDING"
+    assert res_7b["data"]["pending_reason"] == "OCCUPATION_NOT_INSURANCE_TYPE"
+    assert "2790.90" not in res_7b["reply"]
+    print("PASS [Case 7b]: 仅输入“已退休”职业状态 -> 拦截并主动追问参保类型")
+
+    # 7c. 职工+工伤保险 -> 优先识别工伤保险并进入 PENDING
+    q_7c = "68岁职工，工伤保险，M17.9 保守治疗"
+    res_7c = parse_local_intent(q_7c)
+    assert res_7c["intent"] == "need_clarification"
+    assert res_7c["data"]["status"] == "PENDING"
+    assert "UNSUPPORTED_INS_TYPE:工伤保险" in res_7c["data"]["pending_reason"]
+    assert "2790.90" not in res_7c["reply"]
+    print("PASS [Case 7c]: 职工+工伤保险 -> 优先识别工伤保险并进入 PENDING，零虚假金额输出")
+
     print("\n" + "=" * 70)
     print(">>> 恭喜！Phase 1 验收回归测试套件 6 大关键测试集全部 100% 通过！ <<<")
     print("=" * 70)

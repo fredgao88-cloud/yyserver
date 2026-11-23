@@ -123,6 +123,15 @@ class HISReader:
             if not valid_settlements:
                 return {}
 
+            # 严格校验传入的结算单号 (settlement_id)
+            # 若调用方显式指定了单号，必须先核验该单号是否属于本次就诊流水且处于有效未作废状态
+            # 若单号不存在、已作废或属于其他患者/住院记录，严禁返回假阳性对账数据，直接返回空字典
+            if settlement_id is not None:
+                target_str = str(settlement_id).strip()
+                matched_target = [s for s in valid_settlements if str(s.get('id', '')).strip() == target_str]
+                if not matched_target:
+                    return {}
+
             # 判断结算单数量
             # 若同一次住院存在多张有效结算单，因明细表（his_zycz 与 his_cfmain_fyjl）在 HIS 架构中仅关联就诊流水号 lsh，
             # 无论调用方是否指定单张 settlement_id，均自动按整次住院汇总结算金额（ADMISSION_LEVEL）与整次住院明细对账，
@@ -137,7 +146,7 @@ class HISReader:
                 zyjz_record = {
                     'lsh': lsh,
                     'id': ','.join(str(i) for i in active_ids),
-                    'target_settlement_id': settlement_id,
+                    'target_settlement_id': str(settlement_id).strip() if settlement_id is not None else None,
                     'amoney': total_amoney,
                     'czmoney': total_czmoney,
                     'yjmoney': total_yjmoney,

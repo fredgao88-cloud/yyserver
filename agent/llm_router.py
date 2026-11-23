@@ -62,18 +62,20 @@ def parse_local_intent(text: str, channel: str = "web") -> Dict[str, Any]:
     if bed_match and ("床日" in text_clean or "住院" in text_clean or "在院" in text_clean or "康复" in text_clean):
         bed_days = int(bed_match.group(1))
 
-    # ---------------- 5. 提取参保类型 (严格区分城镇居民与城镇职工，严禁默认职工) ----------------
+    # ---------------- 5. 提取参保类型 (严格区分险种与职业状态，优先识别特殊/非DIP险种) ----------------
     ins_type = None
     if "自费" in text_clean:
         ins_type = "自费"
-    elif any(k in text_clean for k in ("城镇居民", "居民", "城乡", "农合", "新农合")):
-        ins_type = "居民"
-    elif any(k in text_clean for k in ("城镇职工", "职工", "在职", "退休")):
-        ins_type = "职工"
     elif "公费" in text_clean:
+        # 无论是否提及退休/在职/职工，公费医疗均属财政单独保障或特定统筹，优先识别
         ins_type = "公费医疗"
     elif "工伤" in text_clean:
+        # 工伤由工伤保险基金支付，优先识别
         ins_type = "工伤保险"
+    elif any(k in text_clean for k in ("城镇居民", "居民医保", "城乡居民", "居民", "城乡", "农合", "新农合")):
+        ins_type = "居民"
+    elif any(k in text_clean for k in ("城镇职工", "职工医保", "职工")):
+        ins_type = "职工"
     elif "城镇" in text_clean:
         return {
             "intent": "need_clarification",
@@ -82,6 +84,17 @@ def parse_local_intent(text: str, channel: str = "web") -> Dict[str, Any]:
                 "matched": False,
                 "status": "PENDING",
                 "pending_reason": "AMBIGUOUS_INS_TYPE"
+            }
+        }
+    elif any(k in text_clean for k in ("退休", "在职", "已退休", "离休", "无业", "待业", "务农", "学生")):
+        # 仅输入职业状态而无险种时，严禁擅自假定为职工医保，主动追问
+        return {
+            "intent": "need_clarification",
+            "reply": "【需要明确参保类型】\n检测到您输入了职业状态（退休/在职等），但未指明具体医保参保类型。请明确患者是【城镇职工医保】、【城乡居民医保】还是【公费医疗/自费】（不同险种医保 DIP 测算基准与规则不同）。",
+            "data": {
+                "matched": False,
+                "status": "PENDING",
+                "pending_reason": "OCCUPATION_NOT_INSURANCE_TYPE"
             }
         }
 

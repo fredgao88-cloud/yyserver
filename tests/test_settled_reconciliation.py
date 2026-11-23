@@ -254,7 +254,7 @@ def run_settled_reconciliation_suite():
     assert detail_no_id['cz_stat']['total'] == Decimal('1300.00')
     assert detail_no_id['fy_stat']['total'] == Decimal('700.00')
 
-    # 调用路径 2: 逐单传入 settlement_id（仍保证对账范围与明细一致，自动升级 ADMISSION_LEVEL）
+    # 调用路径 2: 逐单传入有效 settlement_id（仍保证对账范围与明细一致，自动升级 ADMISSION_LEVEL）
     detail_with_id = multi_reader.get_case_fee_detail('zy_multi_synth', settlement_id='101')
     assert detail_with_id['reconciliation_scope'] == 'ADMISSION_LEVEL'
     assert detail_with_id['settlement_count'] == 2
@@ -263,7 +263,15 @@ def run_settled_reconciliation_suite():
     assert detail_with_id['cz_stat']['total'] == Decimal('1300.00')
     assert detail_with_id['fy_stat']['total'] == Decimal('700.00')
 
-    print("  -> 两条调用路径（不传 settlement_id 与逐单传入）均严格返回 ADMISSION_LEVEL 且范围对齐。")
+    # 调用路径 3: 传入不存在的结算单号 (999) -> 严格拦截，返回空字典 {}，绝不返回假阳性金额掩盖参数错误
+    detail_non_existent = multi_reader.get_case_fee_detail('zy_multi_synth', settlement_id='999')
+    assert detail_non_existent == {}, f"Expected empty dict for non-existent settlement_id 999, got {detail_non_existent}"
+
+    # 调用路径 4: 传入已作废单号或属于其他住院记录的单号 -> 严格返回空字典 {}
+    detail_voided = multi_reader.get_case_fee_detail('zy_multi_synth', settlement_id='888')
+    assert detail_voided == {}, f"Expected empty dict for invalid settlement_id 888, got {detail_voided}"
+
+    print("  -> 结算单参数校验核验通过：有效单号严格升级对齐，不存在单号(999)与无效单号严格返回空结果。")
     print("  [PASS] Suite 6 Multi-settlement Reconciliation & Scope Verified.")
 
     print("\n" + "=" * 70)

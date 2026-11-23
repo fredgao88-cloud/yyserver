@@ -158,14 +158,21 @@ def run_tests():
     assert m_ambig["pending_reason"] == "AMBIGUOUS_INS_TYPE"
     print(f"PASS: 仅输入“城镇” -> 触发 PENDING (原因: {m_ambig['pending_reason']})，绝不擅自假设")
 
-    # Case L: 零基准/无效基准核心层统一拦截（绝不返回 status=MATCHED 或金额 0.0）
+    # Case L: 零基准/无效基准核心层统一拦截（动态匹配目标规则并置零，绝不硬编码固定 rule_id）
     print("\n--- [Test 5] 零基准与无效基准核心层拦截测试 ---")
+    normal_hit = match_dip_rule("M17.9", age=68, ins_type="职工", op_keyword="保守")
+    assert normal_hit["status"] == "MATCHED" and normal_hit["rule_id"] is not None
+    target_rule_id = normal_hit["rule_id"]
+
     mock_rules_zero = [dict(r) for r in get_loaded_rules()]
-    # 把匹配命中规则(rule_id=85)的点值/基准设为 0
+    zeroed_count = 0
     for r in mock_rules_zero:
-        if r.get("rule_id") == 85:
+        if r.get("rule_id") == target_rule_id:
             r["employee_base"] = Decimal("0.00")
             r["resident_base"] = Decimal("0.00")
+            zeroed_count += 1
+    assert zeroed_count == 1, f"必须恰好有一条规则被置零，当前置零数: {zeroed_count}"
+
     import tools.dip_calculator as dip_calc
     orig_get_loaded = dip_calc.get_loaded_rules
     dip_calc.get_loaded_rules = lambda **kw: mock_rules_zero
@@ -175,9 +182,24 @@ def run_tests():
         assert res_zero["status"] == "PENDING"
         assert res_zero["pending_reason"] == "INVALID_BENCHMARK"
         assert "benchmark_amount" not in res_zero
-        print(f"PASS: 零基准核心拦截 -> matched={res_zero['matched']}, status={res_zero['status']}, reason={res_zero['pending_reason']}, 无虚假 0.00 金额")
+        print(f"PASS: 动态规则(#{target_rule_id})零基准核心拦截 -> matched={res_zero['matched']}, status={res_zero['status']}, reason={res_zero['pending_reason']}, 无虚假 0.00 金额")
     finally:
         dip_calc.get_loaded_rules = orig_get_loaded
+
+    # Case M: 仅有职业状态（退休/在职）而无具体险种 -> 触发 PENDING (OCCUPATION_NOT_INSURANCE_TYPE)
+    m_retire = match_dip_rule("M17.9", age=68, ins_type="已退休", op_keyword="保守")
+    assert m_retire["status"] == "PENDING"
+    assert m_retire["pending_reason"] == "OCCUPATION_NOT_INSURANCE_TYPE"
+    print(f"PASS: 仅输入职业状态“已退休” -> 触发 PENDING (原因: {m_retire['pending_reason']})，绝不擅自假定为职工医保")
+
+    # Case N: “退休，公费医疗”与“职工，工伤保险”优先拦截
+    m_gf = match_dip_rule("M17.9", age=68, ins_type="退休，公费医疗", op_keyword="保守")
+    assert m_gf["status"] == "PENDING"
+    assert "UNSUPPORTED_INS_TYPE:公费医疗" in m_gf["pending_reason"]
+    m_gs = match_dip_rule("M17.9", age=68, ins_type="职工，工伤保险", op_keyword="保守")
+    assert m_gs["status"] == "PENDING"
+    assert "UNSUPPORTED_INS_TYPE:工伤保险" in m_gs["pending_reason"]
+    print(f"PASS: “退休，公费医疗”与“职工，工伤保险”均优先识别特殊险种并触发 PENDING 拦截")
 
     print("\n" + "=" * 60)
     print(">>> 恭喜！全部 12 类核心测试用例 100% 通过！ <<<")

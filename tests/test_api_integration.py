@@ -131,6 +131,39 @@ assert res10_ambig["success"] is False
 assert res10_ambig["status"] == "PENDING"
 assert res10_ambig["pending_reason"] == "AMBIGUOUS_INS_TYPE"
 
+print("\n=== 11. 【审查关键验收 P1】退休+公费医疗 聊天接口严禁误判为职工医保 ===")
+res11_retire_gf = post("https://127.0.0.1/api/chat", {
+    "text": "68岁，退休，公费医疗，M17.9，保守治疗，请查询医院 DIP 预估支付额"
+})
+print("Intent:", res11_retire_gf.get("intent"), "Status:", res11_retire_gf.get("data", {}).get("status"), "PendingReason:", res11_retire_gf.get("data", {}).get("pending_reason"))
+assert res11_retire_gf["intent"] == "need_clarification"
+assert res11_retire_gf["data"]["status"] == "PENDING"
+assert "2790.90" not in res11_retire_gf.get("reply", "")
+assert "UNSUPPORTED_INS_TYPE:公费医疗" in res11_retire_gf.get("data", {}).get("pending_reason", "")
+print("PASS [P1 对齐]: 退休+公费医疗 正确识别为公费医疗拦截，绝不返回职工医保基准！")
+
+print("\n=== 12. 【审查关键验收 P1】仅输入“已退休”职业状态 聊天接口主动追问险种 ===")
+res12_retire = post("https://127.0.0.1/api/chat", {
+    "text": "68岁，已退休，M17.9 保守治疗"
+})
+print("Intent:", res12_retire.get("intent"), "Status:", res12_retire.get("data", {}).get("status"), "PendingReason:", res12_retire.get("data", {}).get("pending_reason"))
+assert res12_retire["intent"] == "need_clarification"
+assert res12_retire["data"]["status"] == "PENDING"
+assert res12_retire["data"]["pending_reason"] == "OCCUPATION_NOT_INSURANCE_TYPE"
+assert "2790.90" not in res12_retire.get("reply", "")
+print("PASS [P1 对齐]: 仅输入“已退休”职业状态 正确拦截并追问具体险种！")
+
+print("\n=== 13. 【审查关键验收 P1】职工+工伤保险 优先识别工伤保险并拦截 ===")
+res13_work_inj = post("https://127.0.0.1/api/chat", {
+    "text": "68岁职工，工伤保险，M17.9 保守治疗"
+})
+print("Intent:", res13_work_inj.get("intent"), "Status:", res13_work_inj.get("data", {}).get("status"), "PendingReason:", res13_work_inj.get("data", {}).get("pending_reason"))
+assert res13_work_inj["intent"] == "need_clarification"
+assert res13_work_inj["data"]["status"] == "PENDING"
+assert "UNSUPPORTED_INS_TYPE:工伤保险" in res13_work_inj.get("data", {}).get("pending_reason", "")
+assert "2790.90" not in res13_work_inj.get("reply", "")
+print("PASS [P1 对齐]: 职工+工伤保险 正确优先识别工伤保险并进入待定拦截！")
+
 print("\n" + "=" * 60)
-print(">>> ALL 10 API INTEGRATION TESTS PASSED (100% COMPLIANT) <<<")
+print(">>> ALL 13 API INTEGRATION TESTS PASSED (100% COMPLIANT) <<<")
 print("=" * 60)

@@ -61,6 +61,24 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
             "message": "自费患者不适用医保 DIP 支付规则"
         }
 
+    # 优先匹配公费医疗与工伤保险等非基本医保统筹险种（即使包含'职工'或'退休'，也绝不落入职工分支）
+    if "公费" in s:
+        return {
+            "valid": False,
+            "category": None,
+            "status": "PENDING",
+            "reason": "UNSUPPORTED_INS_TYPE:公费医疗",
+            "message": "公费医疗统筹区尚未核准 DIP 映射，不适用基本医保 DIP 测算基准，需人工核实"
+        }
+    if "工伤" in s:
+        return {
+            "valid": False,
+            "category": None,
+            "status": "PENDING",
+            "reason": "UNSUPPORTED_INS_TYPE:工伤保险",
+            "message": "工伤保险由工伤保险基金单独支付，不适用基本医保 DIP 分值付费测算"
+        }
+
     # 优先匹配“城镇居民”与“居民”系列，绝不因包含“城镇”而错落入职工
     if any(k in s for k in ("城镇居民", "居民", "城乡", "农合", "新农合")):
         return {
@@ -79,6 +97,16 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
             "status": "MATCHED",
             "reason": None,
             "message": None
+        }
+
+    # 仅有职业状态（如退休、在职、离休）而未指明具体医保险种
+    if any(k in s for k in ("退休", "在职", "离休", "无业", "待业", "务农", "学生")):
+        return {
+            "valid": False,
+            "category": None,
+            "status": "PENDING",
+            "reason": "OCCUPATION_NOT_INSURANCE_TYPE",
+            "message": f"【{s}】属于职业状态而非医保参保类型，请明确为城镇职工医保、城乡居民医保、公费医疗或自费"
         }
 
     # 仅有“城镇”字样但无“职工”或“居民”
