@@ -259,8 +259,42 @@ def run_tests():
     assert m_6f["benchmark_amount"] == 2790.90
     print("PASS: “职工医保，部分项目自费” -> 项目级自费兼容，正常测算职工基准 ￥2790.90")
 
+    # --- [Test 7] Round 10 审查验收 (城乡居民别名否定、单字'或'与方案选择消歧、更正为覆盖、耗材自费隔离) ---
+    print("\n--- [Test 7] Round 10 审查验收 (城乡居民别名否定、单字'或'与方案选择消歧、更正为覆盖、耗材自费隔离) ---")
+    # 7a. 本次未按城乡居民医保结算 -> 否定规则必须支持“城乡居民”复合别名，严禁错选居民基准 2604.84
+    m_7a = match_dip_rule("M17.9", age=68, ins_type="本次未按城乡居民医保结算", op_keyword="保守")
+    assert m_7a["status"] == "PENDING"
+    assert m_7a["pending_reason"] == "MISSING_INS_TYPE"
+    assert m_7a.get("benchmark_amount") is None
+    print("PASS: “本次未按城乡居民医保结算” -> 统一别名否定识别，标记 PENDING / MISSING_INS_TYPE，零金额输出")
+
+    # 7b. 按职工医保或居民医保结算？ -> 单字“或”选择疑问句消歧，标记 AMBIGUOUS_INS_TYPE
+    m_7b = match_dip_rule("M17.9", age=68, ins_type="按职工医保或居民医保结算？", op_keyword="保守")
+    assert m_7b["status"] == "PENDING"
+    assert m_7b["pending_reason"] == "AMBIGUOUS_INS_TYPE"
+    assert m_7b.get("benchmark_amount") is None
+    print("PASS: “按职工医保或居民医保结算？” -> 单字'或'精准触发 AMBIGUOUS_INS_TYPE")
+
+    # 7c. 本次按职工医保结算，核实后更正为居民医保 -> “更正为”强力覆盖先前的职工指令，采用居民基准 ￥2604.84
+    m_7c = match_dip_rule("M17.9", age=68, ins_type="本次按职工医保结算，核实后更正为居民医保", op_keyword="保守")
+    assert m_7c["status"] == "MATCHED"
+    assert m_7c["benchmark_amount"] == 2604.84
+    print("PASS: “本次按职工医保结算，核实后更正为居民医保” -> 更正指令优先，准确采用居民基准 ￥2604.84")
+
+    # 7d. 职工医保，耗材按自费项目结算 -> 耗材范围自费不拦截整单医保，正常测算职工基准 ￥2790.90
+    m_7d = match_dip_rule("M17.9", age=68, ins_type="职工医保，耗材按自费项目结算", op_keyword="保守")
+    assert m_7d["status"] == "MATCHED"
+    assert m_7d["benchmark_amount"] == 2790.90
+    print("PASS: “职工医保，耗材按自费项目结算” -> 耗材支付范围隔离，正常测算职工基准 ￥2790.90")
+
+    # 7e. 本次按职工医保结算，保守还是手术？ -> 临床方案选择绝不误触发险种追问，正常测算职工基准 ￥2790.90
+    m_7e = match_dip_rule("M17.9", age=68, ins_type="本次按职工医保结算，保守还是手术？", op_keyword="保守")
+    assert m_7e["status"] == "MATCHED"
+    assert m_7e["benchmark_amount"] == 2790.90
+    print("PASS: “本次按职工医保结算，保守还是手术？” -> 临床方案选择不误伤已确认险种 ￥2790.90")
+
     print("\n" + "=" * 60)
-    print(">>> 恭喜！全部 13 类核心测试用例 100% 通过！ <<<")
+    print(">>> 恭喜！全部 14 类核心测试用例 100% 通过！ <<<")
     print("=" * 60)
 
 if __name__ == "__main__":

@@ -24,26 +24,42 @@ def get_loaded_rules(rule_version: str = "2026_SAMPLE_V1", force_reload: bool = 
         _RULES_CACHE[rule_version] = rules
     return _RULES_CACHE[rule_version]
 
+# ----------------------------------------------------
+# 统一医保别名定义 (肯定匹配与否定匹配共用同一套底表)
+# ----------------------------------------------------
+INS_ALIAS_EMP = r'(?:城镇职工医保|城镇职工|职工医保|单位职工|企业职工|在职职工|职工)'
+INS_ALIAS_RES = r'(?:城乡居民医保|城镇居民医保|城乡居民|城镇居民|居民医保|新型农村合作医疗|新农合|农村合作医疗|农合|居民)'
+INS_ALIAS_GF  = r'(?:公费医疗|公费)'
+INS_ALIAS_GS  = r'(?:工伤保险|工伤)'
+INS_ALIAS_ZF  = r'(?:全额自费|自费患者|纯自费|全自费|自费)'
+
+# 综合正则（按长度降序排列，避免短词贪婪截断长词，如避免“居民”提前截断“城乡居民”）
+ALL_INS_ALIASES = [
+    r'新型农村合作医疗', r'城镇职工医保', r'城乡居民医保', r'城镇居民医保',
+    r'农村合作医疗', r'城镇职工', r'单位职工', r'企业职工', r'在职职工', r'职工医保',
+    r'城乡居民', r'城镇居民', r'居民医保', r'公费医疗', r'工伤保险',
+    r'全额自费', r'自费患者', r'纯自费', r'全自费', r'新农合',
+    r'职工', r'居民', r'公费', r'工伤', r'农合', r'自费'
+]
+INS_ALIAS_COMBINED = r'(?:' + '|'.join(ALL_INS_ALIASES) + r')'
+
+NEGATION_PREFIXES = r'(?:非|不按|未按|不采用|未采用|排除|除外|不是|不属于|否认|不使用|未使用|不以|未以)'
+
+# 项目级范围限定词（前置出现时说明自费仅限具体项目，非整单险种）
+ITEM_SCOPE_PREFIXES = r'(?:耗材|材料|药品|西药|中药|草药|药|检查|检验|化验|治疗|手术耗材|特需|服务|部分项目|项目|部分|目录外|丙类)'
+
 def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
     """
-    统一参保类型解析与合规映射：
-    - 返回标准类别：'职工'、'居民'、'自费'
-    - '城镇居民'、'城乡居民'、'居民医保'、'新农合' -> '居民'（绝不因包含'城镇'而误入职工）
-    - '城镇职工'、'职工医保'、'职工' -> '职工'
-    - 仅有'城镇'而未指明'职工'或'居民' -> PENDING: AMBIGUOUS_INS_TYPE
-    - '公费医疗'、'工伤'等统筹区尚未核准映射的险种 -> PENDING: UNSUPPORTED_INS_TYPE
-    - 缺失/None/空 -> PENDING: MISSING_INS_TYPE
+    统一参保类型归一化与前置合规审查核心函数 (Round 10 优化版)：
+    1. 统一别名库：否定匹配与肯定匹配 100% 共享相同别名表，精准支持“城乡居民”等复合险种；
+    2. 针对性选择疑问句识别：仅当选择词连接的是两类及以上不同险种时触发 AMBIGUOUS_INS_TYPE，
+       若用户已确认险种而后文仅询问临床方案（如“保守还是手术”），绝不误判险种歧义；
+    3. “更正为/修改为/调整为”明确覆盖：后置更正指令强力覆盖既往/前置指令；
+    4. 支付范围前置隔离：“耗材按自费项目结算”精准判定为项目级自费，整单按基本医保正常测算；
+    5. 待查多符号与多字段解耦：冒号、破折号无缝支持，参保待查与病理待查互不干扰；
+    6. 仅有否定险种强力拦截并省略金额。
     """
-    if ins_type_str is None:
-        return {
-            "valid": False,
-            "category": None,
-            "status": "PENDING",
-            "reason": "MISSING_INS_TYPE",
-            "message": "缺少参保类型（职工/居民/自费），无法确定对应点值与测算基准"
-        }
-    s = str(ins_type_str).strip()
-    if not s or s.upper() in ("NONE", "NULL", "UNKNOWN", "未填", "未知"):
+    if not ins_type_str or not str(ins_type_str).strip():
         return {
             "valid": False,
             "category": None,
@@ -53,23 +69,20 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
             "message": "缺少有效参保类型（职工/居民/自费），无法确定对应点值与测算基准"
         }
 
-    import re
-
-    # 检查是否包含选择疑问句关键词 (如 "还是", "或者", "或")
-    is_choice_question = bool(re.search(r'(?:还是|或者|亦或|[与和]\s*.*(?:哪个|哪种))', s))
+    s = str(ins_type_str).strip()
 
     # 1. 分句拆分：按中英文逗号、句号、分号、问号、感叹号、换行符分割
     clauses = [c.strip() for c in re.split(r'[,，;；。?!？！\n]+', s) if c.strip()]
     clause_info = []
 
-    # 否定模式前缀正则
-    negation_prefix_pattern = r'(?:非|不按|未按|不采用|未采用|排除|除外|不是|不属于|否认|不使用|未使用|不以|未以)'
-
     for c in clauses:
         is_historical = bool(re.search(r'(?:原|既往|过去|曾|之前|既往的)', c))
-        is_negated = bool(re.search(negation_prefix_pattern, c))
+        is_negated = bool(re.search(NEGATION_PREFIXES, c))
         is_closed = bool(re.search(r'(?:已结案|已结清|结案|已终结)', c))
-        is_current_directive = bool(re.search(r'(?:本次|现|当前|此次|现已|确认|转为|以|按)', c))
+
+        # 检查是否包含更正指令（如“更正为居民医保”、“核实后更正为...”）
+        is_correction = bool(re.search(r'(?:更正为|修改为|调整为|变更为|改为|重新按|重新核准为|核实后为)', c))
+        is_current_directive = bool(re.search(r'(?:本次|现|当前|此次|现已|确认|转为|以|按)', c)) or is_correction
 
         # 检查参保类型待查：
         # 支持冒号（中文全角 ： 与英文半角 :）、空格、破折号、等号、“为”
@@ -80,14 +93,20 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
         elif re.search(r'^(?:待查|待定|未定|未知|未明确|不详)$', c) and any(k in s for k in ('参保', '险种', '医保类型')):
             has_ins_pending = True
 
-        # 检查是否属于项目级自费 (部分项目自费/自费项目/自费药品等)
-        is_item_level_self_pay = bool(re.search(r'(?:部分项目自费|项目自费|自费项目|部分自费|自费药品|自费耗材|自费药|自费部分|目录外自费)', c))
+        # 检查是否属于项目级自费
+        # 包含：明确词“部分项目自费/自费项目”或者“<项目范围>按自费/自费结算”
+        is_item_level_self_pay = False
+        if re.search(r'(?:部分项目自费|项目自费|自费项目|部分自费|自费药品|自费耗材|自费药|自费部分|目录外自费)', c):
+            is_item_level_self_pay = True
+        elif re.search(ITEM_SCOPE_PREFIXES + r'[^\w\s]*(?:按|以|属于|采用)?\s*自费', c):
+            is_item_level_self_pay = True
 
         clause_info.append({
             'text': c,
             'is_historical': is_historical,
             'is_negated': is_negated,
             'is_closed': is_closed,
+            'is_correction': is_correction,
             'is_current': is_current_directive,
             'has_ins_pending': has_ins_pending,
             'is_item_self_pay': is_item_level_self_pay
@@ -113,32 +132,65 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
             'message': f"检测到参保类型待查（{active_pending_clauses[0]['text']}），需明确参保类型后测算"
         }
 
-    # 3. 提取所有非历史、非否定的结算指令 (指令收集与选择疑问句消歧)
-    directive_targets = []
-    directive_pattern = r'(?:本次|现|当前|此次|现已|确认|转为)?\s*(?:按|以|采用|转为)\s*(?:城镇)?(职工|居民|公费医疗|公费|工伤保险|工伤|自费)(?:医保)?(?:结算)?'
+    # 3. 提取结算指令与更正指令
+    # 注意：若指令前存在“耗材/药品/检查”等项目修饰词，属于项目自费，严禁提取为整单结算指令！
+    directive_records = []  # 记录 (category, is_correction, clause_index)
 
-    for ci in clause_info:
+    # 指令匹配正则：支持“本次按/采用/转为/以”以及更正词“更正为/修改为/调整为”
+    # 使用统一别名表 INS_ALIAS_COMBINED
+    dir_verb = r'(?:更正为|修改为|调整为|变更为|改为|重新按|重新核准为|核实后为|按|以|采用|转为)'
+    dir_prefix = r'(?:本次|现|当前|此次|现已|确认|核实后)?\s*'
+    combined_dir_regex = re.compile(dir_prefix + f'({dir_verb})' + r'\s*' + f'({INS_ALIAS_COMBINED})' + r'(?:医保)?(?:结算)?')
+
+    for idx, ci in enumerate(clause_info):
         if ci['is_historical'] or ci['is_negated']:
             continue
         c = ci['text']
-        # 在同一个分句内可能出现多个指令，例如 "按职工医保还是按居民医保结算"
-        for m in re.finditer(directive_pattern, c):
-            raw_tgt = m.group(1)
-            if '公费' in raw_tgt:
-                directive_targets.append('公费医疗')
-            elif '工伤' in raw_tgt:
-                directive_targets.append('工伤保险')
-            elif '自费' in raw_tgt:
-                directive_targets.append('自费')
-            elif any(k in raw_tgt for k in ('居民', '农合')):
-                directive_targets.append('居民')
-            elif '职工' in raw_tgt:
-                directive_targets.append('职工')
 
-    distinct_directives = list(dict.fromkeys(directive_targets))
+        for m in combined_dir_regex.finditer(c):
+            verb = m.group(1)
+            raw_tgt = m.group(2)
+            start_pos = m.start()
+            pre_text = c[:start_pos].strip()
 
-    # 3.1 若存在多个不同的结算指令，或者包含选择疑问词且指令/候选多于1个 -> 触发 AMBIGUOUS_INS_TYPE 追问
-    if len(distinct_directives) > 1 or (is_choice_question and len(distinct_directives) >= 1):
+            # 检查指令前面是否紧挨着“耗材/药品/检查”等项目范围限定词
+            # 如“耗材按自费项目结算”中的“按自费”
+            if re.search(ITEM_SCOPE_PREFIXES + r'[^\w\s]*$', pre_text):
+                # 属于项目范围自费，绝不作为整单住院指令！
+                continue
+
+            matched_cat = None
+            if re.search(INS_ALIAS_GF, raw_tgt):
+                matched_cat = '公费医疗'
+            elif re.search(INS_ALIAS_GS, raw_tgt):
+                matched_cat = '工伤保险'
+            elif re.search(INS_ALIAS_ZF, raw_tgt):
+                matched_cat = '自费'
+            elif re.search(INS_ALIAS_RES, raw_tgt):
+                matched_cat = '居民'
+            elif re.search(INS_ALIAS_EMP, raw_tgt):
+                matched_cat = '职工'
+
+            if matched_cat:
+                is_corr = ci['is_correction'] or any(k in verb for k in ('更正', '修改', '调整', '变更', '改'))
+                directive_records.append({
+                    'category': matched_cat,
+                    'is_correction': is_corr,
+                    'clause_idx': idx,
+                    'text': m.group(0)
+                })
+
+    # 3.1 检查是否存在明确的险种间选择疑问句（连接了两个及以上不同险种候选）
+    # 例如：“按职工医保还是按居民医保结算？”、“按职工医保或居民医保结算？”
+    # 必须限定在险种与险种之间的选择，绝不误拦截“保守还是手术”！
+    ins_choice_pattern = re.compile(
+        f'(?:按|以|采用)?\s*(?:{INS_ALIAS_COMBINED})\s*(?:还是|或者|或|亦或)\s*(?:按|以|采用)?\s*(?:{INS_ALIAS_COMBINED})'
+    )
+    has_ins_choice = bool(ins_choice_pattern.search(s))
+
+    # 如果指令列表中存在多个不同的非更正指令，或者文本中存在险种间的选择连词：
+    distinct_dir_cats = list(dict.fromkeys([d['category'] for d in directive_records if not d['is_correction']]))
+    if has_ins_choice or len(distinct_dir_cats) > 1:
         return {
             'valid': False,
             'category': None,
@@ -148,45 +200,31 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
             'message': '输入包含选择性或冲突的参保结算指令（如“按职工还是按居民”），请明确患者本次住院具体按哪类险种结算（城镇职工 / 城乡居民）'
         }
 
-    # 3.2 若恰好有唯一确定的肯定结算指令，直接按该指令执行
-    if len(distinct_directives) == 1:
-        single_dir = distinct_directives[0]
+    # 3.2 检查更正指令优先覆盖（如“本次按职工医保结算，核实后更正为居民医保”）
+    # 后置更正指令强力覆盖先前的任何指令
+    correction_records = [d for d in directive_records if d['is_correction']]
+    if correction_records:
+        final_correction = correction_records[-1]['category']
+        if final_correction == '公费医疗':
+            return {'valid': False, 'category': None, 'status': 'PENDING', 'reason': 'UNSUPPORTED_INS_TYPE:公费医疗', 'pending_reason': 'UNSUPPORTED_INS_TYPE:公费医疗', 'message': '公费医疗统筹区尚未核准 DIP 映射，不适用基本医保 DIP 测算基准，需人工核实'}
+        elif final_correction == '工伤保险':
+            return {'valid': False, 'category': None, 'status': 'PENDING', 'reason': 'UNSUPPORTED_INS_TYPE:工伤保险', 'pending_reason': 'UNSUPPORTED_INS_TYPE:工伤保险', 'message': '工伤保险由工伤保险基金单独支付，不适用基本医保 DIP 分值付费测算'}
+        elif final_correction == '自费':
+            return {'valid': True, 'category': '自费', 'status': 'NOT_APPLICABLE', 'reason': 'SELF_PAY', 'pending_reason': 'SELF_PAY', 'message': '自费患者不适用医保 DIP 支付规则'}
+        elif final_correction in ('居民', '职工'):
+            return {'valid': True, 'category': final_correction, 'status': 'MATCHED', 'reason': None, 'pending_reason': None, 'message': None}
+
+    # 3.3 检查唯一确定的肯定结算指令（无更正、无歧义冲突）
+    if len(directive_records) == 1:
+        single_dir = directive_records[0]['category']
         if single_dir == '公费医疗':
-            return {
-                'valid': False,
-                'category': None,
-                'status': 'PENDING',
-                'reason': 'UNSUPPORTED_INS_TYPE:公费医疗',
-                'pending_reason': 'UNSUPPORTED_INS_TYPE:公费医疗',
-                'message': '公费医疗统筹区尚未核准 DIP 映射，不适用基本医保 DIP 测算基准，需人工核实'
-            }
+            return {'valid': False, 'category': None, 'status': 'PENDING', 'reason': 'UNSUPPORTED_INS_TYPE:公费医疗', 'pending_reason': 'UNSUPPORTED_INS_TYPE:公费医疗', 'message': '公费医疗统筹区尚未核准 DIP 映射，不适用基本医保 DIP 测算基准，需人工核实'}
         elif single_dir == '工伤保险':
-            return {
-                'valid': False,
-                'category': None,
-                'status': 'PENDING',
-                'reason': 'UNSUPPORTED_INS_TYPE:工伤保险',
-                'pending_reason': 'UNSUPPORTED_INS_TYPE:工伤保险',
-                'message': '工伤保险由工伤保险基金单独支付，不适用基本医保 DIP 分值付费测算'
-            }
+            return {'valid': False, 'category': None, 'status': 'PENDING', 'reason': 'UNSUPPORTED_INS_TYPE:工伤保险', 'pending_reason': 'UNSUPPORTED_INS_TYPE:工伤保险', 'message': '工伤保险由工伤保险基金单独支付，不适用基本医保 DIP 分值付费测算'}
         elif single_dir == '自费':
-            return {
-                'valid': True,
-                'category': '自费',
-                'status': 'NOT_APPLICABLE',
-                'reason': 'SELF_PAY',
-                'pending_reason': 'SELF_PAY',
-                'message': '自费患者不适用医保 DIP 支付规则'
-            }
+            return {'valid': True, 'category': '自费', 'status': 'NOT_APPLICABLE', 'reason': 'SELF_PAY', 'pending_reason': 'SELF_PAY', 'message': '自费患者不适用医保 DIP 支付规则'}
         elif single_dir in ('居民', '职工'):
-            return {
-                'valid': True,
-                'category': single_dir,
-                'status': 'MATCHED',
-                'reason': None,
-                'pending_reason': None,
-                'message': None
-            }
+            return {'valid': True, 'category': single_dir, 'status': 'MATCHED', 'reason': None, 'pending_reason': None, 'message': None}
 
     # 4. 收集非历史、排除否定与结案短语后的活跃候选险种
     active_tokens = []
@@ -195,32 +233,36 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
     has_occupation_only = False
     has_pure_self_pay = False
 
+    negation_matcher = re.compile(NEGATION_PREFIXES + r'\s*(' + INS_ALIAS_COMBINED + r')')
+    negation_cleaner = re.compile(NEGATION_PREFIXES + r'\s*(?:' + INS_ALIAS_COMBINED + r')')
+
     for ci in clause_info:
         if ci['is_historical']:
             continue
         c = ci['text']
 
-        # 记录被明确否定的险种
-        for neg_m in re.finditer(negation_prefix_pattern + r'\s*(?:城镇)?(工伤(?:保险)?|公费(?:医疗)?|职工(?:医保)?|居民(?:医保)?|新农合|自费)', c):
-            neg_tgt = neg_m.group(1)
-            if '职工' in neg_tgt:
+        # 4.1 提取被明确否定的险种（共用同一套 INS_ALIAS_COMBINED 底表）
+        for neg_m in negation_matcher.finditer(c):
+            raw_neg = neg_m.group(1)
+            if re.search(INS_ALIAS_EMP, raw_neg):
                 negated_tokens.append('职工')
-            elif any(k in neg_tgt for k in ('居民', '农合')):
+            elif re.search(INS_ALIAS_RES, raw_neg):
                 negated_tokens.append('居民')
-            elif '公费' in neg_tgt:
+            elif re.search(INS_ALIAS_GF, raw_neg):
                 negated_tokens.append('公费医疗')
-            elif '工伤' in neg_tgt:
+            elif re.search(INS_ALIAS_GS, raw_neg):
                 negated_tokens.append('工伤保险')
-            elif '自费' in neg_tgt:
+            elif re.search(INS_ALIAS_ZF, raw_neg):
                 negated_tokens.append('自费')
 
-        # 清除所有否定短语与已结案工伤
-        c_clean = re.sub(negation_prefix_pattern + r'\s*(?:城镇)?(?:工伤(?:保险)?|公费(?:医疗)?|职工(?:医保)?|居民(?:医保)?|新农合|自费)', '', c)
+        # 清除所有被否定的险种短语与已结案工伤
+        c_clean = negation_cleaner.sub('', c)
         c_clean = re.sub(r'工伤(?:已结案|已结清|结案)', '', c_clean)
 
-        # 检查项目级自费：若包含“部分项目自费/自费项目/部分自费”，则剔除该自费短语，不作为整单险种
+        # 检查项目级自费：若属于项目级自费，彻底消除该自费短语，不作为整单险种
         if ci['is_item_self_pay']:
             c_clean = re.sub(r'(?:部分项目自费|项目自费|自费项目|部分自费|自费药品|自费耗材|自费药|自费部分|目录外自费)', '', c_clean)
+            c_clean = re.sub(ITEM_SCOPE_PREFIXES + r'[^\w\s]*(?:按|以|属于|采用)?\s*自费[^\w\s]*(?:项目|结算)?', '', c_clean)
 
         # 提取活跃险种词
         if any(k in c_clean for k in ('全额自费', '纯自费', '全自费', '自费患者', '无医保')):
@@ -229,20 +271,21 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
         elif '自费' in c_clean and not ci['is_item_self_pay']:
             active_tokens.append('自费')
 
-        if '公费' in c_clean:
+        if re.search(INS_ALIAS_GF, c_clean):
             active_tokens.append('公费医疗')
-        if '工伤' in c_clean:
+        if re.search(INS_ALIAS_GS, c_clean):
             active_tokens.append('工伤保险')
-        if any(k in c_clean for k in ('城镇居民', '居民医保', '城乡居民', '居民', '城乡', '农合', '新农合')):
+        if re.search(INS_ALIAS_RES, c_clean):
             active_tokens.append('居民')
-        if any(k in c_clean for k in ('城镇职工', '职工医保', '职工')):
+        if re.search(INS_ALIAS_EMP, c_clean):
             active_tokens.append('职工')
-        if '城镇' in c_clean and not any(k in c_clean for k in ('城镇居民', '城镇职工')):
+
+        if '城镇' in c_clean and not re.search(r'(?:城镇职工|城镇居民)', c_clean):
             has_ambiguous_urban = True
         if any(k in c_clean for k in ('退休', '在职', '已退休', '离休', '无业', '待业', '务农', '学生')) and not any(k in c_clean for k in ('职工', '居民', '公费', '工伤', '自费')):
             has_occupation_only = True
 
-    # 4.1 若整个输入只排除了某种险种，而未提供任何正向有效险种（例如“本次未按职工医保结算”/“本次不采用居民医保”）
+    # 4.2 若整个输入只排除了某种险种，而未提供任何正向有效险种（如“本次未按城乡居民医保结算” / “本次未按职工医保结算”）
     # 强制进入 PENDING 追问，严禁将否定险种作为确定结果输出
     if not active_tokens and negated_tokens:
         neg_str = "、".join(list(dict.fromkeys(negated_tokens)))
@@ -255,10 +298,8 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
             'message': f"检测到输入排除了【{neg_str}】，但未说明实际参保类型，请明确本次住院按哪类险种结算（城镇职工 / 城乡居民 / 自费）"
         }
 
-    # 4.2 若包含选择疑问句（如“职工医保还是居民医保？”）且同时出现多个候选
-    has_res = '居民' in active_tokens
-    has_emp = '职工' in active_tokens
-    if is_choice_question and (has_res or has_emp):
+    # 4.3 若文本中存在险种间的选择连词（如“职工医保还是居民医保？” / “职工医保或居民医保”）
+    if has_ins_choice:
         return {
             'valid': False,
             'category': None,
@@ -268,7 +309,7 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
             'message': '输入包含选择性险种提问（如“职工医保还是居民医保”），请明确患者本次住院具体按哪类险种结算（城镇职工 / 城乡居民）'
         }
 
-    # 4.3 特殊险种（公费医疗、工伤保险）优先阻断拦截，严禁误判为职工医保
+    # 4.4 特殊险种（公费医疗、工伤保险）优先阻断拦截，严禁误判为职工医保
     if '公费医疗' in active_tokens:
         return {
             'valid': False,
@@ -288,8 +329,11 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
             'message': '工伤保险由工伤保险基金单独支付，不适用基本医保 DIP 分值付费测算'
         }
 
-    # 4.4 判定具有基本医保（职工/居民）时的项目自费兼容：
+    # 4.5 判定具有基本医保（职工/居民）时的项目自费兼容：
     # 若已有职工或居民医保，且未指定全额纯自费，则整单按职工或居民医保计算，项目自费不拦截整单医保
+    has_res = '居民' in active_tokens
+    has_emp = '职工' in active_tokens
+
     if (has_emp or has_res) and not has_pure_self_pay:
         if has_res and has_emp:
             return {
@@ -305,7 +349,7 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
         if has_res:
             return {'valid': True, 'category': '居民', 'status': 'MATCHED', 'reason': None, 'pending_reason': None, 'message': None}
 
-    # 4.5 纯自费处理
+    # 4.6 纯自费处理
     if '自费' in active_tokens:
         return {
             'valid': True,

@@ -286,8 +286,56 @@ def run_phase1_tests():
     assert "2790.90" in res_10f["reply"]
     print("PASS [Case 10f]: “职工医保，部分项目自费” -> 项目级自费兼容，正常测算职工基准 ￥2790.90")
 
+    # ---------------- 用例 11: Round 10 审查验收 (城乡居民别名否定、单字'或'与方案选择消歧、更正为覆盖、耗材自费隔离) ----------------
+    print("\n--- [Case 11] Round 10 审查验收 (城乡居民别名否定、单字'或'与方案选择消歧、更正为覆盖、耗材自费隔离) ---")
+    # 11a. 本次未按城乡居民医保结算 -> 否定规则必须支持“城乡居民”复合别名，严禁错选居民基准 2604.84
+    q_11a = "68岁，本次未按城乡居民医保结算，M17.9，保守治疗"
+    res_11a = parse_local_intent(q_11a)
+    assert res_11a["intent"] == "need_clarification"
+    assert res_11a["data"]["status"] == "PENDING"
+    assert res_11a["data"]["pending_reason"] == "MISSING_INS_TYPE"
+    assert "2604.84" not in res_11a["reply"]
+    print("PASS [Case 11a]: “本次未按城乡居民医保结算” -> 统一别名否定识别，标记 PENDING / MISSING_INS_TYPE，零金额输出")
+
+    # 11b. 按职工医保或居民医保结算？ -> 单字“或”选择疑问句消歧，标记 AMBIGUOUS_INS_TYPE
+    q_11b = "68岁，按职工医保或居民医保结算？M17.9，保守治疗"
+    res_11b = parse_local_intent(q_11b)
+    assert res_11b["intent"] == "need_clarification"
+    assert res_11b["data"]["status"] == "PENDING"
+    assert res_11b["data"]["pending_reason"] == "AMBIGUOUS_INS_TYPE"
+    assert "2790.90" not in res_11b["reply"]
+    assert "2604.84" not in res_11b["reply"]
+    print("PASS [Case 11b]: “按职工医保或居民医保结算？” -> 单字'或'精准触发 AMBIGUOUS_INS_TYPE")
+
+    # 11c. 本次按职工医保结算，核实后更正为居民医保 -> “更正为”强力覆盖先前的职工指令，采用居民基准 ￥2604.84
+    q_11c = "68岁，本次按职工医保结算，核实后更正为居民医保，M17.9，保守治疗"
+    res_11c = parse_local_intent(q_11c)
+    assert res_11c["intent"] == "query_dip_rule"
+    assert res_11c["data"]["matched"] is True
+    assert res_11c["data"]["benchmark_amount"] == 2604.84
+    assert "2604.84" in res_11c["reply"]
+    print("PASS [Case 11c]: “本次按职工医保结算，核实后更正为居民医保” -> 更正指令优先，准确采用居民基准 ￥2604.84")
+
+    # 11d. 职工医保，耗材按自费项目结算 -> 耗材范围自费不拦截整单医保，正常测算职工基准 ￥2790.90
+    q_11d = "68岁，职工医保，耗材按自费项目结算，M17.9，保守治疗"
+    res_11d = parse_local_intent(q_11d)
+    assert res_11d["intent"] == "query_dip_rule"
+    assert res_11d["data"]["matched"] is True
+    assert res_11d["data"]["benchmark_amount"] == 2790.90
+    assert "2790.90" in res_11d["reply"]
+    print("PASS [Case 11d]: “职工医保，耗材按自费项目结算” -> 耗材支付范围隔离，正常测算职工基准 ￥2790.90")
+
+    # 11e. 本次按职工医保结算，保守还是手术？ -> 临床方案选择绝不误触发险种追问，正常测算职工基准 ￥2790.90
+    q_11e = "68岁，本次按职工医保结算，M17.9，保守还是手术？"
+    res_11e = parse_local_intent(q_11e)
+    assert res_11e["intent"] == "query_dip_rule"
+    assert res_11e["data"]["matched"] is True
+    assert res_11e["data"]["benchmark_amount"] == 2790.90
+    assert "2790.90" in res_11e["reply"]
+    print("PASS [Case 11e]: “本次按职工医保结算，保守还是手术？” -> 临床方案选择不误伤已确认险种 ￥2790.90")
+
     print("\n" + "=" * 70)
-    print(">>> 恭喜！Phase 1 验收回归测试套件全部 10 大关键测试集 100% 通过！ <<<")
+    print(">>> 恭喜！Phase 1 验收回归测试套件全部 11 大关键测试集 100% 通过！ <<<")
     print("=" * 70)
 
 if __name__ == "__main__":
