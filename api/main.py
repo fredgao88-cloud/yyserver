@@ -167,7 +167,15 @@ async def check_patient_dip(req: CheckPatientDipRequest, x_operator_id: Optional
         }
 
     # 唯一定位成功，进行交叉相乘判灯计算
-    bm = Decimal(str(rule_res["benchmark_amount"]))
+    bm = Decimal(str(rule_res.get("benchmark_amount") or 0))
+    if bm <= Decimal("0"):
+        return {
+            "success": False,
+            "patient_id": req.patient_id,
+            "status": "PENDING",
+            "pending_reason": "INVALID_BENCHMARK",
+            "message": "命中规则基准金额为零或无效（<=0），无法进行有效控费判灯测算"
+        }
     low_th = Decimal(str(rule_res["low_threshold"]))
     high_th = Decimal(str(rule_res["high_threshold"]))
     

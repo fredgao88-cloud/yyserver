@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 from db.local_db import get_local_db_connection, query_approved_dip_rules
 from db.his_reader import HISReader
-from tools.dip_calculator import match_dip_rule, evaluate_traffic_light, get_loaded_rules
+from tools.dip_calculator import match_dip_rule, evaluate_traffic_light, get_loaded_rules, normalize_insurance_type
 
 # Timezone helper for Beijing (UTC+8)
 BEIJING_TZ = timezone(timedelta(hours=8))
@@ -41,17 +41,13 @@ class InpatientScanner:
     def map_insurance_type(self, ylzffs: Optional[str], fylx: Optional[str]) -> str:
         """Map HIS payment/insurance codes to standard insurance category."""
         if fylx:
-            fylx_s = str(fylx).strip()
-            if "自费" in fylx_s:
-                return "自费"
-            if "职工" in fylx_s or "城镇" in fylx_s:
-                return "职工"
-            if "居民" in fylx_s or "新农合" in fylx_s or "城乡" in fylx_s or "农合" in fylx_s:
-                return "居民"
-            if "公费" in fylx_s:
-                return "公费医疗"
-            if fylx_s:
-                return fylx_s
+            norm = normalize_insurance_type(fylx)
+            if norm["valid"]:
+                return norm["category"]
+            elif norm["reason"].startswith("UNSUPPORTED_INS_TYPE"):
+                return fylx.strip()
+            elif norm["reason"] == "AMBIGUOUS_INS_TYPE":
+                return "AMBIGUOUS_城镇"
 
         if ylzffs:
             s = str(ylzffs).strip()
@@ -176,18 +172,14 @@ class InpatientScanner:
                 alert_level = "PENDING"
                 pending_reason = None
 
-                is_employee = bool("职工" in ins_type or "城镇" in ins_type)
-                is_resident = bool("居民" in ins_type or "城乡" in ins_type or "农合" in ins_type)
+                norm_ins = normalize_insurance_type(ins_type)
 
-                if ins_type == "自费":
+                if not norm_ins["valid"]:
+                    alert_level = "PENDING"
+                    pending_reason = norm_ins["reason"]
+                elif norm_ins["category"] == "自费":
                     alert_level = "NOT_APPLICABLE"
                     pending_reason = "SELF_PAY"
-                elif ins_type == "UNKNOWN":
-                    alert_level = "PENDING"
-                    pending_reason = "MISSING_INS_TYPE"
-                elif not is_employee and not is_resident:
-                    alert_level = "PENDING"
-                    pending_reason = f"UNSUPPORTED_INS_TYPE:{ins_type}"
                 elif not diag_code and not diag_name and not op_kw:
                     alert_level = "PENDING"
                     pending_reason = "MISSING_DIAGNOSIS"
@@ -200,7 +192,7 @@ class InpatientScanner:
                     match_res = match_dip_rule(
                         disease=disease_query,
                         age=age,
-                        ins_type=ins_type,
+                        ins_type=norm_ins["category"],
                         op_keyword=op_kw,
                         bed_days=bed_days,
                         rule_version=self.rule_version

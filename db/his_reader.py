@@ -123,39 +123,32 @@ class HISReader:
             if not valid_settlements:
                 return {}
 
-            if settlement_id:
-                # Targeted single settlement reconciliation
-                cur.execute("SELECT * FROM dbo.his_zyjz WHERE lsh = %s AND id = %s", (lsh, settlement_id))
-                target_rec = cur.fetchone()
-                if not target_rec:
-                    return {}
-                zyjz_record = target_rec
-                active_ids = [target_rec['id']]
-                reconciliation_scope = "SINGLE_SETTLEMENT"
+            # 判断结算单数量
+            # 若同一次住院存在多张有效结算单，因明细表（his_zycz 与 his_cfmain_fyjl）在 HIS 架构中仅关联就诊流水号 lsh，
+            # 无论调用方是否指定单张 settlement_id，均自动按整次住院汇总结算金额（ADMISSION_LEVEL）与整次住院明细对账，
+            # 彻底杜绝“拿单张结算单金额比对整次住院明细”引发的范围不对齐
+            if len(valid_settlements) > 1:
+                reconciliation_scope = "ADMISSION_LEVEL"
+                active_ids = [s['id'] for s in valid_settlements]
+                total_amoney = sum((Decimal(str(s['amoney'])) for s in valid_settlements), Decimal('0'))
+                total_czmoney = sum((Decimal(str(s.get('czmoney') or 0)) for s in valid_settlements), Decimal('0'))
+                total_yjmoney = sum((Decimal(str(s.get('yjmoney') or 0)) for s in valid_settlements), Decimal('0'))
+                total_yfmoney = sum((Decimal(str(s.get('yfmoney') or 0)) for s in valid_settlements), Decimal('0'))
+                zyjz_record = {
+                    'lsh': lsh,
+                    'id': ','.join(str(i) for i in active_ids),
+                    'target_settlement_id': settlement_id,
+                    'amoney': total_amoney,
+                    'czmoney': total_czmoney,
+                    'yjmoney': total_yjmoney,
+                    'yfmoney': total_yfmoney,
+                    'settlement_count': len(valid_settlements),
+                    'multi_settlements': valid_settlements
+                }
             else:
-                if len(valid_settlements) == 1:
-                    zyjz_record = valid_settlements[0]
-                    active_ids = [zyjz_record['id']]
-                    reconciliation_scope = "SINGLE_SETTLEMENT"
-                else:
-                    # Multi-settlement case: clinical and pharmacy items are admission-level (linked by lsh).
-                    # Aggregate category ledgers and settlement master amounts across all valid settlements.
-                    reconciliation_scope = "ADMISSION_LEVEL"
-                    active_ids = [s['id'] for s in valid_settlements]
-                    total_amoney = sum((Decimal(str(s['amoney'])) for s in valid_settlements), Decimal('0'))
-                    total_czmoney = sum((Decimal(str(s.get('czmoney') or 0)) for s in valid_settlements), Decimal('0'))
-                    total_yjmoney = sum((Decimal(str(s.get('yjmoney') or 0)) for s in valid_settlements), Decimal('0'))
-                    total_yfmoney = sum((Decimal(str(s.get('yfmoney') or 0)) for s in valid_settlements), Decimal('0'))
-                    zyjz_record = {
-                        'lsh': lsh,
-                        'id': ','.join(str(i) for i in active_ids),
-                        'amoney': total_amoney,
-                        'czmoney': total_czmoney,
-                        'yjmoney': total_yjmoney,
-                        'yfmoney': total_yfmoney,
-                        'settlement_count': len(valid_settlements),
-                        'multi_settlements': valid_settlements
-                    }
+                reconciliation_scope = "SINGLE_SETTLEMENT"
+                zyjz_record = valid_settlements[0]
+                active_ids = [zyjz_record['id']]
 
             # 2. Category ledger (his_zycjz)
             if len(active_ids) == 1:

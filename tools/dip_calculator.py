@@ -24,6 +24,82 @@ def get_loaded_rules(rule_version: str = "2026_SAMPLE_V1", force_reload: bool = 
         _RULES_CACHE[rule_version] = rules
     return _RULES_CACHE[rule_version]
 
+def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
+    """
+    统一参保类型解析与合规映射：
+    - 返回标准类别：'职工'、'居民'、'自费'
+    - '城镇居民'、'城乡居民'、'居民医保'、'新农合' -> '居民'（绝不因包含'城镇'而误入职工）
+    - '城镇职工'、'职工医保'、'职工' -> '职工'
+    - 仅有'城镇'而未指明'职工'或'居民' -> PENDING: AMBIGUOUS_INS_TYPE
+    - '公费医疗'、'工伤'等统筹区尚未核准映射的险种 -> PENDING: UNSUPPORTED_INS_TYPE
+    - 缺失/None/空 -> PENDING: MISSING_INS_TYPE
+    """
+    if ins_type_str is None:
+        return {
+            "valid": False,
+            "category": None,
+            "status": "PENDING",
+            "reason": "MISSING_INS_TYPE",
+            "message": "缺少参保类型（职工/居民/自费），无法确定对应点值与测算基准"
+        }
+    s = str(ins_type_str).strip()
+    if not s or s.upper() in ("NONE", "NULL", "UNKNOWN", "未填", "未知"):
+        return {
+            "valid": False,
+            "category": None,
+            "status": "PENDING",
+            "reason": "MISSING_INS_TYPE",
+            "message": "缺少有效参保类型（职工/居民/自费），无法确定对应点值与测算基准"
+        }
+
+    if "自费" in s:
+        return {
+            "valid": True,
+            "category": "自费",
+            "status": "NOT_APPLICABLE",
+            "reason": "SELF_PAY",
+            "message": "自费患者不适用医保 DIP 支付规则"
+        }
+
+    # 优先匹配“城镇居民”与“居民”系列，绝不因包含“城镇”而错落入职工
+    if any(k in s for k in ("城镇居民", "居民", "城乡", "农合", "新农合")):
+        return {
+            "valid": True,
+            "category": "居民",
+            "status": "MATCHED",
+            "reason": None,
+            "message": None
+        }
+
+    # 匹配职工系列
+    if any(k in s for k in ("城镇职工", "职工", "在职职工", "退休职工")):
+        return {
+            "valid": True,
+            "category": "职工",
+            "status": "MATCHED",
+            "reason": None,
+            "message": None
+        }
+
+    # 仅有“城镇”字样但无“职工”或“居民”
+    if "城镇" in s:
+        return {
+            "valid": False,
+            "category": None,
+            "status": "PENDING",
+            "reason": "AMBIGUOUS_INS_TYPE",
+            "message": f"参保类型【{s}】含义模糊（需明确为城镇职工还是城镇居民），两者统筹点值不同，需明确后测算"
+        }
+
+    # 公费医疗、工伤等统筹区尚未核准映射的类型
+    return {
+        "valid": False,
+        "category": None,
+        "status": "PENDING",
+        "reason": f"UNSUPPORTED_INS_TYPE:{s}",
+        "message": f"参保类型【{s}】不适用当前统筹区基本医保 DIP 测算基准（仅支持职工/居民），需人工核实，绝不盲目套用居民标准"
+    }
+
 def evaluate_traffic_light(
     current_cost: Decimal,
     benchmark: Decimal,
@@ -103,7 +179,7 @@ def evaluate_traffic_light(
 def match_dip_rule(
     disease: str,
     age: Optional[int] = None,
-    ins_type: Optional[str] = "职工",
+    ins_type: Optional[str] = None,
     op_keyword: Optional[str] = None,
     bed_days: Optional[int] = None,
     is_tcm_advantage: Optional[bool] = None,
@@ -111,21 +187,24 @@ def match_dip_rule(
 ) -> Dict[str, Any]:
     """
     DIP 规则匹配主流程：
-    1. 自费拦截 -> NOT_APPLICABLE
-    2. 参保类型缺失阻断 -> PENDING (MISSING_INS_TYPE)
+    1. 统一参保类型校验（职工/居民/自费，严格区分城镇居民与城镇职工） -> PENDING (MISSING_INS_TYPE / UNSUPPORTED_INS_TYPE)
+    2. 自费拦截 -> NOT_APPLICABLE
     3. 从库中读取生效规则进行检索匹配
     4. 多重属性过滤（ICD编码/诊断名称、年龄辅助目录、手术/操作类型、床日付费标识）
     5. 针对多候选、缺参、按床日缺天数严格标 PENDING，绝不盲取第一条
-    6. 读取 matched rule 自身参数计算基准金额，严禁硬编码
+    6. 读取 matched rule 自身参数计算基准金额，零基准/无效基准统一拦截为 PENDING (INVALID_BENCHMARK)
     """
-    ins_is_self_pay = bool(ins_type and "自费" in ins_type)
-    if not ins_type:
+    norm_ins = normalize_insurance_type(ins_type)
+    if not norm_ins["valid"]:
         return {
             "matched": False,
             "status": "PENDING",
-            "pending_reason": "MISSING_INS_TYPE",
-            "message": "缺少参保类型（职工/居民/自费），无法确定对应点值与测算基准"
+            "pending_reason": norm_ins["reason"],
+            "message": norm_ins["message"]
         }
+    ins_is_self_pay = (norm_ins["category"] == "自费")
+    is_employee = (norm_ins["category"] == "职工")
+    is_resident = (norm_ins["category"] == "居民")
     
     # 获取数据库生效规则
     try:
@@ -373,22 +452,6 @@ def match_dip_rule(
             "range_90_110": None
         }
 
-    # Step 7.5: 参保类型合规检查（当前统筹区仅支持职工医保与居民医保测算）
-    # 公费医疗、工伤等尚未核准映射的参保类型，统一标记 PENDING 并保留原类别，严禁盲目套用居民规则
-    is_employee = bool("职工" in ins_type or "城镇" in ins_type)
-    is_resident = bool("居民" in ins_type or "城乡" in ins_type or "农合" in ins_type)
-
-    if not is_employee and not is_resident:
-        return {
-            "matched": False,
-            "status": "PENDING",
-            "pending_reason": f"UNSUPPORTED_INS_TYPE:{ins_type}",
-            "message": f"参保类型【{ins_type}】不适用当前统筹区基本医保 DIP 测算基准（仅支持职工/居民），需人工核实，绝不盲目套用居民标准",
-            "rule_id": rule["rule_id"],
-            "rule_version": rule["rule_version"],
-            "ins_type": ins_type
-        }
-
     # Step 8: 从数据库字段动态读取参数计算基准金额（严禁硬编码系数）
     dip_score = Decimal(str(rule["dip_score"]))
     hosp_coef = Decimal(str(rule["hosp_coef"]))
@@ -407,6 +470,22 @@ def match_dip_rule(
         benchmark = (base_unit * days_dec).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     else:
         benchmark = base_unit.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    # 零基准与无效基准核心层统一拦截（绝不返回 top-level MATCHED 或 benchmark_amount: 0.0）
+    if benchmark <= Decimal("0"):
+        return {
+            "matched": False,
+            "status": "PENDING",
+            "pending_reason": "INVALID_BENCHMARK",
+            "message": "命中规则基准金额为零或无效（<=0），需核实医保目录分值与点值参数，无法输出有效测算基准",
+            "rule_id": rule["rule_id"],
+            "rule_version": rule["rule_version"],
+            "department": rule["department"],
+            "disease_code": rule["icd_code"],
+            "disease_name": rule["icd_name"],
+            "group_name": rule["dip_group_name"],
+            "ins_type": "职工" if is_employee else "居民"
+        }
 
     range_lower = (benchmark * low_th).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     range_upper = (benchmark * high_th).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
@@ -435,6 +514,8 @@ def match_dip_rule(
 
 def calculate_benchmark(score: Decimal, ins_type: str, point_val: Optional[Decimal] = None, hosp_coef: Optional[Decimal] = None) -> Decimal:
     """兼容旧接口的基准金额测算函数"""
-    pv = point_val if point_val is not None else (Decimal("7.5") if ("职工" in ins_type or "城镇" in ins_type) else Decimal("7.0"))
+    norm = normalize_insurance_type(ins_type)
+    is_emp = (norm.get("category") == "职工")
+    pv = point_val if point_val is not None else (Decimal("7.5") if is_emp else Decimal("7.0"))
     hc = hosp_coef if hosp_coef is not None else Decimal("0.6")
     return (score * pv * hc).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)

@@ -127,7 +127,7 @@ def run_tests():
     print(f"PASS: M17.9 自费患者匹配 -> status={m_self['status']}, message={m_self['message']}")
 
     # Case I: 未支持参保类型（如公费医疗、工伤），严禁套用居民标准，统一标 PENDING
-    print("\n--- [Test 4] 未支持参保类型合规拦截测试 ---")
+    print("\n--- [Test 4] 参保类型合规与险种别名对齐测试 ---")
     m_gongfei = match_dip_rule("M17.9", age=68, ins_type="公费医疗", op_keyword="保守")
     assert m_gongfei["status"] == "PENDING", f"Expected PENDING, got {m_gongfei['status']}"
     assert m_gongfei["pending_reason"] == "UNSUPPORTED_INS_TYPE:公费医疗"
@@ -139,8 +139,48 @@ def run_tests():
     assert m_gongshang["pending_reason"] == "UNSUPPORTED_INS_TYPE:工伤保险"
     print(f"PASS: 工伤保险拦截 -> status={m_gongshang['status']}, reason={m_gongshang['pending_reason']}")
 
+    # Case J: 【审查关键验收】“城镇居民医保”与“居民医保”必须得到完全相同的基准和灯色！
+    m_res_pure = match_dip_rule("M17.9", age=68, ins_type="居民医保", op_keyword="保守")
+    m_res_city = match_dip_rule("M17.9", age=68, ins_type="城镇居民医保", op_keyword="保守")
+    assert m_res_pure["status"] == "MATCHED" and m_res_city["status"] == "MATCHED"
+    assert m_res_pure["benchmark_amount"] == m_res_city["benchmark_amount"] == 2604.84
+    assert m_res_pure["ins_type"] == m_res_city["ins_type"] == "居民"
+    
+    # 验证费用 2450 元时，两者均判定为黄灯（2604.84 * 0.9 = 2344.36 <= 2450 <= 2865.32）
+    light_pure = evaluate_traffic_light(Decimal("2450.00"), Decimal(str(m_res_pure["benchmark_amount"])), ins_type=m_res_pure["ins_type"])
+    light_city = evaluate_traffic_light(Decimal("2450.00"), Decimal(str(m_res_city["benchmark_amount"])), ins_type=m_res_city["ins_type"])
+    assert light_pure["light"] == light_city["light"] == "黄灯"
+    print(f"PASS [审查核验通过]: 费用 2450 元下，“居民医保”与“城镇居民医保”基准同为 ￥{m_res_pure['benchmark_amount']}，灯色同为【{light_pure['light']}】")
+
+    # Case K: 仅有“城镇”未指明职工还是居民 -> 触发 PENDING (AMBIGUOUS_INS_TYPE)
+    m_ambig = match_dip_rule("M17.9", age=68, ins_type="城镇", op_keyword="保守")
+    assert m_ambig["status"] == "PENDING"
+    assert m_ambig["pending_reason"] == "AMBIGUOUS_INS_TYPE"
+    print(f"PASS: 仅输入“城镇” -> 触发 PENDING (原因: {m_ambig['pending_reason']})，绝不擅自假设")
+
+    # Case L: 零基准/无效基准核心层统一拦截（绝不返回 status=MATCHED 或金额 0.0）
+    print("\n--- [Test 5] 零基准与无效基准核心层拦截测试 ---")
+    mock_rules_zero = [dict(r) for r in get_loaded_rules()]
+    # 把匹配命中规则(rule_id=85)的点值/基准设为 0
+    for r in mock_rules_zero:
+        if r.get("rule_id") == 85:
+            r["employee_base"] = Decimal("0.00")
+            r["resident_base"] = Decimal("0.00")
+    import tools.dip_calculator as dip_calc
+    orig_get_loaded = dip_calc.get_loaded_rules
+    dip_calc.get_loaded_rules = lambda **kw: mock_rules_zero
+    try:
+        res_zero = dip_calc.match_dip_rule("M17.9", age=68, ins_type="职工", op_keyword="保守")
+        assert res_zero["matched"] is False
+        assert res_zero["status"] == "PENDING"
+        assert res_zero["pending_reason"] == "INVALID_BENCHMARK"
+        assert "benchmark_amount" not in res_zero
+        print(f"PASS: 零基准核心拦截 -> matched={res_zero['matched']}, status={res_zero['status']}, reason={res_zero['pending_reason']}, 无虚假 0.00 金额")
+    finally:
+        dip_calc.get_loaded_rules = orig_get_loaded
+
     print("\n" + "=" * 60)
-    print(">>> 恭喜！全部 9 类核心测试用例 100% 通过！ <<<")
+    print(">>> 恭喜！全部 12 类核心测试用例 100% 通过！ <<<")
     print("=" * 60)
 
 if __name__ == "__main__":

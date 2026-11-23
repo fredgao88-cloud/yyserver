@@ -168,10 +168,12 @@ def run_inpatient_scanner_test_suite():
     print("\n[Test 1] 真实在院患者扫描 (include_recent_settled=False)...")
     real_scanner = InpatientScanner(rule_version="2026_SAMPLE_V1")
     batch_real = "TEST_REAL_ACTIVE_001"
+    expected_active = len(real_scanner.his_reader.get_active_inpatients())
     res_real = real_scanner.scan_and_snapshot(batch_id=batch_real, include_recent_settled=False)
     
-    # 验证扫描到的数量等于当前真实在院未出院人数 (6人)
-    assert res_real['total_scanned'] == 6, f"Expected exactly 6 active inpatients, got {res_real['total_scanned']}"
+    # 验证扫描到的数量严格等于当前真实在院未出院人数，绝不混入结算病例
+    assert res_real['total_scanned'] == expected_active, f"Expected exactly {expected_active} active inpatients, got {res_real['total_scanned']}"
+    assert res_real['total_scanned'] > 0, "Active inpatients should be greater than 0"
     print(f"  -> Total active patients scanned: {res_real['total_scanned']} (ZERO settled cases mixed in)")
     
     # 清理真实测试批次
@@ -378,6 +380,56 @@ def run_inpatient_scanner_test_suite():
     finally:
         conn.close()
     print("  [PASS] Test 4 公费医疗合规拦截测试通过！")
+
+    # -----------------------------------------------------------------
+    # Test 5: 城镇居民医保判灯一致性测试（绝不因“城镇”误判为职工绿灯）
+    # -----------------------------------------------------------------
+    print("\n[Test 5] 验证城镇居民医保判定 (费用2450元 -> 居民基准2604.84元 -> 黄灯)...")
+    city_res_batch_id = "BATCH_CITY_RESIDENT_001"
+    cases_test5 = [{
+        'zyh': 'SYNTH_CITY_RES_01',
+        'patient_name': '城镇居民患者',
+        'gender': '女',
+        'age': '68',
+        'current_dept': '骨伤科',
+        'current_bed': '06床',
+        'admission_time': '2026-11-20 08:30:00',
+        'current_stay_days': '3',
+        'attending_doctor': '测试医生',
+        'dept_director': '测试主任',
+        'admission_diag_code': 'M17.9',
+        'admission_diag_name': '未特指的膝关节病',
+        'ssmc1': '保守治疗',
+        'ylzffs': '2',
+        'insurance_type': '城镇居民医保'
+    }]
+    mock_r5 = MockMultiCaseHISReader(cases_test5)
+    s5 = InpatientScanner(rule_version="2026_SAMPLE_V1")
+    s5.his_reader = mock_r5
+
+    res_batch5 = s5.scan_and_snapshot(batch_id=city_res_batch_id, include_recent_settled=False)
+    assert res_batch5['total_scanned'] == 1
+    assert res_batch5['YELLOW'] == 1, f"Expected 1 YELLOW, got {res_batch5}"
+
+    cur, conn = get_local_db_connection(as_dict=True)
+    try:
+        cur.execute("""
+        SELECT visit_id, ins_type, target_base, alert_level
+        FROM dbo.inpatient_dip_snapshot
+        WHERE batch_id = %s
+        """, (city_res_batch_id,))
+        r_cr = cur.fetchone()
+        assert r_cr is not None
+        assert r_cr['ins_type'] == '居民'
+        assert r_cr['target_base'] == Decimal('2604.84')
+        assert r_cr['alert_level'] == 'YELLOW'
+        print(f"  -> 城镇居民医保患者: ins_type={r_cr['ins_type']}, base={r_cr['target_base']}, light={r_cr['alert_level']} (黄灯验收通过)")
+
+        cur.execute("DELETE FROM dbo.inpatient_dip_snapshot WHERE batch_id = %s", (city_res_batch_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    print("  [PASS] Test 5 城镇居民医保黄灯判定验证通过！")
 
     print("\n" + "=" * 70)
     print("  ALL INPATIENT SCANNER TESTS PASSED (100% COMPLIANT WITH v1.2)")

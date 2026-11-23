@@ -60,27 +60,37 @@ def run_settled_reconciliation_suite():
     # -------------------------------------------------------------
     # Test Suite 2: Accounting Formula & Category Ledger Reconciliation
     # -------------------------------------------------------------
-    print("\n[Suite 2] Reconciling accounting formulas across 50 settled cases...")
+    print("\n[Suite 2] Reconciling accounting formulas across settled admissions (deduplicated by lsh)...")
     exact_category_matches = 0
     exact_clinical_matches = 0
     close_pharmacy_matches = 0
 
+    # 按就诊流水号去重，确保每次住院按整次对账（杜绝多结算单拆分造成的范围失配）
+    unique_cases = {}
+    for case in settled_cases:
+        if case['lsh'] not in unique_cases:
+            unique_cases[case['lsh']] = case
+    admission_cases = list(unique_cases.values())
+    print(f"  -> Total distinct settled admissions for reconciliation: {len(admission_cases)}")
+
     reconciled_details = []
 
-    for case in settled_cases:
+    for case in admission_cases:
         lsh = case['lsh']
-        s_id = case['settlement_id']
-        total_amount = Decimal(str(case['total_amount']))
-        czmoney = Decimal(str(case['clinical_amount'] or 0))
-        yjmoney = Decimal(str(case['tech_amount'] or 0))
-        yfmoney = Decimal(str(case['pharmacy_amount'] or 0))
+        detail = reader.get_case_fee_detail(lsh)
+        assert detail['reconciliation_scope'] in ('SINGLE_SETTLEMENT', 'ADMISSION_LEVEL')
+        
+        settled_master = detail['zyjz']
+        total_amount = Decimal(str(settled_master['amoney']))
+        czmoney = Decimal(str(settled_master.get('czmoney') or 0))
+        yjmoney = Decimal(str(settled_master.get('yjmoney') or 0))
+        yfmoney = Decimal(str(settled_master.get('yfmoney') or 0))
 
-        detail = reader.get_case_fee_detail(lsh, settlement_id=s_id)
         cat_sum = detail['category_sum']
         cz_total = detail['cz_stat']['total']
         fy_total = detail['fy_stat']['total']
 
-        # Check Category Ledger (his_zycjz vs his_zyjz)
+        # Check Category Ledger (his_zycjz vs his_zyjz master)
         diff_cat = abs(cat_sum - total_amount)
         if diff_cat < Decimal('0.01'):
             exact_category_matches += 1
@@ -105,13 +115,13 @@ def run_settled_reconciliation_suite():
             'fy_expected': yfmoney
         })
 
-    category_match_rate = exact_category_matches / len(settled_cases)
-    clinical_match_rate = exact_clinical_matches / len(settled_cases)
-    pharmacy_match_rate = close_pharmacy_matches / len(settled_cases)
+    category_match_rate = exact_category_matches / len(admission_cases)
+    clinical_match_rate = exact_clinical_matches / len(admission_cases)
+    pharmacy_match_rate = close_pharmacy_matches / len(admission_cases)
 
-    print(f"  -> Category Ledger (his_zycjz) Exact Match: {exact_category_matches}/{len(settled_cases)} ({category_match_rate:.1%})")
-    print(f"  -> Clinical Item (his_zycz vs cz+yj) Match (<=0.05Y): {exact_clinical_matches}/{len(settled_cases)} ({clinical_match_rate:.1%})")
-    print(f"  -> Pharmacy Dispensing Match (within 0.10Y): {close_pharmacy_matches}/{len(settled_cases)} ({pharmacy_match_rate:.1%})")
+    print(f"  -> Category Ledger (his_zycjz) Exact Match: {exact_category_matches}/{len(admission_cases)} ({category_match_rate:.1%})")
+    print(f"  -> Clinical Item (his_zycz vs cz+yj) Match (<=0.05Y): {exact_clinical_matches}/{len(admission_cases)} ({clinical_match_rate:.1%})")
+    print(f"  -> Pharmacy Dispensing Match (within 0.10Y): {close_pharmacy_matches}/{len(admission_cases)} ({pharmacy_match_rate:.1%})")
     assert category_match_rate == 1.0, f"Expected 100% category match, got {category_match_rate:.1%}"
     assert clinical_match_rate >= 0.90, f"Expected >=90.0% clinical matches, got {clinical_match_rate:.1%}"
     assert pharmacy_match_rate >= 0.95, f"Expected >=95.0% pharmacy matches, got {pharmacy_match_rate:.1%}"
@@ -198,23 +208,62 @@ def run_settled_reconciliation_suite():
         assert detail.get('settlement_count') >= 1
 
     # Synthetic Multi-settlement Case: "一次住院、两次结算、一次退费"
-    # Admission with 2 valid settlements and 1 refund deduction
-    # Settlement 1: amoney=1200.00 (cz=800, yf=400)
-    # Settlement 2: amoney=800.00 (cz=500, yf=300)
-    # Total Admission: amoney=2000.00 (cz=1300, yf=700)
-    # Clinical Items (his_zycz): Positive=1400.00, Refund=-100.00, Net=1300.00
-    # Pharmacy Items (his_cfmain_fyjl): Positive=700.00, Refund=0.00, Net=700.00
-    mock_valid_settlements = [
-        {'id': 101, 'lsh': 'zy_synth_multi_01', 'amoney': Decimal('1200.00'), 'czmoney': Decimal('800.00'), 'yjmoney': Decimal('0.00'), 'yfmoney': Decimal('400.00'), 'iszf': 0},
-        {'id': 102, 'lsh': 'zy_synth_multi_01', 'amoney': Decimal('800.00'), 'czmoney': Decimal('500.00'), 'yjmoney': Decimal('0.00'), 'yfmoney': Decimal('300.00'), 'iszf': 0}
-    ]
-    total_amoney = sum(s['amoney'] for s in mock_valid_settlements)
-    total_cz = sum(s['czmoney'] for s in mock_valid_settlements)
-    total_yf = sum(s['yfmoney'] for s in mock_valid_settlements)
-    assert total_amoney == Decimal('2000.00')
-    assert total_cz == Decimal('1300.00')
-    assert total_yf == Decimal('700.00')
-    print("  -> Verified reconciliation_scope = 'ADMISSION_LEVEL' and multi-settlement aggregation.")
+    # Verification using the actual get_case_fee_detail implementation:
+    # 验证无论是否传入 settlement_id，多次结算就诊均自动升级为 ADMISSION_LEVEL，对齐主账与明细
+    class MockMultiSettlementReader(HISReader):
+        def get_connection(self):
+            class MockCursor:
+                def __init__(self):
+                    self._query = ""
+                def execute(self, sql, params=()):
+                    self._query = sql
+                def fetchall(self):
+                    if "FROM dbo.his_zyjz" in self._query:
+                        return [
+                            {'id': 101, 'lsh': 'zy_multi_synth', 'amoney': Decimal('1200.00'), 'czmoney': Decimal('800.00'), 'yjmoney': Decimal('0.00'), 'yfmoney': Decimal('400.00'), 'iszf': 0},
+                            {'id': 102, 'lsh': 'zy_multi_synth', 'amoney': Decimal('800.00'), 'czmoney': Decimal('500.00'), 'yjmoney': Decimal('0.00'), 'yfmoney': Decimal('300.00'), 'iszf': 0}
+                        ]
+                    elif "FROM dbo.his_zycjz" in self._query:
+                        return [
+                            {'xmsflxid': '01', 'amoney': Decimal('1300.00'), 'ssmoney': Decimal('1300.00')},
+                            {'xmsflxid': '02', 'amoney': Decimal('700.00'), 'ssmoney': Decimal('700.00')}
+                        ]
+                    return []
+                def fetchone(self):
+                    if "FROM dbo.his_zycz" in self._query:
+                        return {'cz_count': 10, 'cz_total': Decimal('1300.00'), 'cz_refund_total': Decimal('-100.00'), 'cz_positive_total': Decimal('1400.00')}
+                    elif "FROM dbo.his_cfmain_fyjl" in self._query:
+                        return {'fy_count': 5, 'fy_total': Decimal('700.00'), 'fy_refund_total': Decimal('0.00'), 'fy_positive_total': Decimal('700.00')}
+                    return None
+                def close(self):
+                    pass
+            class MockConn:
+                def cursor(self, as_dict=True):
+                    return MockCursor()
+                def close(self):
+                    pass
+            return MockConn()
+
+    multi_reader = MockMultiSettlementReader()
+    # 调用路径 1: 不传 settlement_id，自动按整次住院汇总
+    detail_no_id = multi_reader.get_case_fee_detail('zy_multi_synth')
+    assert detail_no_id['reconciliation_scope'] == 'ADMISSION_LEVEL'
+    assert detail_no_id['settlement_count'] == 2
+    assert detail_no_id['category_sum'] == Decimal('2000.00')
+    assert detail_no_id['zyjz']['amoney'] == Decimal('2000.00')
+    assert detail_no_id['cz_stat']['total'] == Decimal('1300.00')
+    assert detail_no_id['fy_stat']['total'] == Decimal('700.00')
+
+    # 调用路径 2: 逐单传入 settlement_id（仍保证对账范围与明细一致，自动升级 ADMISSION_LEVEL）
+    detail_with_id = multi_reader.get_case_fee_detail('zy_multi_synth', settlement_id='101')
+    assert detail_with_id['reconciliation_scope'] == 'ADMISSION_LEVEL'
+    assert detail_with_id['settlement_count'] == 2
+    assert detail_with_id['category_sum'] == Decimal('2000.00')
+    assert detail_with_id['zyjz']['amoney'] == Decimal('2000.00')
+    assert detail_with_id['cz_stat']['total'] == Decimal('1300.00')
+    assert detail_with_id['fy_stat']['total'] == Decimal('700.00')
+
+    print("  -> 两条调用路径（不传 settlement_id 与逐单传入）均严格返回 ADMISSION_LEVEL 且范围对齐。")
     print("  [PASS] Suite 6 Multi-settlement Reconciliation & Scope Verified.")
 
     print("\n" + "=" * 70)

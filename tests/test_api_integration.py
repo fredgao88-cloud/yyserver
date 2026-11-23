@@ -92,6 +92,45 @@ print("Status:", res8.get("status"), "PendingReason:", res8.get("pending_reason"
 assert res8["status"] == "PENDING"
 assert "UNSUPPORTED_INS_TYPE" in res8.get("pending_reason", "")
 
+print("\n=== 9. 【审查关键验收】城镇居民医保 vs 居民医保 接口判定一致性 ===")
+# 同一合成病例：68岁、M17.9、保守治疗、费用 2450 元
+res9_resident = post("https://127.0.0.1/api/tools/check_patient_dip", {
+    "patient_id": "zy_synth_res_01",
+    "disease": "M17.9",
+    "current_cost": 2450.00,
+    "age": 68,
+    "ins_type": "居民医保",
+    "operation": "保守治疗"
+})
+res9_city_res = post("https://127.0.0.1/api/tools/check_patient_dip", {
+    "patient_id": "zy_synth_res_02",
+    "disease": "M17.9",
+    "current_cost": 2450.00,
+    "age": 68,
+    "ins_type": "城镇居民医保",
+    "operation": "保守治疗"
+})
+print("居民医保:", res9_resident.get("benchmark_amount"), "Light:", res9_resident.get("evaluation", {}).get("light"))
+print("城镇居民医保:", res9_city_res.get("benchmark_amount"), "Light:", res9_city_res.get("evaluation", {}).get("light"))
+assert res9_resident["benchmark_amount"] == res9_city_res["benchmark_amount"] == 2604.84
+assert res9_resident["evaluation"]["light"] == res9_city_res["evaluation"]["light"] == "黄灯"
+print("PASS [审查对齐]: 居民医保与城镇居民医保基准与灯色 100% 相同！")
+
+print("\n=== 10. 【审查关键验收】零基准接口顶层状态一致性 ===")
+# 缺省有效参保类型或无效参数时绝不返回 top-level MATCHED
+res10_ambig = post("https://127.0.0.1/api/tools/check_patient_dip", {
+    "patient_id": "zy_synth_zero_01",
+    "disease": "M17.9",
+    "current_cost": 2450.00,
+    "age": 68,
+    "ins_type": "城镇",
+    "operation": "保守治疗"
+})
+print("AmbigStatus:", res10_ambig.get("status"), "Success:", res10_ambig.get("success"), "Reason:", res10_ambig.get("pending_reason"))
+assert res10_ambig["success"] is False
+assert res10_ambig["status"] == "PENDING"
+assert res10_ambig["pending_reason"] == "AMBIGUOUS_INS_TYPE"
+
 print("\n" + "=" * 60)
-print(">>> ALL 8 API INTEGRATION TESTS PASSED (100% COMPLIANT) <<<")
+print(">>> ALL 10 API INTEGRATION TESTS PASSED (100% COMPLIANT) <<<")
 print("=" * 60)
