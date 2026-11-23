@@ -435,8 +435,39 @@ def run_phase1_tests():
     assert "2790.90" in res_14c["reply"]
     print("PASS [Case 14c]: “经检查本次住院仅耗材按自费结算” -> “仅耗材”收窄为项目级自费，保留职工基准 ￥2790.90")
 
+    # ---------------- 用例 15: DIP-INS-001 验收 (条件性更正不生效：待核实/如果则 先澄清，已确认更正对照执行) ----------------
+    print("\n--- [Case 15] DIP-INS-001 验收 (条件性更正不生效：待核实/如果则 先澄清，已确认更正对照执行) ---")
+    # 15a. 本次按职工医保结算，待核实后再更正为居民医保 -> 前提“待核实”未满足，更正未生效，先澄清并省略金额
+    q_15a = "68岁，本次按职工医保结算，待核实后再更正为居民医保，M17.9，保守治疗"
+    res_15a = parse_local_intent(q_15a)
+    assert res_15a["intent"] == "need_clarification"
+    assert res_15a["data"]["status"] == "PENDING"
+    assert res_15a["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+    assert "2790.90" not in res_15a["reply"]
+    assert "2604.84" not in res_15a["reply"]
+    print("PASS [Case 15a]: “待核实后再更正为居民医保” -> 条件未满足不生效，PENDING / CORRECTION_UNCONFIRMED，零金额输出")
+
+    # 15b. 本次职工医保，如果符合条件则更正为居民医保 -> “如果…则”条件句，更正未生效，先澄清并省略金额
+    q_15b = "68岁，本次职工医保，如果符合条件则更正为居民医保，M17.9，保守治疗"
+    res_15b = parse_local_intent(q_15b)
+    assert res_15b["intent"] == "need_clarification"
+    assert res_15b["data"]["status"] == "PENDING"
+    assert res_15b["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+    assert "2790.90" not in res_15b["reply"]
+    assert "2604.84" not in res_15b["reply"]
+    print("PASS [Case 15b]: “如果符合条件则更正为居民医保” -> 条件句不生效，PENDING / CORRECTION_UNCONFIRMED，零金额输出")
+
+    # 15c. 对照例：本次按职工医保结算，已核实并确认更正为居民医保 -> 已确认更正正常执行，采用居民基准 ￥2604.84
+    q_15c = "68岁，本次按职工医保结算，已核实并确认更正为居民医保，M17.9，保守治疗"
+    res_15c = parse_local_intent(q_15c)
+    assert res_15c["intent"] == "query_dip_rule"
+    assert res_15c["data"]["matched"] is True
+    assert res_15c["data"]["benchmark_amount"] == 2604.84
+    assert "2604.84" in res_15c["reply"]
+    print("PASS [Case 15c]: “已核实并确认更正为居民医保” -> 对照例：已确认更正正常执行，居民基准 ￥2604.84")
+
     print("\n" + "=" * 70)
-    print(">>> 恭喜！Phase 1 验收回归测试套件全部 14 大关键测试集 100% 通过！ <<<")
+    print(">>> 恭喜！Phase 1 验收回归测试套件全部 15 大关键测试集 100% 通过！ <<<")
     print("=" * 70)
 
 if __name__ == "__main__":

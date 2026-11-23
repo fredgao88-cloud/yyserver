@@ -69,15 +69,18 @@ def has_whole_bill_self_pay(c: str) -> bool:
 
 def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
     """
-    统一参保类型归一化与前置合规审查核心函数 (Round 12 优化版)：
+    统一参保类型归一化与前置合规审查核心函数 (Round 14 优化版)：
     1. 统一别名库：否定匹配与肯定匹配 100% 共享相同别名表，精准支持“城乡居民”等复合险种；
     2. 针对性选择疑问句识别：仅当选择词连接的是两类及以上不同险种时触发 AMBIGUOUS_INS_TYPE，
        若用户已确认险种而后文仅询问临床方案（如“保守还是手术”），绝不误判险种歧义；
        且选择词判定只在非历史、非否定的活跃分句内进行，历史疑问不压制当前确认；
     3. “更正为/修改为/调整为”明确覆盖：后置更正指令强力覆盖既往/前置指令；
        但“暂不更正/不更正/无需更正”等明确否定保留原险种；“是否需要更正为…”“需要更正为…吗”
-       等询问形式（含句尾“吗/呢/吧”疑问标记）一律先澄清（CORRECTION_UNCONFIRMED），绝不擅自更改测算口径；
-       多次更正并存时按语句先后判断最后一次更正请求的状态：询问在后则澄清，确认在后则以确认更正为准；
+       等询问形式（含句尾“吗/呢/吧”疑问标记与分句句尾问号），以及“待核实后再更正为…”
+       “如果符合条件则更正为…”等条件性更正（前提未满足），一律先澄清（CORRECTION_UNCONFIRMED），
+       绝不擅自更改测算口径；
+       多次更正并存时按(分句序号, 分句内字符位置)判断最后一次更正请求的状态：
+       询问/条件更正在后则澄清，确认更正在后则以确认更正为准；
     4. 支付范围前置隔离：“耗材按自费项目结算”“进口耗材单独按自费项目结算”精准判定为
        项目级自费（范围词与动词间允许“单独/需要”等填充词），整单按基本医保正常测算；
        但“经检查本次住院按自费结算”等含整单范围词（本次住院/整单）的指令优先于词语距离，按整单自费处理；
@@ -188,6 +191,9 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
     # 更正动词前置否定/疑问识别（如“暂不更正为居民医保”/“是否需要更正为居民医保？”）
     corr_neg_pre = re.compile(r'(?:暂不|不需要|无需|无须|不予|勿|别|不|未)$')
     corr_question_pre = re.compile(r'(?:是否需要|要不要|需要|能否|可否|可不可以|是否)$')
+    # 条件性/待核实更正识别（如“待核实后再更正为居民医保”/“如果符合条件则更正为居民医保”）：
+    # 前提条件尚未满足，更正未生效，确认前绝不执行
+    corr_conditional_pre = re.compile(r'(?:待核实|待确认|待核准|待审批|如果|若|假如|一旦|必要时|视情况|符合条件)')
 
     for idx, ci in enumerate(clause_info):
         if ci['is_historical'] or ci['is_negated']:
@@ -206,13 +212,16 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
             if is_corr_verb and corr_neg_pre.search(pre_text):
                 continue
 
-            # 疑问形式的更正询问（“是否需要更正为居民医保？”/“需要更正为居民医保吗？”/“更正为居民医保？”）：先澄清，绝不擅自更改口径
-            # 除动词前的疑问词外，句尾“吗/呢/吧”疑问语气词与分句句尾问号同样表明更正处于询问状态，确认前严禁执行
+            # 疑问/条件性更正（“是否需要更正为居民医保？”/“需要更正为居民医保吗？”/“更正为居民医保？”/
+            # “待核实后再更正为居民医保”/“如果符合条件则更正为居民医保”）：先澄清，绝不擅自更改口径
+            # 除动词前的疑问词外，句尾“吗/呢/吧”疑问语气词、分句句尾问号，以及“待核实/如果/若”等
+            # 条件前提标记，同样表明更正尚未生效，确认前严禁执行
             post_text = c[m.end():].strip()
             is_question_form = (
                 bool(corr_question_pre.search(pre_text))
                 or bool(re.search(r'(?:吗|嘛|么|呢|吧)$', post_text))
                 or ci['is_question']
+                or bool(corr_conditional_pre.search(pre_text))
             )
             if is_corr_verb and is_question_form:
                 q_t = raw_tgt
@@ -279,7 +288,7 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
             'status': 'PENDING',
             'reason': 'CORRECTION_UNCONFIRMED',
             'pending_reason': 'CORRECTION_UNCONFIRMED',
-            'message': f"检测到关于是否更正参保类型的询问（目标：{correction_question_target}），更正尚未确认。请明确回复「确认更正为{correction_question_target}」或「暂不更正」；确认前系统按合规要求暂不更改测算口径"
+            'message': f"检测到参保类型更正请求（目标：{correction_question_target}），更正尚未确认或前提条件未满足。请明确回复「确认更正为{correction_question_target}」或「暂不更正」；确认前系统按合规要求暂不更改测算口径"
         }
 
     # 3.1 检查是否存在明确的险种间选择疑问句（连接了两个及以上不同险种候选）
