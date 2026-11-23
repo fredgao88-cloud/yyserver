@@ -466,8 +466,29 @@ def run_phase1_tests():
     assert "2604.84" in res_15c["reply"]
     print("PASS [Case 15c]: “已核实并确认更正为居民医保” -> 对照例：已确认更正正常执行，居民基准 ￥2604.84")
 
+    # ---------------- 用例 16: DIP-INS-001/002 复审验收 (跨分句未决前提关联更正、前提已落实的确认更正放行) ----------------
+    print("\n--- [Case 16] DIP-INS-001/002 复审验收 (跨分句未决前提关联更正、前提已落实的确认更正放行) ---")
+    # 16a. 本次按职工医保结算，如果审批通过，再更正为居民医保 -> “如果审批通过”跨分句修饰下一条更正，前提未决，先澄清并省略金额
+    q_16a = "68岁，本次按职工医保结算，如果审批通过，再更正为居民医保，M17.9，保守治疗"
+    res_16a = parse_local_intent(q_16a)
+    assert res_16a["intent"] == "need_clarification"
+    assert res_16a["data"]["status"] == "PENDING"
+    assert res_16a["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+    assert "2790.90" not in res_16a["reply"]
+    assert "2604.84" not in res_16a["reply"]
+    print("PASS [Case 16a]: “如果审批通过，再更正为居民医保” -> 跨分句未决前提关联更正，PENDING / CORRECTION_UNCONFIRMED，零金额输出")
+
+    # 16b. 对照例：本次按职工医保结算，已核实符合条件并确认更正为居民医保 -> “符合条件”前提已被“已核实/确认”落实，更正生效，采用居民基准 ￥2604.84
+    q_16b = "68岁，本次按职工医保结算，已核实符合条件并确认更正为居民医保，M17.9，保守治疗"
+    res_16b = parse_local_intent(q_16b)
+    assert res_16b["intent"] == "query_dip_rule"
+    assert res_16b["data"]["matched"] is True
+    assert res_16b["data"]["benchmark_amount"] == 2604.84
+    assert "2604.84" in res_16b["reply"]
+    print("PASS [Case 16b]: “已核实符合条件并确认更正为居民医保” -> 前提已落实，确认更正放行，居民基准 ￥2604.84")
+
     print("\n" + "=" * 70)
-    print(">>> 恭喜！Phase 1 验收回归测试套件全部 15 大关键测试集 100% 通过！ <<<")
+    print(">>> 恭喜！Phase 1 验收回归测试套件全部 16 大关键测试集 100% 通过！ <<<")
     print("=" * 70)
 
 if __name__ == "__main__":

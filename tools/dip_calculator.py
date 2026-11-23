@@ -194,11 +194,20 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
     # 条件性/待核实更正识别（如“待核实后再更正为居民医保”/“如果符合条件则更正为居民医保”）：
     # 前提条件尚未满足，更正未生效，确认前绝不执行
     corr_conditional_pre = re.compile(r'(?:待核实|待确认|待核准|待审批|如果|若|假如|一旦|必要时|视情况|符合条件)')
+    # 前提已落实识别（如“已核实符合条件并确认更正为居民医保”）：
+    # 条件词与“已核实/已确认/已审批”等完成态确认标记共存时，说明前提已有明确核实结果，
+    # 不再视为未决前提，更正正常生效
+    corr_fulfilled_pre = re.compile(r'(?:已核实|经核实|核实无误|已确认|确认无误|已审批|已核准|已获批|已满足|已符合)')
 
+    pending_cond_clause_idx = -1  # 最近一个含未决前提（有条件词且无完成态确认）的分句序号；该前提修饰其后第一条更正指令
     for idx, ci in enumerate(clause_info):
         if ci['is_historical'] or ci['is_negated']:
             continue
         c = ci['text']
+
+        # 本分句是否含未决前提：出现“如果/待核实/符合条件”等条件词，
+        # 且无“已核实/已确认”等前提已落实标记（“如果审批通过”为未决，“已核实符合条件”为已落实）
+        clause_has_pending_cond = bool(corr_conditional_pre.search(c)) and not bool(corr_fulfilled_pre.search(c))
 
         for m in combined_dir_regex.finditer(c):
             verb = m.group(1)
@@ -212,16 +221,28 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
             if is_corr_verb and corr_neg_pre.search(pre_text):
                 continue
 
+            # 跨分句未决前提（如“如果审批通过，再更正为居民医保”中前一分句的“如果审批通过”）：
+            # 将其与其修饰的下一条更正关联，仅作用于其后第一条结算/更正指令，命中即消费，
+            # 绝不污染更靠后的已确认指令（如“…，已确认更正为职工”仍以确认更正为准）
+            cross_clause_conditional = False
+            if 0 <= pending_cond_clause_idx < idx:
+                cross_clause_conditional = is_corr_verb
+                pending_cond_clause_idx = -1
+
             # 疑问/条件性更正（“是否需要更正为居民医保？”/“需要更正为居民医保吗？”/“更正为居民医保？”/
             # “待核实后再更正为居民医保”/“如果符合条件则更正为居民医保”）：先澄清，绝不擅自更改口径
             # 除动词前的疑问词外，句尾“吗/呢/吧”疑问语气词、分句句尾问号，以及“待核实/如果/若”等
-            # 条件前提标记，同样表明更正尚未生效，确认前严禁执行
+            # 条件前提标记，同样表明更正尚未生效，确认前严禁执行；
+            # 但条件词处同时存在“已核实/已确认”等前提已落实标记的（如“已核实符合条件并确认更正为X”），
+            # 说明前提已有明确核实结果，更正生效，绝不误拦截
             post_text = c[m.end():].strip()
+            pre_conditional = bool(corr_conditional_pre.search(pre_text)) and not bool(corr_fulfilled_pre.search(pre_text))
             is_question_form = (
                 bool(corr_question_pre.search(pre_text))
                 or bool(re.search(r'(?:吗|嘛|么|呢|吧)$', post_text))
                 or ci['is_question']
-                or bool(corr_conditional_pre.search(pre_text))
+                or pre_conditional
+                or cross_clause_conditional
             )
             if is_corr_verb and is_question_form:
                 q_t = raw_tgt
@@ -272,6 +293,12 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
                     'pos': start_pos,
                     'text': m.group(0)
                 })
+
+        # 分句处理完毕：若本分句含未决前提且前提目标不在本分句内（本分句无更正动词，
+        # 如同分句的“如果符合条件则更正为X”已由动词前条件词判定），则登记为跨分句未决前提，
+        # 修饰其后第一条更正指令（如“如果审批通过，再更正为居民医保”）
+        if clause_has_pending_cond and not ci['is_correction'] and pending_cond_clause_idx < 0:
+            pending_cond_clause_idx = idx
 
     # 3.0 更正询问未确认：先澄清，保留当前口径，绝不擅自更改险种
     # 按语句先后判断最后一次更正请求的状态：以(分句序号, 分句内字符位置)精确定位，
