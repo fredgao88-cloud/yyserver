@@ -58,7 +58,7 @@ jobs:
                       failed |= not passed
                       print(f"| {sentence} | {expected} | {actual} | {'通过' if passed else '失败'} |", file=report)
                   print(file=report)
-                  for suite in ["tests/test_dip_calculator.py", "tests/test_dip_phase1.py"]:
+                  for suite in ["tests/test_dip_calculator.py", "tests/test_dip_phase1.py", "tests/test_auth_rbac.py"]:
                       try:
                           runpy.run_path(suite, run_name="__main__")
                       except Exception:

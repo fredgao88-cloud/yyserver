@@ -1,23 +1,57 @@
 # -*- coding: utf-8 -*-
 import urllib.request
+import urllib.error
 import json
 import ssl
 import sys
+import os
 
 ctx = ssl.create_default_context()
 ctx.check_hostname = False
 ctx.verify_mode = ssl.CERT_NONE
 
-def post(url, payload):
+# 受保护接口测试用账号（口令只从环境变量读取，绝不入库入仓）
+TEST_OPERATOR_ID = os.environ.get("TEST_OPERATOR_ID", "doctor01")
+TEST_OPERATOR_PASS = os.environ.get("TEST_OPERATOR_PASS", "")
+TEST_ADMIN_ID = os.environ.get("TEST_ADMIN_ID", "admin")
+TEST_ADMIN_PASS = os.environ.get("TEST_ADMIN_PASS", "")
+
+def post(url, payload, token=None):
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"}
+        headers=headers
     )
     with urllib.request.urlopen(req, context=ctx) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
-print("=== 1. Direct Health Check (HTTP 8000) ===")
+def post_with_status(url, payload, token=None):
+    """返回 (HTTP状态码, 响应体JSON)，用于 401/403 等鉴权负向断言"""
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers)
+    try:
+        with urllib.request.urlopen(req, context=ctx) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode("utf-8"))
+
+def get_with_status(url, token=None):
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, context=ctx) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode("utf-8"))
+
+print("=== 1. Direct Health Check (HTTP 8000, 仅宿主机回环绑定) ===")
 with urllib.request.urlopen("http://127.0.0.1:8000/health") as resp:
     res1 = json.loads(resp.read().decode("utf-8"))
     print(res1)
@@ -28,6 +62,59 @@ with urllib.request.urlopen("https://127.0.0.1/health", context=ctx) as resp:
     res2 = json.loads(resp.read().decode("utf-8"))
     print(res2)
     assert res2["status"] == "ok"
+
+print("\n=== 2A. 【RBAC 服务端鉴权验收】登录、令牌、患者级接口强制管控 ===")
+if not TEST_OPERATOR_PASS or not TEST_ADMIN_PASS:
+    print("FATAL: 请先设置环境变量 TEST_OPERATOR_PASS 与 TEST_ADMIN_PASS 再运行集成测试")
+    sys.exit(1)
+
+# 2A-1 错误口令必须 401
+code, body = post_with_status("https://127.0.0.1/api/auth/login", {"operator_id": TEST_OPERATOR_ID, "password": "wrong-password-xxx"})
+assert code == 401
+print("PASS [RBAC 2A-1]: 错误口令登录被拒绝 (401)")
+
+# 2A-2 正确口令签发令牌
+code, body = post_with_status("https://127.0.0.1/api/auth/login", {"operator_id": TEST_OPERATOR_ID, "password": TEST_OPERATOR_PASS})
+assert code == 200 and body.get("access_token")
+TOKEN = body["access_token"]
+assert body.get("role_type") == "DOCTOR"
+print(f"PASS [RBAC 2A-2]: 正确口令登录成功，令牌签发（角色 {body.get('role_type')}）")
+
+# 2A-3 患者判灯接口无令牌必须 401
+code, body = post_with_status("https://127.0.0.1/api/tools/check_patient_dip", {
+    "patient_id": "zy2025042901", "disease": "M17.9", "current_cost": 2550.00,
+    "age": 68, "ins_type": "职工", "operation": "保守治疗"
+})
+assert code == 401
+print("PASS [RBAC 2A-3]: 患者判灯接口无令牌被拒绝 (401)")
+
+# 2A-4 伪造令牌必须 401
+code, body = post_with_status("https://127.0.0.1/api/tools/check_patient_dip", {
+    "patient_id": "zy2025042901", "disease": "M17.9", "current_cost": 2550.00,
+    "age": 68, "ins_type": "职工", "operation": "保守治疗"
+}, token="v1.forged.payload")
+assert code == 401
+print("PASS [RBAC 2A-4]: 伪造令牌被拒绝 (401)")
+
+# 2A-5 预警看板：医生角色 403（角色矩阵生效）
+code, body = get_with_status("https://127.0.0.1/api/inpatient/alerts", token=TOKEN)
+assert code == 403
+print("PASS [RBAC 2A-5]: 医生角色访问预警看板被拒绝 (403)")
+
+# 2A-6 预警看板：管理员角色 200
+code, body = post_with_status("https://127.0.0.1/api/auth/login", {"operator_id": TEST_ADMIN_ID, "password": TEST_ADMIN_PASS})
+assert code == 200 and body.get("access_token")
+ADMIN_TOKEN = body["access_token"]
+code, body = get_with_status("https://127.0.0.1/api/inpatient/alerts", token=ADMIN_TOKEN)
+assert code == 200 and body.get("total") is not None
+print("PASS [RBAC 2A-6]: 管理员角色访问预警看板正常 (200)")
+
+# 2A-7 开放接口（科室级 DIP 基准查询）无令牌保持可用
+res_open = post("https://127.0.0.1/api/tools/query_dip_rule", {
+    "disease": "M17.9", "age": 68, "ins_type": "职工", "operation": "保守治疗"
+})
+assert res_open["matched"] is True and res_open["benchmark_amount"] == 2790.90
+print("PASS [RBAC 2A-7]: 开放接口无令牌保持可用（匿名身份记审计）")
 
 print("\n=== 3. 结构化规则接口 (68岁职工 M17.9 膝关节病 保守治疗) ===")
 res3 = post("https://127.0.0.1/api/tools/query_dip_rule", {
@@ -48,7 +135,7 @@ res4 = post("https://127.0.0.1/api/tools/check_patient_dip", {
     "age": 68,
     "ins_type": "职工",
     "operation": "保守治疗"
-})
+}, token=TOKEN)
 print("Status:", res4.get("status"), "Light:", res4.get("evaluation", {}).get("light"))
 assert res4["status"] == "MATCHED"
 assert res4["evaluation"]["light"] == "黄灯"
@@ -87,7 +174,7 @@ res8 = post("https://127.0.0.1/api/tools/check_patient_dip", {
     "age": 68,
     "ins_type": "公费医疗",
     "operation": "保守治疗"
-})
+}, token=TOKEN)
 print("Status:", res8.get("status"), "PendingReason:", res8.get("pending_reason"))
 assert res8["status"] == "PENDING"
 assert "UNSUPPORTED_INS_TYPE" in res8.get("pending_reason", "")
@@ -101,7 +188,7 @@ res9_resident = post("https://127.0.0.1/api/tools/check_patient_dip", {
     "age": 68,
     "ins_type": "居民医保",
     "operation": "保守治疗"
-})
+}, token=TOKEN)
 res9_city_res = post("https://127.0.0.1/api/tools/check_patient_dip", {
     "patient_id": "zy_synth_res_02",
     "disease": "M17.9",
@@ -109,7 +196,7 @@ res9_city_res = post("https://127.0.0.1/api/tools/check_patient_dip", {
     "age": 68,
     "ins_type": "城镇居民医保",
     "operation": "保守治疗"
-})
+}, token=TOKEN)
 print("居民医保:", res9_resident.get("benchmark_amount"), "Light:", res9_resident.get("evaluation", {}).get("light"))
 print("城镇居民医保:", res9_city_res.get("benchmark_amount"), "Light:", res9_city_res.get("evaluation", {}).get("light"))
 assert res9_resident["benchmark_amount"] == res9_city_res["benchmark_amount"] == 2604.84
@@ -125,7 +212,7 @@ res10_ambig = post("https://127.0.0.1/api/tools/check_patient_dip", {
     "age": 68,
     "ins_type": "城镇",
     "operation": "保守治疗"
-})
+}, token=TOKEN)
 print("AmbigStatus:", res10_ambig.get("status"), "Success:", res10_ambig.get("success"), "Reason:", res10_ambig.get("pending_reason"))
 assert res10_ambig["success"] is False
 assert res10_ambig["status"] == "PENDING"
@@ -518,5 +605,5 @@ assert "2790.90" in res33_chat.get("reply", "")
 print("PASS [Round 10 P1 对齐]: “本次按职工医保结算，保守还是手术？” 方案选择不误伤险种，正常测算 ￥2790.90！")
 
 print("\n" + "=" * 60)
-print(">>> ALL 33 API INTEGRATION TESTS PASSED (100% COMPLIANT) <<<")
+print(">>> ALL 40 API INTEGRATION TESTS PASSED (100% COMPLIANT) <<<")
 print("=" * 60)

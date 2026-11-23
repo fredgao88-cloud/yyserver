@@ -8,7 +8,7 @@
 - 严格遵循隐私保护红线：审计日志严禁记录患者自由文本、姓名与病案明细；
 - 支持渠道分流（钉钉渠道患者级查询自动激活隐私盾牌）。
 """
-from fastapi import FastAPI, HTTPException, Query, Header
+from fastapi import FastAPI, HTTPException, Query, Header, Depends
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 from decimal import Decimal
@@ -22,6 +22,10 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from tools.dip_calculator import match_dip_rule, evaluate_traffic_light
 from agent.llm_router import parse_local_intent
 from db.local_db import record_audit_log
+from auth.rbac import (
+    authenticate, issue_token, operator_from_optional_token, require_roles,
+    ensure_auth_schema, TOKEN_TTL_MINUTES, PATIENT_QUERY_ROLES, ALERTS_ROLES
+)
 
 app = FastAPI(
     title="私立医院智能业务管理 Agent 系统 (FastAPI 规则引擎)",
@@ -54,6 +58,20 @@ class ChatRequest(BaseModel):
     text: str = Field(..., description="自然语言查询内容")
     channel: Optional[str] = Field("web", description="来源渠道：dingtalk / web")
 
+class LoginRequest(BaseModel):
+    operator_id: str = Field(..., description="操作员工号")
+    password: str = Field(..., description="操作员口令")
+
+# ----------------- 启动自检 -----------------
+
+@app.on_event("startup")
+async def _startup_auth_schema():
+    """启动时确保鉴权账号表就绪（数据库暂不可用时仅告警，不阻断服务）"""
+    try:
+        ensure_auth_schema()
+    except Exception as e:
+        print(f"[WARN] 鉴权账号表自检失败: {e}")
+
 # ----------------- 路由定义 -----------------
 
 @app.get("/health", summary="开机自愈与健康检查接口")
@@ -61,11 +79,41 @@ async def health_check():
     """轻量级健康检查，独立返回 HTTP 200 与 ok 状态"""
     return {"status": "ok", "version": "1.2.0"}
 
+@app.post("/api/auth/login", summary="操作员登录签发访问令牌")
+async def login(req: LoginRequest):
+    """
+    工号 + 口令本地校验（PBKDF2 哈希），签发 HMAC 签名令牌；
+    连续失败 5 次锁定 10 分钟。审计日志绝不记录口令与令牌本体。
+    """
+    op, reason = authenticate(req.operator_id, req.password)
+    if op is None:
+        record_audit_log(
+            operator_id=re.sub(r'[^a-zA-Z0-9_-]', '', req.operator_id or "unknown")[:64] or "unknown",
+            role_type="UNKNOWN", channel="API", action_type="LOGIN",
+            target_ref="LOGIN", auth_result="DENIED"
+        )
+        raise HTTPException(status_code=401, detail=reason)
+    token = issue_token(op["operator_id"], op["role_type"], op.get("dept_scope", ""))
+    record_audit_log(
+        operator_id=op["operator_id"], role_type=op["role_type"], channel="API",
+        action_type="LOGIN", target_ref="LOGIN", auth_result="PERMITTED"
+    )
+    return {
+        "access_token": token,
+        "token_type": "Bearer",
+        "expires_in_minutes": TOKEN_TTL_MINUTES,
+        "operator_id": op["operator_id"],
+        "display_name": op["display_name"],
+        "role_type": op["role_type"]
+    }
+
 @app.post("/api/tools/query_dip_rule", summary="DIP 规则检索与基准测算接口")
-async def query_dip_rule(req: QueryDipRuleRequest, x_operator_id: Optional[str] = Header("anonymous", alias="X-Operator-Id")):
+async def query_dip_rule(req: QueryDipRuleRequest, authorization: Optional[str] = Header(None)):
     """
-    根据疾病、年龄、医保类型、手术操作等参数，从数据库检索匹配生效 DIP 规则并测算基准
+    根据疾病、年龄、医保类型、手术操作等参数，从数据库检索匹配生效 DIP 规则并测算基准。
+    科室级基准不含患者数据，保持开放；身份仅取自有效令牌，绝不信任自报工号请求头。
     """
+    op = operator_from_optional_token(authorization)
     result = match_dip_rule(
         disease=req.disease,
         age=req.age,
@@ -83,8 +131,8 @@ async def query_dip_rule(req: QueryDipRuleRequest, x_operator_id: Optional[str] 
     else:
         clean_target = "QUERY:UNMATCHED"
     record_audit_log(
-        operator_id=x_operator_id,
-        role_type="DOCTOR",
+        operator_id=op["sub"],
+        role_type=op["role"],
         channel="API",
         action_type="QUERY_DIP_RULE",
         target_ref=clean_target,
@@ -95,9 +143,10 @@ async def query_dip_rule(req: QueryDipRuleRequest, x_operator_id: Optional[str] 
     return result
 
 @app.post("/api/tools/check_patient_dip", summary="在院患者费用判灯与控费分析接口")
-async def check_patient_dip(req: CheckPatientDipRequest, x_operator_id: Optional[str] = Header("anonymous", alias="X-Operator-Id")):
+async def check_patient_dip(req: CheckPatientDipRequest, operator: Dict[str, Any] = Depends(require_roles(*PATIENT_QUERY_ROLES))):
     """
-    根据患者累计费用与数据库生效 DIP 规则，执行高精度未舍入 Decimal 交叉相乘判灯分析
+    根据患者累计费用与数据库生效 DIP 规则，执行高精度未舍入 Decimal 交叉相乘判灯分析。
+    患者级接口：强制有效令牌 + 角色校验（医生/医保办/管理员），操作人身份只取自令牌。
     """
     rule_res = match_dip_rule(
         disease=req.disease,
@@ -116,8 +165,8 @@ async def check_patient_dip(req: CheckPatientDipRequest, x_operator_id: Optional
     else:
         clean_target = "PATIENT:UNSPECIFIED"
     record_audit_log(
-        operator_id=x_operator_id,
-        role_type="DOCTOR",
+        operator_id=operator["sub"],
+        role_type=operator["role"],
         channel="API",
         action_type="CHECK_PATIENT_DIP",
         target_ref=clean_target,
@@ -203,9 +252,11 @@ async def check_patient_dip(req: CheckPatientDipRequest, x_operator_id: Optional
     }
 
 @app.get("/api/inpatient/alerts", summary="在院科室预警列表看板接口")
-async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="科室筛选，如 中医科")):
+async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="科室筛选，如 中医科"),
+                               operator: Dict[str, Any] = Depends(require_roles(*ALERTS_ROLES))):
     """
-    获取当前住院患者红黄绿灯控费预警清单（一期演示基线数据，第二步历史回放后接入实时快照）
+    获取当前住院患者红黄绿灯控费预警清单（一期演示基线数据，第二步历史回放后接入实时快照）。
+    患者级接口：强制有效令牌，仅医保办与管理员角色可访问。
     """
     sample_alerts = [
         {
@@ -243,17 +294,19 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
     }
 
 @app.post("/api/chat", summary="院内本地自然语言意图分类与规则问答接口")
-async def chat_interaction(req: ChatRequest, x_operator_id: Optional[str] = Header("anonymous", alias="X-Operator-Id")):
+async def chat_interaction(req: ChatRequest, authorization: Optional[str] = Header(None)):
     """
-    接收自然语言提问，执行本地纯正则/规则意图分流，零云端大模型依赖，严格保护患者隐私
+    接收自然语言提问，执行本地纯正则/规则意图分流，零云端大模型依赖，严格保护患者隐私。
+    科室级问答保持开放；身份仅取自有效令牌，绝不信任自报工号请求头。
     """
+    op = operator_from_optional_token(authorization)
     result = parse_local_intent(req.text, channel=req.channel or "web")
     
     # 严格合规审计日志：严禁截取或写入原始用户文本，只记录结构化意图代码
     intent_code = result.get("intent", "UNKNOWN")
     record_audit_log(
-        operator_id=x_operator_id,
-        role_type="DOCTOR",
+        operator_id=op["sub"],
+        role_type=op["role"],
         channel=req.channel or "web",
         action_type="CHAT_INTENT",
         target_ref=f"INTENT:{intent_code}",
