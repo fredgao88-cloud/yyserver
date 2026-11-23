@@ -404,8 +404,39 @@ def run_phase1_tests():
     assert "2604.84" not in res_13c["reply"]
     print("PASS [Case 13c]: “已更正为职工医保，是否需要更正为居民医保？” -> 按语序判定最后更正请求待确认，PENDING / CORRECTION_UNCONFIRMED")
 
+    # ---------------- 用例 14: Round 13 审查验收 (分句问号保留、同分句多次更正定位、整单范围词后项目再收窄) ----------------
+    print("\n--- [Case 14] Round 13 审查验收 (分句问号保留、同分句多次更正定位、整单范围词后项目再收窄) ---")
+    # 14a. 职工医保，更正为居民医保？ -> 分句句尾问号保留为疑问标记，更正询问先澄清，绝不擅自执行
+    q_14a = "68岁，职工医保，更正为居民医保？M17.9，保守治疗"
+    res_14a = parse_local_intent(q_14a)
+    assert res_14a["intent"] == "need_clarification"
+    assert res_14a["data"]["status"] == "PENDING"
+    assert res_14a["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+    assert "2790.90" not in res_14a["reply"]
+    assert "2604.84" not in res_14a["reply"]
+    print("PASS [Case 14a]: “更正为居民医保？” -> 分句问号保留为疑问标记，PENDING / CORRECTION_UNCONFIRMED，零金额输出")
+
+    # 14b. 已更正为职工医保后是否需要更正为居民医保？ -> 同一分句内两次更正按(分句, 字符位置)定位，后一次询问待确认
+    q_14b = "68岁，已更正为职工医保后是否需要更正为居民医保？M17.9，保守治疗"
+    res_14b = parse_local_intent(q_14b)
+    assert res_14b["intent"] == "need_clarification"
+    assert res_14b["data"]["status"] == "PENDING"
+    assert res_14b["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+    assert "2790.90" not in res_14b["reply"]
+    assert "2604.84" not in res_14b["reply"]
+    print("PASS [Case 14b]: “已更正为职工医保后是否需要更正为居民医保？” -> 同分句多次更正按字符位置判定，PENDING / CORRECTION_UNCONFIRMED")
+
+    # 14c. 职工医保，经检查本次住院仅耗材按自费结算 -> 整单范围词后“仅耗材”将自费重新收窄到项目级，保留职工基准 ￥2790.90
+    q_14c = "68岁，职工医保，经检查本次住院仅耗材按自费结算，M17.9，保守治疗"
+    res_14c = parse_local_intent(q_14c)
+    assert res_14c["intent"] == "query_dip_rule"
+    assert res_14c["data"]["matched"] is True
+    assert res_14c["data"]["benchmark_amount"] == 2790.90
+    assert "2790.90" in res_14c["reply"]
+    print("PASS [Case 14c]: “经检查本次住院仅耗材按自费结算” -> “仅耗材”收窄为项目级自费，保留职工基准 ￥2790.90")
+
     print("\n" + "=" * 70)
-    print(">>> 恭喜！Phase 1 验收回归测试套件全部 13 大关键测试集 100% 通过！ <<<")
+    print(">>> 恭喜！Phase 1 验收回归测试套件全部 14 大关键测试集 100% 通过！ <<<")
     print("=" * 70)
 
 if __name__ == "__main__":
