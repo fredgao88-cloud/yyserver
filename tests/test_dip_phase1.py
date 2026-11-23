@@ -144,8 +144,46 @@ def run_phase1_tests():
     assert "2790.90" not in res_7c["reply"]
     print("PASS [Case 7c]: 职工+工伤保险 -> 优先识别工伤保险并进入 PENDING，零虚假金额输出")
 
+    # ---------------- 用例 8: 待查拦截、本次结算指令优先与否定描述识别 (Round 7 验收) ----------------
+    print("\n--- [Case 8] 待查拦截、本次结算指令优先与否定描述识别 ---")
+    # 8a. 企业职工，参保类型待查 -> 明确表示险种未知，应追问并省略金额
+    q_8a = "68岁，企业职工，参保类型待查，M17.9，保守治疗"
+    res_8a = parse_local_intent(q_8a)
+    assert res_8a["intent"] == "need_clarification"
+    assert res_8a["data"]["status"] == "PENDING"
+    assert res_8a["data"]["pending_reason"] == "MISSING_INS_TYPE"
+    assert "2790.90" not in res_8a["reply"]
+    print("PASS [Case 8a]: “企业职工，参保类型待查” -> 拦截并追问，彻底剔除确定金额")
+
+    # 8b. 原居民医保，本次按职工医保结算 -> 采用明确指定的本次职工医保 (2790.90元)
+    q_8b = "68岁，原居民医保，本次按职工医保结算，M17.9，保守治疗"
+    res_8b = parse_local_intent(q_8b)
+    assert res_8b["intent"] == "query_dip_rule"
+    assert res_8b["data"]["matched"] is True
+    assert res_8b["data"]["benchmark_amount"] == 2790.90
+    assert "2790.90" in res_8b["reply"]
+    print("PASS [Case 8b]: “原居民医保，本次按职工医保结算” -> 采用本次职工医保 ￥2790.90")
+
+    # 8c. 职工医保，非工伤 -> 识别“非工伤”否定含义，按职工医保继续 (2790.90元)
+    q_8c = "68岁，职工医保，非工伤，M17.9，保守治疗"
+    res_8c = parse_local_intent(q_8c)
+    assert res_8c["intent"] == "query_dip_rule"
+    assert res_8c["data"]["matched"] is True
+    assert res_8c["data"]["benchmark_amount"] == 2790.90
+    assert "2790.90" in res_8c["reply"]
+    print("PASS [Case 8c]: “职工医保，非工伤” -> 排除非工伤否定词，按职工医保正常测算 ￥2790.90")
+
+    # 8d. 本次职工医保结算，既往工伤已结案 -> 识别既往工伤已结案，按职工医保继续 (2790.90元)
+    q_8d = "68岁，本次职工医保结算，既往工伤已结案，M17.9，保守治疗"
+    res_8d = parse_local_intent(q_8d)
+    assert res_8d["intent"] == "query_dip_rule"
+    assert res_8d["data"]["matched"] is True
+    assert res_8d["data"]["benchmark_amount"] == 2790.90
+    assert "2790.90" in res_8d["reply"]
+    print("PASS [Case 8d]: “本次职工医保结算，既往工伤已结案” -> 排除既往工伤，按职工医保正常测算 ￥2790.90")
+
     print("\n" + "=" * 70)
-    print(">>> 恭喜！Phase 1 验收回归测试套件 6 大关键测试集全部 100% 通过！ <<<")
+    print(">>> 恭喜！Phase 1 验收回归测试套件全部 8 大关键测试集 100% 通过！ <<<")
     print("=" * 70)
 
 if __name__ == "__main__":

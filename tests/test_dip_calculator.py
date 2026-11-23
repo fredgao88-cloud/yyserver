@@ -201,6 +201,21 @@ def run_tests():
     assert "UNSUPPORTED_INS_TYPE:工伤保险" in m_gs["pending_reason"]
     print(f"PASS: “退休，公费医疗”与“职工，工伤保险”均优先识别特殊险种并触发 PENDING 拦截")
 
+    # Case O: “企业职工，参保类型待查” -> 明确标明待查，绝不强行套用职工基准
+    m_unknown = match_dip_rule("M17.9", age=68, ins_type="企业职工，参保类型待查", op_keyword="保守")
+    assert m_unknown["status"] == "PENDING"
+    assert m_unknown["pending_reason"] == "MISSING_INS_TYPE"
+    print(f"PASS: “企业职工，参保类型待查” -> 拦截待查并标记 PENDING (原因: {m_unknown['pending_reason']})")
+
+    # Case P: 结算指令优先与否定词排除
+    m_dir = match_dip_rule("M17.9", age=68, ins_type="原居民医保，本次按职工医保结算", op_keyword="保守")
+    assert m_dir["status"] == "MATCHED"
+    assert m_dir["benchmark_amount"] == 2790.90
+    m_neg = match_dip_rule("M17.9", age=68, ins_type="职工医保，非工伤", op_keyword="保守")
+    assert m_neg["status"] == "MATCHED"
+    assert m_neg["benchmark_amount"] == 2790.90
+    print(f"PASS: “本次按职工医保结算”及“职工医保，非工伤”均正确按职工基准 ￥2790.90 测算")
+
     print("\n" + "=" * 60)
     print(">>> 恭喜！全部 12 类核心测试用例 100% 通过！ <<<")
     print("=" * 60)
