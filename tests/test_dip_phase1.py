@@ -182,8 +182,55 @@ def run_phase1_tests():
     assert "2790.90" in res_8d["reply"]
     print("PASS [Case 8d]: “本次职工医保结算，既往工伤已结案” -> 排除既往工伤，按职工医保正常测算 ￥2790.90")
 
+    # ---------------- 用例 9: Round 8 审查验收 (分句时态冲突、带空格待查、非医保字段保护与历史待查消除) ----------------
+    print("\n--- [Case 9] Round 8 审查验收 (分句时态冲突、带空格待查、非医保字段保护与历史待查消除) ---")
+    # 9a. 企业职工，参保类型 待查 (带空格) -> 必须正确拦截并省略金额
+    q_9a = "68岁，企业职工，参保类型 待查，M17.9，保守治疗"
+    res_9a = parse_local_intent(q_9a)
+    assert res_9a["intent"] == "need_clarification"
+    assert res_9a["data"]["status"] == "PENDING"
+    assert res_9a["data"]["pending_reason"] == "MISSING_INS_TYPE"
+    assert "2790.90" not in res_9a["reply"]
+    print("PASS [Case 9a]: “企业职工，参保类型 待查”(含空格) -> 拦截并追问，彻底省略确定金额")
+
+    # 9b. 既往按居民医保结算，本次按职工医保结算 -> 优先采用本次肯定指令 (2790.90元)，绝不错选既往居民 (2604.84元)
+    q_9b = "68岁，既往按居民医保结算，本次按职工医保结算，M17.9，保守治疗"
+    res_9b = parse_local_intent(q_9b)
+    assert res_9b["intent"] == "query_dip_rule"
+    assert res_9b["data"]["matched"] is True
+    assert res_9b["data"]["benchmark_amount"] == 2790.90
+    assert "2790.90" in res_9b["reply"]
+    print("PASS [Case 9b]: “既往按居民医保结算，本次按职工医保结算” -> 排除既往分句，准确采用本次职工基准 ￥2790.90")
+
+    # 9c. 本次不按职工医保结算，按居民医保结算 -> 排除否定分句，准确采用居民基准 (2604.84元)
+    q_9c = "68岁，本次不按职工医保结算，按居民医保结算，M17.9，保守治疗"
+    res_9c = parse_local_intent(q_9c)
+    assert res_9c["intent"] == "query_dip_rule"
+    assert res_9c["data"]["matched"] is True
+    assert res_9c["data"]["benchmark_amount"] == 2604.84
+    assert "2604.84" in res_9c["reply"]
+    print("PASS [Case 9c]: “本次不按职工医保结算，按居民医保结算” -> 排除否定分句，准确采用居民基准 ￥2604.84")
+
+    # 9d. 职工医保，病理类型待查 -> 非医保字段待查绝不误拦截，按职工医保正常测算 (2790.90元)
+    q_9d = "68岁，职工医保，病理类型待查，M17.9，保守治疗"
+    res_9d = parse_local_intent(q_9d)
+    assert res_9d["intent"] == "query_dip_rule"
+    assert res_9d["data"]["matched"] is True
+    assert res_9d["data"]["benchmark_amount"] == 2790.90
+    assert "2790.90" in res_9d["reply"]
+    print("PASS [Case 9d]: “职工医保，病理类型待查” -> 仅限定参保字段待查，病理类型待查不误拦截 ￥2790.90")
+
+    # 9e. 原参保类型待查，现已确认本次按职工医保结算 -> 历史待查被当前确认消除，按职工医保测算 (2790.90元)
+    q_9e = "68岁，原参保类型待查，现已确认本次按职工医保结算，M17.9，保守治疗"
+    res_9e = parse_local_intent(q_9e)
+    assert res_9e["intent"] == "query_dip_rule"
+    assert res_9e["data"]["matched"] is True
+    assert res_9e["data"]["benchmark_amount"] == 2790.90
+    assert "2790.90" in res_9e["reply"]
+    print("PASS [Case 9e]: “原参保类型待查，现已确认本次按职工医保结算” -> 历史待查不压制当前确认 ￥2790.90")
+
     print("\n" + "=" * 70)
-    print(">>> 恭喜！Phase 1 验收回归测试套件全部 8 大关键测试集 100% 通过！ <<<")
+    print(">>> 恭喜！Phase 1 验收回归测试套件全部 9 大关键测试集 100% 通过！ <<<")
     print("=" * 70)
 
 if __name__ == "__main__":

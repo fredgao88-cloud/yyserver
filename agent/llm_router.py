@@ -11,7 +11,7 @@
 import re
 from decimal import Decimal
 from typing import Dict, Any, Optional
-from tools.dip_calculator import match_dip_rule, evaluate_traffic_light
+from tools.dip_calculator import match_dip_rule, evaluate_traffic_light, normalize_insurance_type
 
 def parse_local_intent(text: str, channel: str = "web") -> Dict[str, Any]:
     """院内纯本地意图解析与参数提取（零云端调用）"""
@@ -63,15 +63,12 @@ def parse_local_intent(text: str, channel: str = "web") -> Dict[str, Any]:
         bed_days = int(bed_match.group(1))
 
     # ---------------- 5. 提取参保类型 (消歧、否定/既往过滤、指令优先与待查拦截) ----------------
-    # 5.1 检查是否明确包含“待查/待定/未定/未知”等表示参保类型不详的表述（例如：“企业职工，参保类型待查”）
-    # 凡输入明确指明险种待查，严禁按企业职工假定险种，一律阻断追问并省略金额
-    is_unknown_ins = False
-    if any(k in text_clean for k in ("参保类型待查", "险种待查", "医保待查", "参保待定", "险种待定", "参保未知", "险种未知", "类型待查")):
-        is_unknown_ins = True
-    elif re.search(r'(?:参保|险种|医保|类型)[^\w\s]*(?:待查|待定|未定|未知|不详|不清|未明确|暂不知)', text_clean):
-        is_unknown_ins = True
-
-    if is_unknown_ins:
+    # 统一调用 normalize_insurance_type，确保与 match_dip_rule 共享同一套分句时态与修饰判定
+    norm_ins = normalize_insurance_type(text_clean)
+    
+    # 5.1 检查是否显式包含活跃的“参保类型待查/未定”等表述（例如：“企业职工，参保类型 待查”）
+    # 凡输入明确指明参保待查，严禁按企业职工假定险种，一律阻断追问并省略金额
+    if not norm_ins["valid"] and norm_ins.get("reason") == "MISSING_INS_TYPE" and "待查" in (norm_ins.get("message") or ""):
         return {
             "intent": "need_clarification",
             "reply": "【需要明确参保类型】\n检测到输入包含“参保类型待查/未定”，当前医保类型未知。由于城镇职工与城乡居民的 DIP 点值与基准不同，在明确参保类型前系统依规暂不测算金额，请补充患者的具体险种（城镇职工 / 城乡居民 / 自费）。" + reimburse_clarification,
@@ -82,77 +79,40 @@ def parse_local_intent(text: str, channel: str = "web") -> Dict[str, Any]:
             }
         }
 
-    # 5.2 检查是否有明确的本次结算指令（例如：“原居民医保，本次按职工医保结算”、“现按居民医保结算”）
-    # 该显式指令优先级最高，直接覆盖历史/既往险种描述
-    ins_type = None
-    current_match = re.search(r'(?:本次|现|当前|此次)?(?:按|以|采用|转为)\s*(城镇职工|职工医保|职工|城镇居民|城乡居民|居民医保|居民|新农合|公费医疗|公费|工伤保险|工伤|自费)(?:医保)?(?:结算)?', text_clean)
-    if current_match:
-        target = current_match.group(1)
-        if target in ("公费医疗", "公费"):
-            ins_type = "公费医疗"
-        elif target in ("工伤保险", "工伤"):
-            ins_type = "工伤保险"
-        elif target == "自费":
-            ins_type = "自费"
-        elif any(k in target for k in ("城镇居民", "城乡居民", "居民医保", "居民", "新农合")):
-            ins_type = "居民"
-        elif any(k in target for k in ("城镇职工", "职工医保", "职工")):
-            ins_type = "职工"
+    # 5.2 多重模糊、职业状态或暂不适用医保统筹险种阻断拦截
+    if not norm_ins["valid"]:
+        if norm_ins.get("reason") == "AMBIGUOUS_INS_TYPE":
+            return {
+                "intent": "need_clarification",
+                "reply": f"【需要明确参保类型】\n{norm_ins.get('message', '同时存在职工与居民医保且未指明结算口径，请明确患者本次住院按哪类险种结算')}。",
+                "data": {
+                    "matched": False,
+                    "status": "PENDING",
+                    "pending_reason": "AMBIGUOUS_INS_TYPE"
+                }
+            }
+        elif norm_ins.get("reason") == "OCCUPATION_NOT_INSURANCE_TYPE":
+            return {
+                "intent": "need_clarification",
+                "reply": "【需要明确参保类型】\n检测到您输入了职业状态（退休/在职等），但未指明具体医保参保类型。请明确患者是【城镇职工医保】、【城乡居民医保】还是【公费医疗/自费】（不同险种医保 DIP 测算基准与规则不同）。",
+                "data": {
+                    "matched": False,
+                    "status": "PENDING",
+                    "pending_reason": "OCCUPATION_NOT_INSURANCE_TYPE"
+                }
+            }
+        elif norm_ins.get("reason", "").startswith("UNSUPPORTED_INS_TYPE"):
+            return {
+                "intent": "need_clarification",
+                "reply": f"【险种暂不适用 DIP】\n{norm_ins.get('message')}",
+                "data": {
+                    "matched": False,
+                    "status": "PENDING",
+                    "pending_reason": norm_ins.get("reason")
+                }
+            }
 
-    # 5.3 过滤否定描述与既往描述（例如：“职工医保，非工伤”、“本次职工医保结算，既往工伤已结案”、“排除公费”）
-    if ins_type is None:
-        cleaned_for_ins = text_clean
-        # 消除否定与既往工伤/公费
-        cleaned_for_ins = re.sub(r'(?:非|排除|除外|不属于|不是|否认)\s*(?:工伤(?:保险)?|公费(?:医疗)?)', '', cleaned_for_ins)
-        cleaned_for_ins = re.sub(r'(?:既往|原|过去|曾|之前)\s*(?:工伤|公费|居民|职工)(?:[^\w\s]*(?:已结案|已结清|结案|已终结))?', '', cleaned_for_ins)
-        cleaned_for_ins = re.sub(r'工伤(?:已结案|已结清|结案)', '', cleaned_for_ins)
-
-        # 5.4 常规优先级判定
-        if "自费" in cleaned_for_ins:
-            ins_type = "自费"
-        elif "公费" in cleaned_for_ins:
-            ins_type = "公费医疗"
-        elif "工伤" in cleaned_for_ins:
-            ins_type = "工伤保险"
-        else:
-            has_resident = any(k in cleaned_for_ins for k in ("城镇居民", "居民医保", "城乡居民", "居民", "城乡", "农合", "新农合"))
-            has_employee = any(k in cleaned_for_ins for k in ("城镇职工", "职工医保", "职工"))
-            
-            if has_resident and has_employee:
-                # 存在多个未被指令消歧的险种，返回 PENDING 追问
-                return {
-                    "intent": "need_clarification",
-                    "reply": "【需要明确参保类型】\n输入中同时检测到职工医保与居民医保且未指明结算口径，请明确患者本次住院按哪类险种结算（城镇职工 / 城乡居民）。",
-                    "data": {
-                        "matched": False,
-                        "status": "PENDING",
-                        "pending_reason": "AMBIGUOUS_INS_TYPE"
-                    }
-                }
-            elif has_resident:
-                ins_type = "居民"
-            elif has_employee:
-                ins_type = "职工"
-            elif "城镇" in cleaned_for_ins:
-                return {
-                    "intent": "need_clarification",
-                    "reply": "【需要明确参保类型】\n检测到您输入了“城镇”，请明确患者是【城镇职工】还是【城镇居民】（两者医保 DIP 测算基准不同）。",
-                    "data": {
-                        "matched": False,
-                        "status": "PENDING",
-                        "pending_reason": "AMBIGUOUS_INS_TYPE"
-                    }
-                }
-            elif any(k in cleaned_for_ins for k in ("退休", "在职", "已退休", "离休", "无业", "待业", "务农", "学生")):
-                return {
-                    "intent": "need_clarification",
-                    "reply": "【需要明确参保类型】\n检测到您输入了职业状态（退休/在职等），但未指明具体医保参保类型。请明确患者是【城镇职工医保】、【城乡居民医保】还是【公费医疗/自费】（不同险种医保 DIP 测算基准与规则不同）。",
-                    "data": {
-                        "matched": False,
-                        "status": "PENDING",
-                        "pending_reason": "OCCUPATION_NOT_INSURANCE_TYPE"
-                    }
-                }
+    ins_type = norm_ins.get("category") if norm_ins.get("valid") else None
 
     # ---------------- 6. 操作识别与时态感知 ----------------
     op_status = "UNKNOWN"
