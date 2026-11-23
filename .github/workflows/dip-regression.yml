@@ -1,0 +1,71 @@
+name: DIP 合成样例回归
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 安装离线规则测试所需依赖
+        run: python -m pip install openpyxl python-dotenv
+      - name: 执行样例并生成中文报告
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from unittest.mock import patch
+          import os
+          import re
+          import runpy
+          import traceback
+          
+          from db.import_dip_excel import parse_excel_to_memory
+          
+          version = "2026_SAMPLE_V1"
+          raw_rows, _ = parse_excel_to_memory("data/dip_rules.xlsx", version)
+          source = Path("db/import_dip_excel.py").read_text(encoding="utf-8")
+          columns = re.search(r"INSERT INTO dbo\.dip_rules\s*\((.*?)\)\s*VALUES", source, re.S)[1]
+          keys = [column.strip() for column in columns.split(",")]
+          rules = [dict(zip(keys, row, strict=True), rule_id=i) for i, row in enumerate(raw_rows, 1)]
+          assert rules, "样例规则为空"
+          failed = False
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as report:
+              print("提交 `" + os.environ["GITHUB_SHA"] + "`\n", file=report)
+              with patch("db.local_db.query_approved_dip_rules", return_value=rules):
+                  from tools.dip_calculator import normalize_insurance_type
+                  cases = [
+                      ("职工医保，更正为居民医保？", ("PENDING", None)),
+                      ("已更正为职工医保后是否需要更正为居民医保？", ("PENDING", None)),
+                      ("职工医保，经检查本次住院仅耗材按自费结算", ("MATCHED", "职工")),
+                      ("登记为职工医保，经检查本次住院按自费结算", ("NOT_APPLICABLE", "自费")),
+                  ]
+                  print("| 合成输入 | 预期（状态、险种） | 实际 | 结果 |\n|---|---|---|---|", file=report)
+                  for sentence, expected in cases:
+                      result = normalize_insurance_type(sentence)
+                      actual = (result["status"], result["category"])
+                      passed = actual == expected
+                      failed |= not passed
+                      print(f"| {sentence} | {expected} | {actual} | {'通过' if passed else '失败'} |", file=report)
+                  print(file=report)
+                  for suite in ["tests/test_dip_calculator.py", "tests/test_dip_phase1.py"]:
+                      try:
+                          runpy.run_path(suite, run_name="__main__")
+                      except Exception:
+                          failed = True
+                          traceback.print_exc()
+                          print(f"- 失败：{suite}，请查看运行日志中的断言位置。", file=report)
+                      else:
+                          print(f"- 通过：{suite}", file=report)
+          raise SystemExit(int(failed))
+          PY
