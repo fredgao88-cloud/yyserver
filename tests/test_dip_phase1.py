@@ -334,8 +334,47 @@ def run_phase1_tests():
     assert "2790.90" in res_11e["reply"]
     print("PASS [Case 11e]: “本次按职工医保结算，保守还是手术？” -> 临床方案选择不误伤已确认险种 ￥2790.90")
 
+    # ---------------- 用例 12: Round 11 审查验收 (暂不更正、更正询问澄清、历史分句隔离、项目自费填充词容错) ----------------
+    print("\n--- [Case 12] Round 11 审查验收 (暂不更正、更正询问澄清、历史分句隔离、项目自费填充词容错) ---")
+    # 12a. 暂不更正为居民医保 -> 否定前缀'暂不'严禁触发更正，必须保留职工基准 ￥2790.90
+    q_12a = "68岁，职工医保，暂不更正为居民医保，M17.9，保守治疗"
+    res_12a = parse_local_intent(q_12a)
+    assert res_12a["intent"] == "query_dip_rule"
+    assert res_12a["data"]["matched"] is True
+    assert res_12a["data"]["benchmark_amount"] == 2790.90
+    assert "2790.90" in res_12a["reply"]
+    print("PASS [Case 12a]: “暂不更正为居民医保” -> 否定前缀识别，保留职工基准 ￥2790.90")
+
+    # 12b. 是否需要更正为居民医保？ -> 疑问形式的更正绝不擅自执行，返回 PENDING / CORRECTION_UNCONFIRMED 澄清
+    q_12b = "68岁，职工医保，是否需要更正为居民医保？M17.9，保守治疗"
+    res_12b = parse_local_intent(q_12b)
+    assert res_12b["intent"] == "need_clarification"
+    assert res_12b["data"]["status"] == "PENDING"
+    assert res_12b["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+    assert "2790.90" not in res_12b["reply"]
+    assert "2604.84" not in res_12b["reply"]
+    print("PASS [Case 12b]: “是否需要更正为居民医保？” -> 更正询问拦截，PENDING / CORRECTION_UNCONFIRMED，零金额输出")
+
+    # 12c. 原先不确定按职工医保还是居民医保，现已核实按居民医保结算 -> 历史分句(含'原')中的'还是'不得压过当前确认，采用居民基准 ￥2604.84
+    q_12c = "68岁，原先不确定按职工医保还是居民医保，现已核实按居民医保结算，M17.9，保守治疗"
+    res_12c = parse_local_intent(q_12c)
+    assert res_12c["intent"] == "query_dip_rule"
+    assert res_12c["data"]["matched"] is True
+    assert res_12c["data"]["benchmark_amount"] == 2604.84
+    assert "2604.84" in res_12c["reply"]
+    print("PASS [Case 12c]: “原先不确定按职工医保还是居民医保，现已核实按居民医保结算” -> 历史分句隔离，采用居民基准 ￥2604.84")
+
+    # 12d. 进口耗材单独按自费项目结算 -> '单独'等填充词不得破坏项目范围识别，整单按职工测算 ￥2790.90
+    q_12d = "68岁，职工医保，进口耗材单独按自费项目结算，M17.9，保守治疗"
+    res_12d = parse_local_intent(q_12d)
+    assert res_12d["intent"] == "query_dip_rule"
+    assert res_12d["data"]["matched"] is True
+    assert res_12d["data"]["benchmark_amount"] == 2790.90
+    assert "2790.90" in res_12d["reply"]
+    print("PASS [Case 12d]: “进口耗材单独按自费项目结算” -> 填充词容错，项目级自费隔离，整单按职工测算 ￥2790.90")
+
     print("\n" + "=" * 70)
-    print(">>> 恭喜！Phase 1 验收回归测试套件全部 11 大关键测试集 100% 通过！ <<<")
+    print(">>> 恭喜！Phase 1 验收回归测试套件全部 12 大关键测试集 100% 通过！ <<<")
     print("=" * 70)
 
 if __name__ == "__main__":

@@ -111,6 +111,17 @@ def parse_local_intent(text: str, channel: str = "web") -> Dict[str, Any]:
                     "pending_reason": norm_ins.get("reason")
                 }
             }
+        elif norm_ins.get("reason") == "CORRECTION_UNCONFIRMED":
+            # “是否需要更正为X医保？”等更正询问：确认前绝不擅自更改测算口径，先澄清
+            return {
+                "intent": "need_clarification",
+                "reply": f"【更正参保类型待确认】\n{norm_ins.get('message', '检测到参保类型更正询问，确认前系统暂不更改测算口径')}。",
+                "data": {
+                    "matched": False,
+                    "status": "PENDING",
+                    "pending_reason": "CORRECTION_UNCONFIRMED"
+                }
+            }
 
     ins_type = norm_ins.get("category") if norm_ins.get("valid") else None
 
