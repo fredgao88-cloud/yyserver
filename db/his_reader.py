@@ -27,6 +27,11 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.dirname(__file__)),
 load_dotenv('/opt/hospital-agent/.env')
 
 class HISReader:
+    # RECON-RX-001：对账读取的一致性隔离级别。生产环境严禁修改，恒为 SERIALIZABLE；
+    # 仅验收测试的变异子类可将其覆盖为 None（跳过显式隔离设置，退回数据库默认
+    # READ COMMITTED），用于证明一致性验收对隔离保护确实敏感（变异必须失败）。
+    RECON_ISOLATION = "SERIALIZABLE"
+
     def __init__(self):
         self.server = os.getenv('HIS_FREETDS_SECTION', 'hisdb')
         self.user = os.getenv('HIS_USER', 'agent_reader')
@@ -124,7 +129,8 @@ class HISReader:
             # 本函数仅供对账审计低频调用，无 API 在线路径），
             # 保证并发结算/发药提交时对账只读到完整旧账或完整新账。
             conn.autocommit(False)
-            cur.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+            if self.RECON_ISOLATION:
+                cur.execute("SET TRANSACTION ISOLATION LEVEL " + self.RECON_ISOLATION)
             # 1. Query valid settlements for lsh
             cur.execute("SELECT * FROM dbo.his_zyjz WHERE lsh = %s AND iszf = 0 ORDER BY jzrq ASC", (lsh,))
             valid_settlements = cur.fetchall()

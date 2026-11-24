@@ -556,8 +556,32 @@ def run_phase1_tests():
     assert "2604.84" not in res_19b["reply"]
     print("PASS [Case 19b]: “如果审批通过，已核实审批材料齐全并更正为居民医保” -> 材料齐全非审批结果，PENDING / CORRECTION_UNCONFIRMED，零金额输出")
 
+    # ---------------- 用例 20: DIP-INS-001 变体五验收 (确认须同话题且结果为肯定) ----------------
+    print("\n--- [Case 20] DIP-INS-001 变体五验收 (“审批未通过”否定结果与“身份核验”无关事项，绝不解除待定) ---")
+    # 20a. 本次职工医保，如果审批通过，已核实审批未通过并更正为居民医保 -> “未通过”是前提的否定结果，
+    #      前提未满足且结果相反，更正绝不生效，先澄清并省略金额
+    q_20a = "68岁，本次职工医保，如果审批通过，已核实审批未通过并更正为居民医保，M17.9，保守治疗"
+    res_20a = parse_local_intent(q_20a)
+    assert res_20a["intent"] == "need_clarification"
+    assert res_20a["data"]["status"] == "PENDING"
+    assert res_20a["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+    assert "2790.90" not in res_20a["reply"]
+    assert "2604.84" not in res_20a["reply"]
+    print("PASS [Case 20a]: “如果审批通过，已核实审批未通过并更正为居民医保” -> 否定结果不解除待定，PENDING / CORRECTION_UNCONFIRMED，零金额输出")
+
+    # 20b. 本次职工医保，如果审批通过，已确认身份核验通过并更正为居民医保 -> “身份核验通过”与审批前提无关，
+    #      更正绝不生效，先澄清并省略金额；正对照仍由 Case 18b（“已确认审批通过”放行 ￥2604.84）覆盖
+    q_20b = "68岁，本次职工医保，如果审批通过，已确认身份核验通过并更正为居民医保，M17.9，保守治疗"
+    res_20b = parse_local_intent(q_20b)
+    assert res_20b["intent"] == "need_clarification"
+    assert res_20b["data"]["status"] == "PENDING"
+    assert res_20b["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+    assert "2790.90" not in res_20b["reply"]
+    assert "2604.84" not in res_20b["reply"]
+    print("PASS [Case 20b]: “如果审批通过，已确认身份核验通过并更正为居民医保” -> 无关事项确认不解除待定，PENDING / CORRECTION_UNCONFIRMED，零金额输出")
+
     print("\n" + "=" * 70)
-    print(">>> 恭喜！Phase 1 验收回归测试套件全部 19 大关键测试集 100% 通过！ <<<")
+    print(">>> 恭喜！Phase 1 验收回归测试套件全部 20 大关键测试集 100% 通过！ <<<")
     print("=" * 70)
 
 if __name__ == "__main__":

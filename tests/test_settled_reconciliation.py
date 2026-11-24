@@ -484,15 +484,19 @@ def run_settled_reconciliation_suite():
     print("  [PASS] Suite 8 Actual-SQL Offline Execution & Mutation Verified.")
 
     # -------------------------------------------------------------
-    # Test Suite 9: 双会话串行化一致性验收（RECON-RX-001）
-    # 在院内隔离 SQL Server（his_agent_db 本地容器，与生产 HIS 库无关）建临时表，
-    # 按生产读取模式（SERIALIZABLE 显式事务）读取；并发会话在读取期间提交
-    # 主单与药费调整，断言读取方只得到完整旧账或完整新账
+    # Test Suite 9: 真实 get_case_fee_detail 双会话一致性验收（RECON-RX-001 深化 / TEST-ISO-001）
+    # 每轮运行在院内隔离 SQL Server 上创建专有可丢弃数据库（rxt_recon_<随机>，零并发冲突，
+    # 严禁指向共享/生产库），建与生产同名表，走真实 get_case_fee_detail 代码路径；
+    # 写线程在读取方主单读就绪信号后才并发提交主单与药费调整，断言读取方只得到
+    # 完整旧账或完整新账；变异子类关闭隔离保护后必须读到跨时点撕裂（证明验收对保护敏感）。
+    # 环境缺失时明确报告 SKIP，绝不静默跳过。
     # -------------------------------------------------------------
-    print("\n[Suite 9] Two-session SERIALIZABLE consistency on isolated SQL Server...")
+    print("\n[Suite 9] Real get_case_fee_detail two-session consistency on per-run scratch database...")
     try:
         import pymssql
         import threading
+        import time
+        import uuid
     except ImportError:
         print("  [SKIP] Suite 9: pymssql 不可用（离线环境跳过，服务器上必跑）")
     else:
@@ -504,90 +508,158 @@ def run_settled_reconciliation_suite():
         if not (_h and _u and _p):
             print("  [SKIP] Suite 9: LOCAL_DB_* 未配置（离线环境跳过，服务器上必跑）")
         else:
+            assert _db.strip().lower() not in ('his', 'hisdb'), \
+                "Suite 9 严禁指向共享/生产 HIS 库，LOCAL_DB_NAME 必须为院内隔离库"
+            scratch = 'rxt_recon_' + uuid.uuid4().hex[:8]
             admin = pymssql.connect(server=_h, port=_port, user=_u, password=_p, database=_db,
                                     autocommit=True, login_timeout=10, timeout=30)
             ac = admin.cursor()
+            ac.execute(f"CREATE DATABASE {scratch}")
             try:
-                for t in ('rxt_zyjz', 'rxt_cfmain', 'rxt_cfmain_fyjl'):
-                    ac.execute(f"IF OBJECT_ID('dbo.{t}','U') IS NOT NULL DROP TABLE dbo.{t}")
-                ac.execute("CREATE TABLE dbo.rxt_zyjz (lsh NVARCHAR(64), id NVARCHAR(64), amoney DECIMAL(18,5), czmoney DECIMAL(18,5), yjmoney DECIMAL(18,5), yfmoney DECIMAL(18,5), iszf INT, jzrq DATETIME2)")
-                ac.execute("CREATE TABLE dbo.rxt_cfmain (lsh NVARCHAR(64), id NVARCHAR(64), bmoney DECIMAL(18,5), jsrq DATETIME2 NULL, iszf INT NULL)")
-                ac.execute("CREATE TABLE dbo.rxt_cfmain_fyjl (lsh NVARCHAR(64), id NVARCHAR(64), bmoney DECIMAL(18,5))")
-                # 旧账：主单 37 = 已发药净额 25（30 - 5 退药）+ 已计费未发药 12（合成编号，非真实就诊流水号）
-                ac.execute("INSERT INTO dbo.rxt_zyjz VALUES ('RXTEST01','S1',200,0,0,37,0,SYSDATETIME())")
-                ac.execute("INSERT INTO dbo.rxt_cfmain VALUES ('RXTEST01','RX-DISP-0001',30,'2026-11-24 09:12:00',NULL)")
-                ac.execute("INSERT INTO dbo.rxt_cfmain VALUES ('RXTEST01','RX-UNFY-0001',12,'2026-11-24 09:30:00',NULL)")
-                ac.execute("INSERT INTO dbo.rxt_cfmain_fyjl VALUES ('RXTEST01','RX-DISP-0001',30)")
-                ac.execute("INSERT INTO dbo.rxt_cfmain_fyjl VALUES ('RXTEST01','RX-DISP-0001',-5)")
+                # 专库内建与生产同名表，读取器实际 SQL 原样执行，不做任何表名替换
+                ddl = pymssql.connect(server=_h, port=_port, user=_u, password=_p, database=scratch,
+                                      autocommit=True, login_timeout=10, timeout=30)
+                dc = ddl.cursor()
+                dc.execute("CREATE TABLE dbo.his_zyjz (lsh NVARCHAR(64), id NVARCHAR(64), amoney DECIMAL(18,5), czmoney DECIMAL(18,5), yjmoney DECIMAL(18,5), yfmoney DECIMAL(18,5), iszf INT, jzrq DATETIME2)")
+                dc.execute("CREATE TABLE dbo.his_zycjz (lsh NVARCHAR(64), id NVARCHAR(64), xmsflxid NVARCHAR(16), amoney DECIMAL(18,5), ssmoney DECIMAL(18,5))")
+                dc.execute("CREATE TABLE dbo.his_zycz (lsh NVARCHAR(64), money DECIMAL(18,5))")
+                dc.execute("CREATE TABLE dbo.his_cfmain (lsh NVARCHAR(64), id NVARCHAR(64), bmoney DECIMAL(18,5), jsrq DATETIME2 NULL, iszf INT NULL)")
+                dc.execute("CREATE TABLE dbo.his_cfmain_fyjl (lsh NVARCHAR(64), id NVARCHAR(64), bmoney DECIMAL(18,5))")
+                ddl.close()
 
-                # 读取器实际生成的合并聚合 SQL，仅替换为临时表名
-                fy_sql_rxt = (fy_sql.replace('dbo.his_cfmain_fyjl', 'dbo.rxt_cfmain_fyjl')
-                                    .replace('dbo.his_cfmain', 'dbo.rxt_cfmain'))
-                master_sql = "SELECT SUM(yfmoney) AS yfm FROM dbo.rxt_zyjz WHERE lsh = %s AND iszf = 0"
+                def _seed_old_account():
+                    """灌入合成旧账（编号全部虚构）：主单 37 = 已发药净额 25（30 - 5 退药）+ 已计费未发药 12"""
+                    sd = pymssql.connect(server=_h, port=_port, user=_u, password=_p, database=scratch,
+                                         autocommit=True, login_timeout=10, timeout=30)
+                    sc = sd.cursor()
+                    for t in ('his_zyjz', 'his_zycjz', 'his_zycz', 'his_cfmain', 'his_cfmain_fyjl'):
+                        sc.execute(f"DELETE FROM dbo.{t}")
+                    sc.execute("INSERT INTO dbo.his_zyjz VALUES ('RXTEST01','S1',200,0,0,37,0,SYSDATETIME())")
+                    sc.execute("INSERT INTO dbo.his_zycjz VALUES ('RXTEST01','S1','01',200,200)")
+                    sc.execute("INSERT INTO dbo.his_cfmain VALUES ('RXTEST01','RX-DISP-0001',30,'2026-11-24 09:12:00',NULL)")
+                    sc.execute("INSERT INTO dbo.his_cfmain VALUES ('RXTEST01','RX-UNFY-0001',12,'2026-11-24 09:30:00',NULL)")
+                    sc.execute("INSERT INTO dbo.his_cfmain VALUES ('RXTEST01','RX-UNBILL-01',99,NULL,NULL)")
+                    sc.execute("INSERT INTO dbo.his_cfmain VALUES ('RXTEST01','RX-VOID-0001',55,'2026-11-24 09:40:00',1)")
+                    sc.execute("INSERT INTO dbo.his_cfmain_fyjl VALUES ('RXTEST01','RX-DISP-0001',30)")
+                    sc.execute("INSERT INTO dbo.his_cfmain_fyjl VALUES ('RXTEST01','RX-DISP-0001',-5)")
+                    sd.close()
 
-                # 会话 R：生产同款 SERIALIZABLE 只读事务，先读旧账
-                R = pymssql.connect(server=_h, port=_port, user=_u, password=_p, database=_db,
-                                    autocommit=False, login_timeout=10, timeout=60)
-                rc = R.cursor(as_dict=True)
-                rc.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
-                rc.execute(master_sql, ('RXTEST01',))
-                old_master = Decimal(str(rc.fetchone()['yfm']))
-                rc.execute(fy_sql_rxt, ('RXTEST01', 'RXTEST01'))
-                old_fy = rc.fetchone()
-                assert old_master == Decimal('37')
-                assert Decimal(str(old_fy['fy_total'])) == Decimal('25')
-                assert Decimal(str(old_fy['unfy_total'])) == Decimal('12')
+                class HookCursor:
+                    """包装游标：主单读取完成后触发就绪钩子（置位事件并按需停顿），
+                    让写线程在读取事务持锁期间发起并发提交；其余调用原样转发"""
+                    def __init__(self, inner, on_master_read):
+                        self._inner = inner
+                        self._sql = ""
+                        self._hook = on_master_read
+                    def execute(self, sql, params=()):
+                        self._sql = sql
+                        return self._inner.execute(sql, params)
+                    def fetchall(self):
+                        rows = self._inner.fetchall()
+                        if self._hook and "FROM dbo.his_zyjz " in self._sql:
+                            self._hook()
+                        return rows
+                    def fetchone(self):
+                        return self._inner.fetchone()
 
-                # 会话 W：并发提交主单与药费调整（新账 45 = 33 + 12），将被 R 的串行化锁阻塞
-                w_result = []
-                def _writer():
+                class HookConn:
+                    def __init__(self, conn, hook):
+                        self._conn = conn
+                        self._hook = hook
+                    def cursor(self, as_dict=False):
+                        return HookCursor(self._conn.cursor(as_dict=as_dict), self._hook)
+                    def autocommit(self, value):
+                        return self._conn.autocommit(value)
+                    def commit(self):
+                        return self._conn.commit()
+                    def rollback(self):
+                        return self._conn.rollback()
+                    def close(self):
+                        return self._conn.close()
+
+                class ScratchReader(HISReader):
+                    """真实 get_case_fee_detail 代码路径，仅连接目标换为本轮专有库；
+                    isolation=None 时经 RECON_ISOLATION 变异点关闭显式隔离保护（仅限本测试）"""
+                    def __init__(self, isolation='SERIALIZABLE', hold_seconds=0.0, master_read_event=None):
+                        self._hold = hold_seconds
+                        self._event = master_read_event
+                        if isolation is None:
+                            self.RECON_ISOLATION = None  # 实例级变异，类属性生产默认不受影响
+                    def get_connection(self):
+                        conn = pymssql.connect(server=_h, port=_port, user=_u, password=_p,
+                                               database=scratch, charset='cp936',
+                                               login_timeout=10, timeout=60)
+                        if self._event is None:
+                            return conn
+                        def _hook():
+                            self._event.set()      # 写线程就绪同步：主单已读、锁已持有
+                            if self._hold:
+                                time.sleep(self._hold)
+                        return HookConn(conn, _hook)
+
+                def _writer(event, results):
+                    """并发写入：等待读取方主单读就绪信号后，提交主单+药费调整（新账 45 = 33 + 12）"""
                     try:
-                        W = pymssql.connect(server=_h, port=_port, user=_u, password=_p, database=_db,
+                        if not event.wait(timeout=20):
+                            results.append('error:no-read-ready-signal')
+                            return
+                        W = pymssql.connect(server=_h, port=_port, user=_u, password=_p, database=scratch,
                                             autocommit=False, login_timeout=10, timeout=60)
                         wc = W.cursor()
-                        wc.execute("UPDATE dbo.rxt_zyjz SET yfmoney = 45 WHERE lsh = 'RXTEST01'")
-                        wc.execute("INSERT INTO dbo.rxt_cfmain_fyjl VALUES ('RXTEST01','RX-DISP-0001',8)")
+                        wc.execute("UPDATE dbo.his_zyjz SET yfmoney = 45 WHERE lsh = 'RXTEST01'")
+                        wc.execute("INSERT INTO dbo.his_cfmain_fyjl VALUES ('RXTEST01','RX-DISP-0001',8)")
                         W.commit()
-                        w_result.append('committed')
+                        results.append('committed')
                         W.close()
                     except Exception as e:
-                        w_result.append('error:' + type(e).__name__)
-                wt = threading.Thread(target=_writer)
-                wt.start()
-                wt.join(timeout=5)
+                        results.append('error:' + type(e).__name__)
 
-                # R 在 W 挂起期间重读：串行化保证仍是完整旧账（37 = 25 + 12）
-                rc.execute(master_sql, ('RXTEST01',))
-                mid_master = Decimal(str(rc.fetchone()['yfm']))
-                rc.execute(fy_sql_rxt, ('RXTEST01', 'RXTEST01'))
-                mid_fy = rc.fetchone()
-                mid_total = Decimal(str(mid_fy['fy_total'])) + Decimal(str(mid_fy['unfy_total'] or 0))
-                assert mid_master == Decimal('37') and mid_total == Decimal('37'), \
-                    f"SERIALIZABLE 事务内必须读到完整旧账，实际主单 {mid_master} / 药费 {mid_total}"
-                R.commit()
-                R.close()
-                wt.join(timeout=30)
-                assert w_result == ['committed'], f"写入会话未正常完成: {w_result}"
-                print("PASS [Suite 9a]: 并发提交期间读取方两次读取均为完整旧账（主单 37 = 药费 25 + 未发药 12）")
+                # —— 9a/9b：SERIALIZABLE 保护下只读完整旧账或完整新账 ——
+                _seed_old_account()
+                ev1 = threading.Event()
+                w1 = []
+                wt1 = threading.Thread(target=_writer, args=(ev1, w1))
+                wt1.start()
+                r1 = ScratchReader(isolation='SERIALIZABLE', hold_seconds=2.0, master_read_event=ev1)
+                d_old = r1.get_case_fee_detail('RXTEST01')   # 真实方法，含 SERIALIZABLE 显式事务
+                wt1.join(timeout=30)
+                assert w1 == ['committed'], f"写入会话未正常完成: {w1}"
+                old_master = Decimal(str(d_old['zyjz']['yfmoney']))
+                assert old_master == Decimal('37') and d_old['fy_stat']['total'] == Decimal('25.00') \
+                    and d_old['fy_stat']['undispensed'] == Decimal('12.00'), \
+                    f"串行化读取必须得到完整旧账，实际主单 {old_master} / 发药 {d_old['fy_stat']['total']} / 未发药 {d_old['fy_stat']['undispensed']}"
+                print("PASS [Suite 9a]: 真实 get_case_fee_detail 在并发提交期间读到完整旧账（主单 37 = 发药 25 + 未发药 12）")
 
-                # W 提交后的新读取：只见完整新账（45 = 33 + 12）
-                N = pymssql.connect(server=_h, port=_port, user=_u, password=_p, database=_db,
-                                    autocommit=True, login_timeout=10, timeout=30)
-                nc = N.cursor(as_dict=True)
-                nc.execute(master_sql, ('RXTEST01',))
-                new_master = Decimal(str(nc.fetchone()['yfm']))
-                nc.execute(fy_sql_rxt, ('RXTEST01', 'RXTEST01'))
-                new_fy = nc.fetchone()
-                new_total = Decimal(str(new_fy['fy_total'])) + Decimal(str(new_fy['unfy_total'] or 0))
-                N.close()
-                assert new_master == Decimal('45') and new_total == Decimal('45'), \
-                    f"提交后必须读到完整新账，实际主单 {new_master} / 药费 {new_total}"
-                print("PASS [Suite 9b]: 写入提交后新读取只见完整新账（主单 45 = 药费 33 + 未发药 12），绝不出现在中间态")
+                d_new = ScratchReader().get_case_fee_detail('RXTEST01')
+                new_master = Decimal(str(d_new['zyjz']['yfmoney']))
+                assert new_master == Decimal('45') and d_new['fy_stat']['total'] == Decimal('33.00') \
+                    and d_new['fy_stat']['undispensed'] == Decimal('12.00'), \
+                    f"写入提交后必须读到完整新账，实际主单 {new_master} / 发药 {d_new['fy_stat']['total']} / 未发药 {d_new['fy_stat']['undispensed']}"
+                print("PASS [Suite 9b]: 写入提交后新读取只见完整新账（主单 45 = 发药 33 + 未发药 12），绝不出现在中间态")
+
+                # —— 9c：变异对照——去除隔离保护（RECON_ISOLATION=None）必须读到不一致 ——
+                _seed_old_account()
+                ev2 = threading.Event()
+                w2 = []
+                wt2 = threading.Thread(target=_writer, args=(ev2, w2))
+                wt2.start()
+                r2 = ScratchReader(isolation=None, hold_seconds=3.0, master_read_event=ev2)
+                d_mut = r2.get_case_fee_detail('RXTEST01')   # 默认 READ COMMITTED，主单读旧、药费读新
+                wt2.join(timeout=30)
+                assert w2 == ['committed'], f"变异轮写入会话未正常完成: {w2}"
+                mut_master = Decimal(str(d_mut['zyjz']['yfmoney']))
+                mut_fy = d_mut['fy_stat']['total'] + d_mut['fy_stat']['undispensed']
+                assert mut_master != mut_fy, \
+                    f"去除隔离保护的变异读取必须暴露不一致（主单 {mut_master} vs 药费 {mut_fy}），否则验收对保护不敏感"
+                print(f"PASS [Suite 9c]: 变异对照——关闭隔离后读到跨时点撕裂账（主单 {mut_master} ≠ 药费 {mut_fy}），验收对隔离保护确实敏感")
             finally:
-                for t in ('rxt_zyjz', 'rxt_cfmain', 'rxt_cfmain_fyjl'):
-                    ac.execute(f"IF OBJECT_ID('dbo.{t}','U') IS NOT NULL DROP TABLE dbo.{t}")
+                try:
+                    ac.execute(f"ALTER DATABASE {scratch} SET SINGLE_USER WITH ROLLBACK IMMEDIATE")
+                except Exception:
+                    pass
+                ac.execute(f"DROP DATABASE {scratch}")
                 admin.close()
-            print("  [PASS] Suite 9 Two-session SERIALIZABLE Consistency Verified.")
+            print("  [PASS] Suite 9 Real-reader Two-session Consistency & Mutation Verified.")
 
     print("\n" + "=" * 70)
     print("  ALL 9 RECONCILIATION SUITES PASSED (100.0% COMPLIANT WITH v1.2)")

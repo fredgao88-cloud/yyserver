@@ -207,24 +207,38 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
     # 确认分句必须同时覆盖事项话题与前提中出现的结果词，才视为同一前提已被确认；
     # “审批尚在办理”（无结果词）、“审批材料齐全”（事项相关但结果不符）均不得解除待定
     _premise_outcome_words = ('通过', '获批', '批准', '核准', '同意', '符合', '满足', '成功', '完成', '落实', '到位')
+    _negation_pre = re.compile(r'(?:尚未|未有|未|不|无|没)$')
 
     def _premise_core_confirmed(core_text, clause_text):
-        """跨分句前提解除判据（DIP-INS-001 变体三/四）：
-        1) 事项话题重叠：确认分句须覆盖前提核心内容的二字片段（“已核实年龄”不含“审批”，不放行）；
-        2) 结果词同现：前提中出现的结果词（如“通过”）必须在确认分句中同现
-           （“审批尚在办理”“审批材料齐全”不含“通过”，不放行）；
+        """跨分句前提解除判据（DIP-INS-001 变体三/四/五）：
+        1) 事项话题重叠：核心内容先剥除结果词再做二字片段比对——
+           “身份核验通过”不含“审批”，不放行（变体五）；
+        2) 结果词肯定同现：前提中的结果词（如“通过”）须在确认分句以肯定形式出现，
+           紧邻“未/不/无/没/尚未”等否定的（“审批未通过”）不放行（变体五），
+           无结果词的（“尚在办理”“材料齐全”）不放行（变体四）；
         3) 前提无明确结果词时从严：要求前提核心整体出现在确认分句中"""
         if not core_text:
             return False  # 前提核心为空时绝不自动解除，保持澄清
-        topic_hit = (core_text in clause_text) or any(
-            core_text[i:i + 2] in clause_text for i in range(len(core_text) - 1)
-        )
+        topic_core = core_text
+        for w in _premise_outcome_words:
+            topic_core = topic_core.replace(w, '')
+        topic_core = topic_core.strip()
+        if topic_core:
+            topic_hit = (topic_core in clause_text) or any(
+                topic_core[i:i + 2] in clause_text for i in range(len(topic_core) - 1)
+            )
+        else:
+            topic_hit = core_text in clause_text  # 前提只剩结果词时从严整体匹配
         if not topic_hit:
             return False
         core_outcomes = [w for w in _premise_outcome_words if w in core_text]
-        if core_outcomes:
-            return any(w in clause_text for w in core_outcomes)
-        return core_text in clause_text
+        if not core_outcomes:
+            return core_text in clause_text
+        for w in core_outcomes:
+            for m in re.finditer(re.escape(w), clause_text):
+                if not _negation_pre.search(clause_text[:m.start()]):
+                    return True
+        return False
 
     pending_cond_clause_idx = -1  # 最近一个含未决前提（有条件词且无完成态确认）的分句序号；该前提修饰其后第一条更正指令
     pending_cond_core = ""  # 该未决前提的核心内容（剥除假设/条件标记与标点），用于核对后续确认是否针对同一前提
