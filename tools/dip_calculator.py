@@ -207,12 +207,16 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
     # 确认分句必须同时覆盖事项话题与前提中出现的结果词，才视为同一前提已被确认；
     # “审批尚在办理”（无结果词）、“审批材料齐全”（事项相关但结果不符）均不得解除待定
     _premise_outcome_words = ('通过', '获批', '批准', '核准', '同意', '符合', '满足', '成功', '完成', '落实', '到位')
-    # 紧邻否定识别（DIP-INS-001 变体五/六）：除单字“未/不/无/没”外，
-    # 还须覆盖“没有/没能/未能/并未/并无/还没有”等较长否定形式（“审批没有通过”不放行）
-    _negation_pre = re.compile(r'(?:尚未|未有|没有|没能|未能|还没有|还没|并未|并无|未|不|无|没)$')
-    # 阶段性结果识别（DIP-INS-001 变体六）：确认分句含“仍待/尚待/待终审/待复审/待复核/
-    # 仍需/还需”等未最终落实标记时（“通过初审但仍待终审”），前提未最终满足，绝不解除待定
-    _premise_pending_markers = re.compile(r'(?:仍待|尚待|待终审|待复审|待复核|仍需|还需)')
+    # 紧邻否定/非最终限定识别（DIP-INS-001 变体五/六/七）：除单字“未/不/无/没”外，
+    # 还须覆盖“没有/未能/并未/不予/是否/有无/仅/仅仅”等较长否定、疑问与部分限定形式
+    # （“审批没有通过”“审批不予通过”“审批是否通过”“审批仅通过初审”均不放行）
+    _negation_pre = re.compile(r'(?:尚未|未有|没有|没能|未能|还没有|还没|并未|并无|不予|是否|有无|仅仅|仅|未|不|无|没)$')
+    # 阶段性结果识别（DIP-INS-001 变体六/七）：确认分句含“仍待/尚待/待终审/待复审/待复核/
+    # 仍需/还需/尚无结论/尚无定论/未有结论”等未最终落实标记时（“通过初审但仍待终审”
+    # “是否通过尚无结论”），前提未最终满足，绝不解除待定
+    _premise_pending_markers = re.compile(r'(?:仍待|尚待|待终审|待复审|待复核|仍需|还需|尚无结论|尚无定论|未有结论|未有定论|无结论)')
+    # 结果词后紧跟阶段词（初审/预审/初核/预核）时仅为阶段性通过，不算最终肯定结果（变体七）
+    _premise_stage_suffix = re.compile(r'(?:初审|预审|初核|预核)')
 
     def _premise_core_confirmed(core_text, clause_text):
         """跨分句前提解除判据（DIP-INS-001 变体三/四/五/六）：
@@ -245,8 +249,11 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
             return core_text in clause_text
         for w in core_outcomes:
             for m in re.finditer(re.escape(w), clause_text):
-                if not _negation_pre.search(clause_text[:m.start()]):
-                    return True
+                if _negation_pre.search(clause_text[:m.start()]):
+                    continue  # 紧邻否定/疑问/部分限定（“未通过”“不予通过”“是否通过”“仅通过”）不算肯定
+                if _premise_stage_suffix.match(clause_text[m.end():]):
+                    continue  # 结果词后紧跟阶段词（“通过初审/预审”）仅为阶段性通过，不算最终肯定
+                return True
         return False
 
     pending_cond_clause_idx = -1  # 最近一个含未决前提（有条件词且无完成态确认）的分句序号；该前提修饰其后第一条更正指令
