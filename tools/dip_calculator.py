@@ -198,6 +198,10 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
     # 条件词与“已核实/已确认/已审批”等完成态确认标记共存时，说明前提已有明确核实结果，
     # 不再视为未决前提，更正正常生效
     corr_fulfilled_pre = re.compile(r'(?:已核实|经核实|核实无误|已确认|确认无误|已审批|已核准|已获批|已满足|已符合)')
+    # 假设语气识别（“如果/若/假如/一旦”）：假设句内的完成态词（如“如果已获批则…”）只是假设前提，
+    # 绝非事实确认，完成态词不得放行使更正生效（DIP-INS-001 变体）；
+    # 仅当后续分句以陈述事实口吻明确确认同一前提结果（含完成态词且无假设词）时才解除待定（DIP-INS-002 变体）
+    corr_hypothetical = re.compile(r'(?:如果|若|假如|一旦)')
 
     pending_cond_clause_idx = -1  # 最近一个含未决前提（有条件词且无完成态确认）的分句序号；该前提修饰其后第一条更正指令
     for idx, ci in enumerate(clause_info):
@@ -206,8 +210,11 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
         c = ci['text']
 
         # 本分句是否含未决前提：出现“如果/待核实/符合条件”等条件词，
-        # 且无“已核实/已确认”等前提已落实标记（“如果审批通过”为未决，“已核实符合条件”为已落实）
-        clause_has_pending_cond = bool(corr_conditional_pre.search(c)) and not bool(corr_fulfilled_pre.search(c))
+        # 且无“已核实/已确认”等前提已落实标记（“如果审批通过”为未决，“已核实符合条件”为已落实）；
+        # 假设句（如果/若/假如/一旦）内的完成态词（如“如果已获批”）只是假设前提，绝不视为已落实
+        clause_has_pending_cond = bool(corr_conditional_pre.search(c)) and (
+            bool(corr_hypothetical.search(c)) or not bool(corr_fulfilled_pre.search(c))
+        )
 
         for m in combined_dir_regex.finditer(c):
             verb = m.group(1)
@@ -226,17 +233,25 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
             # 绝不污染更靠后的已确认指令（如“…，已确认更正为职工”仍以确认更正为准）
             cross_clause_conditional = False
             if 0 <= pending_cond_clause_idx < idx:
-                cross_clause_conditional = is_corr_verb
-                pending_cond_clause_idx = -1
+                if bool(corr_fulfilled_pre.search(c)) and not bool(corr_hypothetical.search(c)):
+                    # 后续分句以陈述事实口吻明确确认了前提结果（如“现已确认审批通过并更正为居民医保”），
+                    # 解除跨分句待定，更正正常生效（DIP-INS-002 变体）
+                    pending_cond_clause_idx = -1
+                else:
+                    cross_clause_conditional = is_corr_verb
+                    pending_cond_clause_idx = -1
 
             # 疑问/条件性更正（“是否需要更正为居民医保？”/“需要更正为居民医保吗？”/“更正为居民医保？”/
             # “待核实后再更正为居民医保”/“如果符合条件则更正为居民医保”）：先澄清，绝不擅自更改口径
             # 除动词前的疑问词外，句尾“吗/呢/吧”疑问语气词、分句句尾问号，以及“待核实/如果/若”等
             # 条件前提标记，同样表明更正尚未生效，确认前严禁执行；
             # 但条件词处同时存在“已核实/已确认”等前提已落实标记的（如“已核实符合条件并确认更正为X”），
-            # 说明前提已有明确核实结果，更正生效，绝不误拦截
+            # 说明前提已有明确核实结果，更正生效，绝不误拦截；
+            # 假设句（如果/若/假如/一旦）内的完成态词（如“如果已获批则更正为X”）只是假设前提，绝不放行
             post_text = c[m.end():].strip()
-            pre_conditional = bool(corr_conditional_pre.search(pre_text)) and not bool(corr_fulfilled_pre.search(pre_text))
+            pre_conditional = bool(corr_conditional_pre.search(pre_text)) and (
+                bool(corr_hypothetical.search(pre_text)) or not bool(corr_fulfilled_pre.search(pre_text))
+            )
             is_question_form = (
                 bool(corr_question_pre.search(pre_text))
                 or bool(re.search(r'(?:吗|嘛|么|呢|吧)$', post_text))

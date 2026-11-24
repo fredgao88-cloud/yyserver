@@ -121,8 +121,60 @@ def run_auth_tests():
             pass
     print("PASS [Auth 8]: 非法角色签发令牌被正确拒绝")
 
+    # 9. AUTH-REV-001 撤权/降权逐次数据库核对（内存模拟账号库，纯离线）：
+    #    有效医保办可复核通过；停用后拒绝；降权后旧令牌角色不再生效；凭据版本不匹配/缺失拒绝
+    import auth.rbac as rbac_mod
+
+    mock_db = {
+        "ins01": {"operator_id": "ins01", "display_name": "模拟医保办", "password_hash": "x",
+                  "role_type": ROLE_INSURANCE, "dept_scope": "", "status": "ACTIVE", "cred_version": 3}
+    }
+    orig_get_operator = rbac_mod.get_operator
+    rbac_mod.get_operator = lambda oid: mock_db.get(oid)
+    try:
+        # 9a. 有效医保办账号 + 凭据版本匹配 -> 复核通过，身份以数据库当前角色为准
+        tok_ins = issue_token("ins01", ROLE_INSURANCE, "", cred_version=3)
+        payload_ins = verify_token(tok_ins)
+        assert payload_ins is not None and payload_ins.get("cv") == 3
+        fresh, reason = rbac_mod.revalidate_operator(payload_ins)
+        assert fresh is not None and reason == ""
+        assert fresh["role"] == ROLE_INSURANCE
+        assert role_permitted(fresh["role"], ALERTS_ROLES) is True
+        print("PASS [Auth 9a]: 有效医保办账号凭据版本匹配，复核通过且角色取自数据库")
+
+        # 9b. 停用后同一令牌下一次请求被拒
+        mock_db["ins01"]["status"] = "DISABLED"
+        fresh, reason = rbac_mod.revalidate_operator(payload_ins)
+        assert fresh is None and "停用" in reason
+        print("PASS [Auth 9b]: 账号停用后旧令牌复核被拒，绝不放行")
+
+        # 9c. 恢复并降为医生：旧令牌（声明医保办）复核后角色以数据库为准，预警看板不再放行
+        mock_db["ins01"]["status"] = "ACTIVE"
+        mock_db["ins01"]["role_type"] = ROLE_DOCTOR
+        fresh, reason = rbac_mod.revalidate_operator(payload_ins)
+        assert fresh is not None and fresh["role"] == ROLE_DOCTOR
+        assert role_permitted(fresh["role"], ALERTS_ROLES) is False, "降权后旧会话绝不可再进医保办看板"
+        print("PASS [Auth 9c]: 降权为医生后角色即时以数据库为准，预警看板正确拒绝")
+
+        # 9d. 凭据版本不匹配（口令/权限变更 bump 后旧令牌）与缺失 cv 的旧版令牌一律拒绝
+        mock_db["ins01"]["role_type"] = ROLE_INSURANCE
+        mock_db["ins01"]["cred_version"] = 4  # 模拟凭据变更
+        fresh, reason = rbac_mod.revalidate_operator(payload_ins)
+        assert fresh is None and "凭据" in reason
+        legacy_payload = {"sub": "ins01", "role": ROLE_INSURANCE, "dept": "", "iat": now, "exp": now + 3600}  # 无 cv
+        fresh, reason = rbac_mod.revalidate_operator(legacy_payload)
+        assert fresh is None and "凭据" in reason
+        print("PASS [Auth 9d]: 凭据版本不匹配及无 cv 旧版令牌均被拒，强制重新登录")
+
+        # 9e. 账号不存在一律拒绝
+        fresh, reason = rbac_mod.revalidate_operator({"sub": "ghost01", "role": ROLE_ADMIN, "cv": 0})
+        assert fresh is None and "不存在" in reason
+        print("PASS [Auth 9e]: 不存在账号的令牌复核被拒")
+    finally:
+        rbac_mod.get_operator = orig_get_operator
+
     print("\n" + "=" * 70)
-    print(">>> 恭喜！auth/rbac.py 全部 8 组离线单元测试 100% 通过！ <<<")
+    print(">>> 恭喜！auth/rbac.py 全部 9 组离线单元测试 100% 通过！ <<<")
     print("=" * 70)
 
 

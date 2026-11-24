@@ -10,19 +10,44 @@ ctx = ssl.create_default_context()
 ctx.check_hostname = False
 ctx.verify_mode = ssl.CERT_NONE
 
-# 受保护接口测试用账号（口令只从环境变量读取，绝不入库入仓）
-TEST_OPERATOR_ID = os.environ.get("TEST_OPERATOR_ID", "doctor01")
-TEST_OPERATOR_PASS = os.environ.get("TEST_OPERATOR_PASS", "")
-TEST_ADMIN_ID = os.environ.get("TEST_ADMIN_ID", "admin")
-TEST_ADMIN_PASS = os.environ.get("TEST_ADMIN_PASS", "")
-if (not TEST_OPERATOR_PASS or not TEST_ADMIN_PASS) and os.path.exists(".env"):
-    with open(".env", "r", encoding="utf-8") as _ef:
-        for _line in _ef:
-            _line = _line.strip()
-            if _line.startswith("TEST_OPERATOR_PASS="):
-                TEST_OPERATOR_PASS = TEST_OPERATOR_PASS or _line.split("=", 1)[1]
-            elif _line.startswith("TEST_ADMIN_PASS="):
-                TEST_ADMIN_PASS = TEST_ADMIN_PASS or _line.split("=", 1)[1]
+# 受保护接口测试用账号（口令只从环境变量/.env 读取，绝不入库入仓）
+# TEST-CRED-001：使用标准 dotenv 解析器，四个字段（两个工号 + 两个口令）均支持
+# 环境变量优先、.env 兜底；.env 中带引号的口令自动剥离引号，自定义工号同样生效
+def load_test_credentials():
+    """按字段优先级读取测试凭据：环境变量 > .env；口令绝不打印、绝不落盘"""
+    if os.path.exists(".env"):
+        try:
+            from dotenv import dotenv_values
+            file_vals = {k: v for k, v in dotenv_values(".env").items() if v is not None}
+        except ImportError:
+            # 无 python-dotenv 时的最小降级解析：同样剥离成对引号
+            file_vals = {}
+            with open(".env", "r", encoding="utf-8") as _ef:
+                for _line in _ef:
+                    _line = _line.strip()
+                    if not _line or _line.startswith("#") or "=" not in _line:
+                        continue
+                    _k, _v = _line.split("=", 1)
+                    _v = _v.strip()
+                    if len(_v) >= 2 and _v[0] == _v[-1] and _v[0] in ("'", '"'):
+                        _v = _v[1:-1]
+                    file_vals[_k.strip()] = _v
+    else:
+        file_vals = {}
+    def _pick(key, default=""):
+        return os.environ.get(key) or file_vals.get(key) or default
+    return {
+        "TEST_OPERATOR_ID": _pick("TEST_OPERATOR_ID", "doctor01"),
+        "TEST_OPERATOR_PASS": _pick("TEST_OPERATOR_PASS"),
+        "TEST_ADMIN_ID": _pick("TEST_ADMIN_ID", "admin"),
+        "TEST_ADMIN_PASS": _pick("TEST_ADMIN_PASS"),
+    }
+
+_cred = load_test_credentials()
+TEST_OPERATOR_ID = _cred["TEST_OPERATOR_ID"]
+TEST_OPERATOR_PASS = _cred["TEST_OPERATOR_PASS"]
+TEST_ADMIN_ID = _cred["TEST_ADMIN_ID"]
+TEST_ADMIN_PASS = _cred["TEST_ADMIN_PASS"]
 
 def post(url, payload, token=None):
     headers = {"Content-Type": "application/json"}
@@ -249,7 +274,7 @@ res10_ambig = post("https://127.0.0.1/api/tools/check_patient_dip", {
     "age": 68,
     "ins_type": "城镇",
     "operation": "保守治疗"
-}, token=ADMIN_TOKEN)
+}, token=TOKEN)
 print("AmbigStatus:", res10_ambig.get("status"), "Success:", res10_ambig.get("success"), "Reason:", res10_ambig.get("pending_reason"))
 assert res10_ambig["success"] is False
 assert res10_ambig["status"] == "PENDING"

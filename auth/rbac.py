@@ -17,7 +17,8 @@ import os
 import secrets
 import sys
 import time
-from typing import Any, Dict, List, Optional, Tuple
+import re
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 # 确保能加载项目内部模块
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -97,8 +98,8 @@ def verify_password(password: str, stored_hash: str) -> bool:
 
 # ----------------- 令牌签发与校验（HMAC-SHA256 签名，自包含过期时间） -----------------
 
-def issue_token(operator_id: str, role_type: str, dept_scope: str = "") -> str:
-    """签发 v1.<payload>.<signature> 形式的本地令牌"""
+def issue_token(operator_id: str, role_type: str, dept_scope: str = "", cred_version: int = 0) -> str:
+    """签发 v1.<payload>.<signature> 形式的本地令牌（cv 为凭据版本，账号凭据/权限变更后旧令牌失效）"""
     if role_type not in ALL_ROLES:
         raise ValueError(f"非法角色类型: {role_type}")
     now = int(time.time())
@@ -106,6 +107,7 @@ def issue_token(operator_id: str, role_type: str, dept_scope: str = "") -> str:
         "sub": operator_id,
         "role": role_type,
         "dept": dept_scope or "",
+        "cv": int(cred_version or 0),
         "iat": now,
         "exp": now + TOKEN_TTL_MINUTES * 60
     }
@@ -136,6 +138,37 @@ def verify_token(token: str) -> Optional[Dict[str, Any]]:
         return payload
     except Exception:
         return None
+
+
+def revalidate_operator(payload: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], str]:
+    """
+    受保护请求逐次核对数据库当前状态（AUTH-REV-001）：
+    - 账号不存在或已停用 → 拒绝；
+    - 凭据版本（cv）与数据库不一致 → 拒绝（口令/角色/状态变更后旧令牌立即失效，旧版无 cv 令牌一律需重新登录）；
+    - 通过则以数据库当前角色与科室范围为准返回最新身份（降权即时生效）。
+    返回 (最新身份, 拒绝原因)；成功时拒绝原因为空串。数据库暂不可用时一律拒绝，绝不放行。
+    """
+    try:
+        op = get_operator(payload.get("sub", ""))
+    except Exception:
+        return None, "鉴权服务暂不可用"
+    if op is None:
+        return None, "账号不存在"
+    if op.get("status") != "ACTIVE":
+        return None, "账号已停用"
+    try:
+        if int(op.get("cred_version") or 0) != int(payload.get("cv", -1)):
+            return None, "凭据已变更，请重新登录"
+    except (TypeError, ValueError):
+        return None, "凭据已变更，请重新登录"
+    return {
+        "sub": op["operator_id"],
+        "role": op["role_type"],
+        "dept": op.get("dept_scope", "") or "",
+        "cv": int(op.get("cred_version") or 0),
+        "iat": payload.get("iat"),
+        "exp": payload.get("exp"),
+    }, ""
 
 
 def extract_bearer_token(authorization: Optional[str]) -> Optional[str]:
@@ -170,6 +203,7 @@ def ensure_auth_schema() -> None:
             dingtalk_userid NVARCHAR(100) NULL,
             can_export_case BIT           NOT NULL CONSTRAINT DF_opacct_export DEFAULT 0,
             status          NVARCHAR(20)  NOT NULL CONSTRAINT DF_opacct_status DEFAULT 'ACTIVE',
+            cred_version    INT           NOT NULL CONSTRAINT DF_opacct_credv DEFAULT 0,
             created_at      DATETIME2     NOT NULL CONSTRAINT DF_opacct_created DEFAULT SYSDATETIME(),
             updated_at      DATETIME2     NOT NULL CONSTRAINT DF_opacct_updated DEFAULT SYSDATETIME()
         );
@@ -177,6 +211,10 @@ def ensure_auth_schema() -> None:
             ALTER TABLE dbo.sys_operator_account ADD dingtalk_userid NVARCHAR(100) NULL;
         IF COL_LENGTH('dbo.sys_operator_account', 'can_export_case') IS NULL
             ALTER TABLE dbo.sys_operator_account ADD can_export_case BIT NOT NULL CONSTRAINT DF_opacct_export DEFAULT 0;
+        IF COL_LENGTH('dbo.sys_operator_account', 'doctor_id') IS NULL
+            ALTER TABLE dbo.sys_operator_account ADD doctor_id NVARCHAR(64) NULL;
+        IF COL_LENGTH('dbo.sys_operator_account', 'cred_version') IS NULL
+            ALTER TABLE dbo.sys_operator_account ADD cred_version INT NOT NULL CONSTRAINT DF_opacct_credv DEFAULT 0;
         """)
         conn.commit()
     finally:
@@ -188,7 +226,7 @@ def get_operator(operator_id: str) -> Optional[Dict[str, Any]]:
     cursor, conn = get_local_db_connection(as_dict=True)
     try:
         cursor.execute(
-            "SELECT operator_id, display_name, password_hash, role_type, dept_scope, dingtalk_userid, can_export_case, status "
+            "SELECT operator_id, display_name, password_hash, role_type, dept_scope, dingtalk_userid, can_export_case, status, cred_version "
             "FROM dbo.sys_operator_account WHERE operator_id = %s",
             (operator_id,)
         )
@@ -202,7 +240,7 @@ def list_operators() -> List[Dict[str, Any]]:
     cursor, conn = get_local_db_connection(as_dict=True)
     try:
         cursor.execute(
-            "SELECT operator_id, display_name, role_type, dept_scope, dingtalk_userid, can_export_case, status, updated_at "
+            "SELECT operator_id, display_name, role_type, dept_scope, dingtalk_userid, can_export_case, doctor_id, status, updated_at "
             "FROM dbo.sys_operator_account ORDER BY operator_id ASC"
         )
         return cursor.fetchall()
@@ -212,7 +250,7 @@ def list_operators() -> List[Dict[str, Any]]:
 
 def create_operator(operator_id: str, display_name: str, password: str,
                     role_type: str, dept_scope: str = "", dingtalk_userid: str = "",
-                    can_export_case: bool = False) -> None:
+                    can_export_case: bool = False, doctor_id: str = "") -> None:
     """创建或重置操作员账号（口令只存哈希，绝不落明文）"""
     operator_id = (operator_id or "").strip()
     if not operator_id or len(operator_id) > 64:
@@ -227,7 +265,8 @@ def create_operator(operator_id: str, display_name: str, password: str,
         if exists:
             cursor.execute(
                 "UPDATE dbo.sys_operator_account SET display_name=%s, password_hash=%s, role_type=%s, "
-                "dept_scope=%s, dingtalk_userid=%s, can_export_case=%s, status='ACTIVE', updated_at=SYSDATETIME() WHERE operator_id=%s",
+                "dept_scope=%s, dingtalk_userid=%s, can_export_case=%s, status='ACTIVE', "
+                "cred_version=cred_version+1, updated_at=SYSDATETIME() WHERE operator_id=%s",
                 (display_name, pwd_hash, role_type, dept_scope or "", dingtalk_userid or None, 1 if can_export_case else 0, operator_id)
             )
         else:
@@ -248,7 +287,7 @@ def set_operator_status(operator_id: str, status: str) -> bool:
     cursor, conn = get_local_db_connection(as_dict=False)
     try:
         cursor.execute(
-            "UPDATE dbo.sys_operator_account SET status=%s, updated_at=SYSDATETIME() WHERE operator_id=%s",
+            "UPDATE dbo.sys_operator_account SET status=%s, cred_version=cred_version+1, updated_at=SYSDATETIME() WHERE operator_id=%s",
             (status, operator_id)
         )
         conn.commit()
@@ -284,6 +323,37 @@ def authenticate(operator_id: str, password: str) -> Tuple[Optional[Dict[str, An
 
 # ----------------- FastAPI 依赖注入（延迟导入 fastapi，离线单测无需安装） -----------------
 
+
+
+def get_authorized_dept_ids(dept_scope: str) -> Set[str]:
+    """
+    根据操作员配置的科室范围 (dept_scope)，精确解析授权科室 ID 与名称集合。
+    支持以逗号分隔的科室编号或名称，并查询 his_ks 进行精准 ID 映射，绝不使用模糊子串匹配。
+    """
+    if not dept_scope:
+        return set()
+    raw_items = [x.strip() for x in re.split(r'[,;，；]', str(dept_scope)) if x.strip()]
+    dept_ids = set(raw_items)
+    try:
+        from db.his_reader import HISReader
+        r = HISReader()
+        conn = r.get_connection()
+        cur = conn.cursor(as_dict=True)
+        try:
+            cur.execute("SELECT ksid, ksname FROM dbo.his_ks WHERE ksid IS NOT NULL")
+            for row in cur.fetchall():
+                ks_id_str = str(row["ksid"]).strip()
+                ks_name = (row["ksname"] or "").strip()
+                if ks_id_str in raw_items or ks_name in raw_items:
+                    dept_ids.add(ks_id_str)
+                    if ks_name:
+                        dept_ids.add(ks_name)
+        finally:
+            conn.close()
+    except Exception:
+        pass
+    return dept_ids
+
 def require_roles(*allowed_roles: str):
     """患者级/受保护接口依赖：强制有效令牌 + 角色矩阵校验，拒绝即写审计日志"""
     from fastapi import Header, HTTPException
@@ -297,13 +367,21 @@ def require_roles(*allowed_roles: str):
                 action_type="AUTH_CHECK", target_ref="TOKEN:INVALID", auth_result="DENIED"
             )
             raise HTTPException(status_code=401, detail="未认证或令牌已过期：请先调用 /api/auth/login 获取访问令牌")
-        if not role_permitted(payload["role"], allowed_roles):
+        # AUTH-REV-001：逐次核对数据库当前在岗状态、角色与凭据版本，拒绝发生在任何业务数据读取之前
+        fresh, reason = revalidate_operator(payload)
+        if fresh is None:
             record_audit_log(
                 operator_id=payload["sub"], role_type=payload["role"], channel="API",
+                action_type="AUTH_CHECK", target_ref="TOKEN:REVALIDATE_DENIED", auth_result="DENIED"
+            )
+            raise HTTPException(status_code=401, detail=f"登录状态已失效：{reason}，请重新登录")
+        if not role_permitted(fresh["role"], allowed_roles):
+            record_audit_log(
+                operator_id=fresh["sub"], role_type=fresh["role"], channel="API",
                 action_type="AUTH_CHECK", target_ref="ROLE:DENIED", auth_result="DENIED"
             )
             raise HTTPException(status_code=403, detail="权限不足：当前角色无权访问该接口")
-        return payload
+        return fresh
 
     return _dependency
 
@@ -316,7 +394,10 @@ def operator_from_optional_token(authorization: Optional[str]) -> Dict[str, Any]
     token = extract_bearer_token(authorization)
     payload = verify_token(token) if token else None
     if payload:
-        return {"sub": payload["sub"], "role": payload["role"], "authenticated": True}
+        # AUTH-REV-001：可选身份同样逐次核对数据库；撤权/降权后一律降级为 anonymous
+        fresh, _reason = revalidate_operator(payload)
+        if fresh is not None:
+            return {"sub": fresh["sub"], "role": fresh["role"], "authenticated": True}
     return {"sub": "anonymous", "role": ROLE_DOCTOR, "authenticated": False}
 
 

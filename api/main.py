@@ -24,6 +24,7 @@ from agent.llm_router import parse_local_intent
 from db.local_db import record_audit_log, get_local_db_connection
 from db.his_reader import HISReader
 from auth.rbac import (
+    get_authorized_dept_ids,
     authenticate, issue_token, operator_from_optional_token, require_roles,
     ensure_auth_schema, TOKEN_TTL_MINUTES, PATIENT_QUERY_ROLES, ALERTS_ROLES,
     ROLE_DEPT_HEAD, get_operator
@@ -95,7 +96,7 @@ async def login(req: LoginRequest):
             target_ref="LOGIN", auth_result="DENIED"
         )
         raise HTTPException(status_code=401, detail=reason)
-    token = issue_token(op["operator_id"], op["role_type"], op.get("dept_scope", ""))
+    token = issue_token(op["operator_id"], op["role_type"], op.get("dept_scope", ""), cred_version=int(op.get("cred_version") or 0))
     record_audit_log(
         operator_id=op["operator_id"], role_type=op["role_type"], channel="API",
         action_type="LOGIN", target_ref="LOGIN", auth_result="PERMITTED"
@@ -150,8 +151,9 @@ async def check_patient_dip(req: CheckPatientDipRequest, operator: Dict[str, Any
     根据患者累计费用与数据库生效 DIP 规则，执行高精度未舍入 Decimal 交叉相乘判灯分析。
     患者级接口：强制有效令牌 + 角色校验（医生/医保办/管理员），操作人身份只取自令牌。
     """
-    # 实时管床医生权限穿透核验（严禁使用 15 分钟快照授权）
-    if operator.get("role") == "DOCTOR" and req.patient_id:
+    # 实时管床医生与科主任数据范围穿透核验（严禁使用 15 分钟快照授权）
+    role = operator.get("role")
+    if role in (ROLE_DOCTOR, ROLE_DEPT_HEAD) and req.patient_id:
         reader = HISReader()
         adm = reader.get_patient_realtime_admission(req.patient_id)
         if not adm:
@@ -160,35 +162,61 @@ async def check_patient_dip(req: CheckPatientDipRequest, operator: Dict[str, Any
                 role_type=operator["role"],
                 channel="API",
                 action_type="CHECK_PATIENT_DIP",
-                target_ref=f"PATIENT:{req.patient_id}",
+                target_ref=f"PATIENT:{re.sub(r'[^a-zA-Z0-9_-]', '', req.patient_id or '')[:30]}",
                 auth_result="DENIED"
             )
             raise HTTPException(
                 status_code=403,
-                detail=f"越权访问：在 HIS 中未检索到患者 {req.patient_id} 的当前在院记录，管床鉴权未通过"
+                detail="越权访问：管床鉴权未通过"
             )
-        cur_doc = (adm.get("attending_doctor") or "").strip()
-        cur_dept = (adm.get("current_dept") or "").strip()
-        op_rec = get_operator(operator["sub"])
-        op_name = (op_rec.get("display_name") or operator["sub"]).strip()
-        op_dept = (operator.get("dept") or (op_rec.get("dept_scope") if op_rec else "")).strip()
 
-        is_attending = (operator["sub"] == cur_doc) or (op_name == cur_doc) or (op_name and op_name in cur_doc) or (cur_doc and cur_doc in op_name)
-        dept_match = bool(op_dept and (op_dept in cur_dept or cur_dept in op_dept))
+        if role == ROLE_DOCTOR:
+            cur_doc_id = (adm.get("attending_doctor_id") or "").strip()
+            op_rec = get_operator(operator["sub"]) or {}
+            valid_doc_ids = {
+                operator["sub"].strip(),
+                (op_rec.get("operator_id") or "").strip(),
+                (op_rec.get("doctor_id") or "").strip(),
+                (operator.get("doctor_id") or "").strip()
+            }
+            valid_doc_ids.discard("")
+            # 严格使用唯一工号和有效在院关系精确授权，关系缺失时拒绝；严禁根据科室放行，对外统一拒绝信息
+            is_attending = bool(cur_doc_id and cur_doc_id in valid_doc_ids)
+            if not is_attending:
+                record_audit_log(
+                    operator_id=operator["sub"],
+                    role_type=operator["role"],
+                    channel="API",
+                    action_type="CHECK_PATIENT_DIP",
+                    target_ref=f"PATIENT:{re.sub(r'[^a-zA-Z0-9_-]', '', req.patient_id or '')[:30]}",
+                    auth_result="DENIED"
+                )
+                raise HTTPException(
+                    status_code=403,
+                    detail="越权访问：管床鉴权未通过"
+                )
 
-        if not (is_attending or (dept_match and not cur_doc)):
-            record_audit_log(
-                operator_id=operator["sub"],
-                role_type=operator["role"],
-                channel="API",
-                action_type="CHECK_PATIENT_DIP",
-                target_ref=f"PATIENT:{req.patient_id}",
-                auth_result="DENIED"
+        elif role == ROLE_DEPT_HEAD:
+            cur_dept_id = str(adm.get("current_dept_id") or "").strip()
+            cur_dept_name = str(adm.get("current_dept") or "").strip()
+            auth_dept_ids = get_authorized_dept_ids(operator.get("dept") or "")
+            is_authorized_dept = bool(
+                (cur_dept_id and cur_dept_id in auth_dept_ids) or
+                (cur_dept_name and cur_dept_name in auth_dept_ids)
             )
-            raise HTTPException(
-                status_code=403,
-                detail=f"越权访问：管床医生仅能查看本人管床患者费用（当前管床医生为 {cur_doc}，科室 {cur_dept}），转科或跨科访问已被拒绝"
-            )
+            if not is_authorized_dept:
+                record_audit_log(
+                    operator_id=operator["sub"],
+                    role_type=operator["role"],
+                    channel="API",
+                    action_type="CHECK_PATIENT_DIP",
+                    target_ref=f"PATIENT:{re.sub(r'[^a-zA-Z0-9_-]', '', req.patient_id or '')[:30]}",
+                    auth_result="DENIED"
+                )
+                raise HTTPException(
+                    status_code=403,
+                    detail="越权访问：管床鉴权未通过"
+                )
 
     cost_dec = Decimal(str(req.current_cost))
 
@@ -384,16 +412,23 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
             stale_warning = f"快照数据生成于 {synced_at.strftime('%Y-%m-%d %H:%M:%S')}，已超过 24 小时未更新，请及时运行定时巡检任务"
 
         sql = """
-        SELECT visit_id, ward_name, bed_no, dept_name, doctor_id, age,
+        SELECT visit_id, ward_name, bed_no, dept_id, dept_name, doctor_id, age,
                ins_type, primary_icd, matched_rule_id, current_fee, target_base,
                fee_ratio, alert_level, pending_reason, data_cutoff_time
         FROM dbo.inpatient_dip_snapshot
         WHERE batch_id = %s
         """
         params = [batch_id]
-        if effective_dept:
-            sql += " AND (dept_name = %s OR dept_name LIKE %s)"
-            params.extend([effective_dept, f"%{effective_dept}%"])
+        if role == ROLE_DEPT_HEAD:
+            auth_dept_ids = get_authorized_dept_ids(user_dept)
+            if not auth_dept_ids:
+                raise HTTPException(status_code=403, detail="科室主任账号未配置科室范围 (dept_scope)，无法访问预警看板")
+            placeholders = ', '.join(['%s'] * len(auth_dept_ids))
+            sql += f" AND (dept_id IN ({placeholders}) OR dept_name IN ({placeholders}))"
+            params.extend(list(auth_dept_ids))
+        elif dept:
+            sql += " AND (dept_id = %s OR dept_name = %s)"
+            params.extend([dept, dept])
         sql += " ORDER BY alert_level ASC, current_fee DESC"
 
         cursor.execute(sql, tuple(params))

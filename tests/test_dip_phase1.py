@@ -487,8 +487,31 @@ def run_phase1_tests():
     assert "2604.84" in res_16b["reply"]
     print("PASS [Case 16b]: “已核实符合条件并确认更正为居民医保” -> 前提已落实，确认更正放行，居民基准 ￥2604.84")
 
+    # ---------------- 用例 17: DIP-INS-001/002 新变体验收 (假设句内完成态词不放行；后续分句确认前提则更正生效) ----------------
+    print("\n--- [Case 17] DIP-INS-001/002 新变体验收 (假设句完成态词误判修复：如果已获批则→待定；现已确认审批通过→更正生效) ---")
+    # 17a. 本次按职工医保结算，如果已获批则更正为居民医保 -> “已获批”位于“如果…则”假设句内，只是假设前提而非事实确认，
+    #      更正未生效，先澄清并省略金额（DIP-INS-001 新变体）
+    q_17a = "68岁，本次按职工医保结算，如果已获批则更正为居民医保，M17.9，保守治疗"
+    res_17a = parse_local_intent(q_17a)
+    assert res_17a["intent"] == "need_clarification"
+    assert res_17a["data"]["status"] == "PENDING"
+    assert res_17a["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+    assert "2790.90" not in res_17a["reply"]
+    assert "2604.84" not in res_17a["reply"]
+    print("PASS [Case 17a]: “如果已获批则更正为居民医保” -> 假设句内完成态词不放行，PENDING / CORRECTION_UNCONFIRMED，零金额输出")
+
+    # 17b. 对照例：本次职工医保，如果审批通过，现已确认审批通过并更正为居民医保 -> 后续分句以陈述事实口吻
+    #      明确确认同一前提结果（“现已确认审批通过”），解除跨分句待定，更正生效，采用居民基准 ￥2604.84（DIP-INS-002 新变体）
+    q_17b = "68岁，本次职工医保，如果审批通过，现已确认审批通过并更正为居民医保，M17.9，保守治疗"
+    res_17b = parse_local_intent(q_17b)
+    assert res_17b["intent"] == "query_dip_rule"
+    assert res_17b["data"]["matched"] is True
+    assert res_17b["data"]["benchmark_amount"] == 2604.84
+    assert "2604.84" in res_17b["reply"]
+    print("PASS [Case 17b]: “如果审批通过，现已确认审批通过并更正为居民医保” -> 前提结果被确认，更正生效，居民基准 ￥2604.84")
+
     print("\n" + "=" * 70)
-    print(">>> 恭喜！Phase 1 验收回归测试套件全部 16 大关键测试集 100% 通过！ <<<")
+    print(">>> 恭喜！Phase 1 验收回归测试套件全部 17 大关键测试集 100% 通过！ <<<")
     print("=" * 70)
 
 if __name__ == "__main__":
