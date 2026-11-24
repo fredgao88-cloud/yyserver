@@ -27,7 +27,7 @@ from auth.rbac import (
     get_authorized_dept_ids,
     authenticate, issue_token, operator_from_optional_token, require_roles,
     ensure_auth_schema, TOKEN_TTL_MINUTES, PATIENT_QUERY_ROLES, ALERTS_ROLES,
-    ROLE_DEPT_HEAD, get_operator
+    ROLE_DOCTOR, ROLE_DEPT_HEAD, get_operator
 )
 
 app = FastAPI(
@@ -423,9 +423,11 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
             auth_dept_ids = get_authorized_dept_ids(user_dept)
             if not auth_dept_ids:
                 raise HTTPException(status_code=403, detail="科室主任账号未配置科室范围 (dept_scope)，无法访问预警看板")
-            placeholders = ', '.join(['%s'] * len(auth_dept_ids))
+            dept_list = list(auth_dept_ids)
+            placeholders = ', '.join(['%s'] * len(dept_list))
             sql += f" AND (dept_id IN ({placeholders}) OR dept_name IN ({placeholders}))"
-            params.extend(list(auth_dept_ids))
+            params.extend(dept_list)
+            params.extend(dept_list)
         elif dept:
             sql += " AND (dept_id = %s OR dept_name = %s)"
             params.extend([dept, dept])

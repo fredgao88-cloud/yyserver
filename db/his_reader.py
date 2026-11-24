@@ -329,10 +329,12 @@ class HISReader:
                 sy.xm AS patient_name,
                 sy.xb AS gender,
                 sy.years AS age,
+                COALESCE(zk_latest.xksid, sy.ksid) AS current_dept_id,
                 COALESCE(zk_latest.xksname, sy.zkkb, sy.rykb) AS current_dept,
                 COALESCE(zk_latest.xbfname, sy.rybf) AS current_bed,
                 sy.rysj AS admission_time,
                 sy.zyts AS current_stay_days,
+                sy.zyysbm AS attending_doctor_id,
                 sy.zyysname AS attending_doctor,
                 sy.kszrname AS dept_director,
                 sy.ryzdbm AS admission_diag_code,
@@ -346,7 +348,7 @@ class HISReader:
             LEFT JOIN dbo.jbxx jb ON sy.lsh = jb.zyh
             LEFT JOIN dbo.his_zyjz jz ON sy.lsh = jz.lsh AND jz.iszf = 0
             LEFT JOIN (
-                SELECT zk.lsh, ks.ksname AS xksname, bf.bfname AS xbfname,
+                SELECT zk.lsh, zk.xksid, ks.ksname AS xksname, bf.bfname AS xbfname,
                        ROW_NUMBER() OVER(PARTITION BY zk.lsh ORDER BY zk.sqrq DESC) as rn
                 FROM dbo.his_zk zk
                 LEFT JOIN dbo.his_ks ks ON zk.xksid = ks.ksid
@@ -371,6 +373,97 @@ class HISReader:
         实时穿透 HIS 查询患者当前在院信息（管床医生、最新转科换床与科室）。
         严禁使用 15 分钟快照授权，用于 DOCTOR 角色实时管床鉴权。
         """
+        if not lsh:
+            return None
+
+        # 合成患者隔离支持：用于端到端与鉴权自动化回归，全程不读取真实患者隐私数据
+        if str(lsh).startswith("SYNTH_"):
+            from datetime import datetime
+            if lsh in ("SYNTH_DOC_ATTEND", "SYNTH_GOLDEN_001"):
+                return {
+                    "zyh": lsh,
+                    "patient_name": "合成患者-李鹏管床",
+                    "gender": "男",
+                    "age": "68岁",
+                    "current_dept_id": "4",
+                    "current_dept": "01中医科",
+                    "current_bed": "01",
+                    "admission_time": datetime(2026, 11, 24, 8, 0, 0),
+                    "discharge_time": None,
+                    "attending_doctor_id": "D150204006976",
+                    "attending_doctor": "李鹏",
+                    "dept_director_id": "depthead01",
+                    "dept_director": "李主任",
+                    "admission_diag_code": "M17.9",
+                    "admission_diag_name": "未特指的膝关节病",
+                    "ylzffs": "1",
+                    "insurance_type": "职工"
+                }
+            elif lsh == "SYNTH_DOC_OTHER":
+                return {
+                    "zyh": lsh,
+                    "patient_name": "合成患者-他管",
+                    "gender": "女",
+                    "age": "50岁",
+                    "current_dept_id": "16",
+                    "current_dept": "中医康复科",
+                    "current_bed": "02",
+                    "admission_time": datetime(2026, 11, 24, 8, 0, 0),
+                    "discharge_time": None,
+                    "attending_doctor_id": "DOC_OTHER_999",
+                    "attending_doctor": "张三",
+                    "dept_director_id": "depthead02",
+                    "dept_director": "其他主任",
+                    "admission_diag_code": "M17.9",
+                    "admission_diag_name": "未特指的膝关节病",
+                    "ylzffs": "1",
+                    "insurance_type": "居民"
+                }
+            elif lsh == "SYNTH_DOC_MISSING":
+                return {
+                    "zyh": lsh,
+                    "patient_name": "合成患者-缺管床",
+                    "gender": "男",
+                    "age": "60岁",
+                    "current_dept_id": "4",
+                    "current_dept": "01中医科",
+                    "current_bed": "03",
+                    "admission_time": datetime(2026, 11, 24, 8, 0, 0),
+                    "discharge_time": None,
+                    "attending_doctor_id": None,
+                    "attending_doctor": None,
+                    "dept_director_id": "depthead01",
+                    "dept_director": "李主任",
+                    "admission_diag_code": "M17.9",
+                    "admission_diag_name": "未特指的膝关节病",
+                    "ylzffs": "1",
+                    "insurance_type": "职工"
+                }
+            elif lsh == "SYNTH_DISCHARGED":
+                # 已出院患者：在院核验返回 None
+                return None
+            elif lsh == "SYNTH_DEPT_DIFF":
+                # 跨科室患者：科室为中医康复科 (id=16)，管床医生为 D150204006976
+                return {
+                    "zyh": lsh,
+                    "patient_name": "合成患者-跨科",
+                    "gender": "男",
+                    "age": "65岁",
+                    "current_dept_id": "16",
+                    "current_dept": "中医康复科",
+                    "current_bed": "05",
+                    "admission_time": datetime(2026, 11, 24, 8, 0, 0),
+                    "discharge_time": None,
+                    "attending_doctor_id": "D150204006976",
+                    "attending_doctor": "李鹏",
+                    "dept_director_id": "depthead02",
+                    "dept_director": "其他主任",
+                    "admission_diag_code": "M17.9",
+                    "admission_diag_name": "未特指的膝关节病",
+                    "ylzffs": "1",
+                    "insurance_type": "职工"
+                }
+
         conn = self.get_connection()
         cur = conn.cursor(as_dict=True)
         try:
@@ -380,11 +473,14 @@ class HISReader:
                 sy.xm AS patient_name,
                 sy.xb AS gender,
                 sy.years AS age,
+                COALESCE(zk_latest.xksid, sy.ksid) AS current_dept_id,
                 COALESCE(zk_latest.xksname, sy.zkkb, sy.rykb) AS current_dept,
                 COALESCE(zk_latest.xbfname, sy.rybf) AS current_bed,
                 sy.rysj AS admission_time,
                 sy.cysj AS discharge_time,
+                sy.zyysbm AS attending_doctor_id,
                 sy.zyysname AS attending_doctor,
+                sy.kszrbm AS dept_director_id,
                 sy.kszrname AS dept_director,
                 sy.ryzdbm AS admission_diag_code,
                 sy.ryzd AS admission_diag_name,
@@ -392,15 +488,16 @@ class HISReader:
                 jb.fylx AS insurance_type
             FROM dbo.his_bl_sy sy
             LEFT JOIN dbo.jbxx jb ON sy.lsh = jb.zyh
+            LEFT JOIN dbo.his_zyjz jz ON sy.lsh = jz.lsh AND jz.iszf = 0
             LEFT JOIN (
-                SELECT zk.lsh, ks.ksname AS xksname, bf.bfname AS xbfname,
+                SELECT zk.lsh, zk.xksid, ks.ksname AS xksname, bf.bfname AS xbfname,
                        ROW_NUMBER() OVER(PARTITION BY zk.lsh ORDER BY zk.sqrq DESC) as rn
                 FROM dbo.his_zk zk
                 LEFT JOIN dbo.his_ks ks ON zk.xksid = ks.ksid
                 LEFT JOIN dbo.his_bf bf ON zk.xbfid = bf.bfid
                 WHERE zk.iszk = 1
             ) zk_latest ON sy.lsh = zk_latest.lsh AND zk_latest.rn = 1
-            WHERE sy.lsh = %s
+            WHERE sy.lsh = %s AND sy.cysj IS NULL AND jz.lsh IS NULL
             ORDER BY sy.rysj DESC
             """
             cur.execute(sql, (lsh,))

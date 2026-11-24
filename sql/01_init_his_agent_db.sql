@@ -62,6 +62,7 @@ BEGIN
         visit_id          NVARCHAR(64)   NOT NULL,
         ward_name         NVARCHAR(50)   NOT NULL,
         bed_no            NVARCHAR(30)   NOT NULL,
+        dept_id           NVARCHAR(30)   NULL,
         dept_name         NVARCHAR(50)   NOT NULL,
         doctor_id         NVARCHAR(50)   NOT NULL,
         age               INT            NULL,
@@ -109,6 +110,7 @@ BEGIN
         dingtalk_userid NVARCHAR(100)  NULL,
         role_type       NVARCHAR(30)   NOT NULL,
         dept_scope      NVARCHAR(300)  NOT NULL DEFAULT N'',
+        doctor_id       NVARCHAR(64)   NULL,
         can_export_case BIT            NOT NULL DEFAULT 0,
         status          NVARCHAR(20)   NOT NULL DEFAULT N'ACTIVE',
         updated_at      DATETIME2      NOT NULL DEFAULT SYSDATETIME()

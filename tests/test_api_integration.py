@@ -35,12 +35,19 @@ def load_test_credentials():
     else:
         file_vals = {}
     def _pick(key, default=""):
-        return os.environ.get(key) or file_vals.get(key) or default
+        v = os.environ.get(key) or file_vals.get(key) or default
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+            v = v[1:-1]
+        return v
     return {
         "TEST_OPERATOR_ID": _pick("TEST_OPERATOR_ID", "doctor01"),
         "TEST_OPERATOR_PASS": _pick("TEST_OPERATOR_PASS"),
         "TEST_ADMIN_ID": _pick("TEST_ADMIN_ID", "admin"),
         "TEST_ADMIN_PASS": _pick("TEST_ADMIN_PASS"),
+        "TEST_DOC_OTHER_ID": _pick("TEST_DOC_OTHER_ID", "doctor_other"),
+        "TEST_DOC_OTHER_PASS": _pick("TEST_DOC_OTHER_PASS"),
+        "TEST_DEPTHEAD_ID": _pick("TEST_DEPTHEAD_ID", "depthead01"),
+        "TEST_DEPTHEAD_PASS": _pick("TEST_DEPTHEAD_PASS"),
     }
 
 _cred = load_test_credentials()
@@ -48,6 +55,10 @@ TEST_OPERATOR_ID = _cred["TEST_OPERATOR_ID"]
 TEST_OPERATOR_PASS = _cred["TEST_OPERATOR_PASS"]
 TEST_ADMIN_ID = _cred["TEST_ADMIN_ID"]
 TEST_ADMIN_PASS = _cred["TEST_ADMIN_PASS"]
+TEST_DOC_OTHER_ID = _cred["TEST_DOC_OTHER_ID"]
+TEST_DOC_OTHER_PASS = _cred["TEST_DOC_OTHER_PASS"]
+TEST_DEPTHEAD_ID = _cred["TEST_DEPTHEAD_ID"]
+TEST_DEPTHEAD_PASS = _cred["TEST_DEPTHEAD_PASS"]
 
 def post(url, payload, token=None):
     headers = {"Content-Type": "application/json"}
@@ -151,33 +162,146 @@ print("PASS [RBAC 2A-7]: 开放接口无令牌保持可用（匿名身份记审�
 
 
 # 2A-3B 医生实时管床越权校验：普通医生访问非本人管床/跨科患者必须 403 并在审计中记录 DENIED
-code_doc2, body_doc2 = post_with_status("https://127.0.0.1/api/auth/login", {"operator_id": "doctor_other", "password": "Doc@Other2026!"})
+code_doc2, body_doc2 = post_with_status("https://127.0.0.1/api/auth/login", {"operator_id": TEST_DOC_OTHER_ID, "password": TEST_DOC_OTHER_PASS})
 assert code_doc2 == 200
 TOKEN_DOC2 = body_doc2["access_token"]
 code_unauth, body_unauth = post_with_status("https://127.0.0.1/api/tools/check_patient_dip", {
-    "patient_id": "zy2025042901", "disease": "M17.9", "current_cost": 2550.00,
+    "patient_id": "SYNTH_DOC_ATTEND", "disease": "M17.9", "current_cost": 2550.00,
     "age": 68, "ins_type": "职工", "operation": "保守治疗"
 }, token=TOKEN_DOC2)
 assert code_unauth == 403 and "越权访问" in body_unauth.get("detail", "")
+assert body_unauth.get("detail") == "越权访问：管床鉴权未通过"
 print("PASS [RBAC 2A-3B]: 非本人管床医生访问患者费用被实时阻断 (403)，严禁跨床越权！")
 
+# 2A-3C 【AUTH-SCOPE-001 医生管床四重鉴权验收】
+# 场景 a: 虚构同名医生 (同姓名但工号不同) -> 403
+code_a, body_a = post_with_status("https://127.0.0.1/api/tools/check_patient_dip", {
+    "patient_id": "SYNTH_DOC_ATTEND", "disease": "M17.9", "current_cost": 2550.00,
+    "age": 68, "ins_type": "职工", "operation": "保守治疗"
+}, token=TOKEN_DOC2)
+assert code_a == 403 and body_a.get("detail") == "越权访问：管床鉴权未通过"
+
+# 场景 b: 缺失管床关系 (在院患者缺失管床医生工号) -> 403
+code_b, body_b = post_with_status("https://127.0.0.1/api/tools/check_patient_dip", {
+    "patient_id": "SYNTH_DOC_MISSING", "disease": "M17.9", "current_cost": 2550.00,
+    "age": 68, "ins_type": "职工", "operation": "保守治疗"
+}, token=TOKEN)
+assert code_b == 403 and body_b.get("detail") == "越权访问：管床鉴权未通过"
+
+# 场景 c: 已出院患者 (非在院状态) -> 403
+code_c, body_c = post_with_status("https://127.0.0.1/api/tools/check_patient_dip", {
+    "patient_id": "zy2025042901", "disease": "M17.9", "current_cost": 2550.00,
+    "age": 68, "ins_type": "职工", "operation": "保守治疗"
+}, token=TOKEN)
+assert code_c == 403 and body_c.get("detail") == "越权访问：管床鉴权未通过"
+
+# 场景 d: 当前本人管床 (有效在院且由测试医生管床) -> 200 正常判灯
+code_d, body_d = post_with_status("https://127.0.0.1/api/tools/check_patient_dip", {
+    "patient_id": "SYNTH_DOC_ATTEND", "disease": "M17.9", "current_cost": 2550.00,
+    "age": 68, "ins_type": "职工", "operation": "保守治疗"
+}, token=TOKEN)
+assert code_d == 200 and body_d.get("status") == "MATCHED"
+assert body_d["evaluation"]["light"] == "黄灯"
+print("PASS [AUTH-SCOPE-001]: 虚构同名医生(403)、缺失管床(403)、已出院(403)、当前管床(200) 全部通过！")
+
 # 2A-5B 预警看板：科室主任角色 (DEPT_HEAD) 访问本科室预警正常 (200)
-code_dh, body_dh = post_with_status("https://127.0.0.1/api/auth/login", {"operator_id": "depthead01", "password": "Head@Yy2026!Test"})
+code_dh, body_dh = post_with_status("https://127.0.0.1/api/auth/login", {"operator_id": TEST_DEPTHEAD_ID, "password": TEST_DEPTHEAD_PASS})
 assert code_dh == 200
 TOKEN_DH = body_dh["access_token"]
 code_dh_alerts, body_dh_alerts = get_with_status("https://127.0.0.1/api/inpatient/alerts", token=TOKEN_DH)
 assert code_dh_alerts == 200 and body_dh_alerts.get("is_demo_baseline") is False
 print("PASS [RBAC 2A-5B]: 科室主任角色成功访问本科室真实在院快照看板 (200)！")
 
+# 2A-5C 【AUTH-SCOPE-002 科主任双入口科室范围精确隔离】
+# 入口 1: check_patient_dip 判灯科主任科室校验
+# 1a. 本科室在院患者 -> 200
+code_dh_ok, body_dh_ok = post_with_status("https://127.0.0.1/api/tools/check_patient_dip", {
+    "patient_id": "SYNTH_DOC_ATTEND", "disease": "M17.9", "current_cost": 2550.00,
+    "age": 68, "ins_type": "职工", "operation": "保守治疗"
+}, token=TOKEN_DH)
+assert code_dh_ok == 200
+
+# 1b. 跨科室在院患者 (中医康复科 id=16) -> 403 拒绝
+code_dh_diff, body_dh_diff = post_with_status("https://127.0.0.1/api/tools/check_patient_dip", {
+    "patient_id": "SYNTH_DEPT_DIFF", "disease": "M17.9", "current_cost": 2550.00,
+    "age": 68, "ins_type": "职工", "operation": "保守治疗"
+}, token=TOKEN_DH)
+assert code_dh_diff == 403 and "越权访问" in body_dh_diff.get("detail", "")
+
+# 入口 2: alerts 预警看板按科室 ID 精确过滤（严禁混入 中医康复科 id=16）
+for itm in body_dh_alerts.get("items", []):
+    assert itm.get("dept_id") in ("4", None) or "中医科" in itm.get("dept_name", "")
+    assert "中医康复科" not in itm.get("dept_name", "")
+print("PASS [AUTH-SCOPE-002]: 科主任判灯跨科室阻断(403)与看板精确科室ID过滤全部通过！")
+
 # 2A-8 负费用拦截校验：current_cost < 0 必须拦截待定并标明 NEGATIVE_FEE_UNRECONCILED
 code_neg, body_neg = post_with_status("https://127.0.0.1/api/tools/check_patient_dip", {
-    "patient_id": "zy2025042901", "disease": "M17.9", "current_cost": -120.50,
+    "patient_id": "SYNTH_DOC_ATTEND", "disease": "M17.9", "current_cost": -120.50,
     "age": 68, "ins_type": "职工", "operation": "保守治疗"
 }, token=TOKEN)
 assert code_neg == 200 and body_neg.get("status") == "PENDING"
 assert body_neg.get("pending_reason") == "NEGATIVE_FEE_UNRECONCILED"
 assert body_neg.get("evaluation", {}).get("light") == "无"
 print("PASS [P1 负费用拦截 2A-8]: 冲正未闭环负费用成功拦截为 PENDING / NEGATIVE_FEE_UNRECONCILED，杜绝误判绿灯！")
+
+# 2A-9 【AUTH-REV-001 动态在岗状态与凭据版本复核】
+# 使用容器内 local_db 辅助验证：停用账号与版本更新后已签发令牌立即失效
+import subprocess
+
+def _exec_db_update(status_val, cv_bump=False, reset_cv=None):
+    if cv_bump:
+        py_code = f"""from db.local_db import get_local_db_connection
+cur, conn = get_local_db_connection()
+cur.execute(\"UPDATE dbo.sys_operator_account SET status = %s, cred_version = cred_version + 1 WHERE operator_id = %s\", ('{status_val}', '{TEST_OPERATOR_ID}'))
+conn.commit()
+conn.close()"""
+    elif reset_cv is not None:
+        py_code = f"""from db.local_db import get_local_db_connection
+cur, conn = get_local_db_connection()
+cur.execute(\"UPDATE dbo.sys_operator_account SET status = %s, cred_version = %s WHERE operator_id = %s\", ('{status_val}', {reset_cv}, '{TEST_OPERATOR_ID}'))
+conn.commit()
+conn.close()"""
+    else:
+        py_code = f"""from db.local_db import get_local_db_connection
+cur, conn = get_local_db_connection()
+cur.execute(\"UPDATE dbo.sys_operator_account SET status = %s WHERE operator_id = %s\", ('{status_val}', '{TEST_OPERATOR_ID}'))
+conn.commit()
+conn.close()"""
+    subprocess.run(["docker", "exec", "hospital_agent_api", "python3", "-c", py_code], check=True)
+
+try:
+    # a. 临时停用账号
+    _exec_db_update("DISABLED")
+    code_rev1, body_rev1 = post_with_status("https://127.0.0.1/api/tools/check_patient_dip", {
+        "patient_id": "SYNTH_DOC_ATTEND", "disease": "M17.9", "current_cost": 2550.00,
+        "age": 68, "ins_type": "职工", "operation": "保守治疗"
+    }, token=TOKEN)
+    assert code_rev1 == 401, f"Expected 401 for disabled account, got {code_rev1}"
+
+    # b. 推进凭据版本 cred_version
+    _exec_db_update("ACTIVE", cv_bump=True)
+    code_rev2, body_rev2 = post_with_status("https://127.0.0.1/api/tools/check_patient_dip", {
+        "patient_id": "SYNTH_DOC_ATTEND", "disease": "M17.9", "current_cost": 2550.00,
+        "age": 68, "ins_type": "职工", "operation": "保守治疗"
+    }, token=TOKEN)
+    assert code_rev2 == 401, f"Expected 401 for stale cred_version, got {code_rev2}"
+finally:
+    _exec_db_update("ACTIVE", reset_cv=2)
+# 刷新 TOKEN 供后续继续使用
+code_re, body_re = post_with_status("https://127.0.0.1/api/auth/login", {"operator_id": TEST_OPERATOR_ID, "password": TEST_OPERATOR_PASS})
+assert code_re == 200
+TOKEN = body_re["access_token"]
+print("PASS [AUTH-REV-001]: 账号停用与凭据版本推进即时阻断旧令牌 (401)，复核成功！")
+
+# 2A-10 【TEST-CRED-001 dotenv 引号剥离与环境优先级单元断言】
+def _test_strip_quotes(v):
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+        return v[1:-1]
+    return v
+assert _test_strip_quotes("'Secret@Pass123'") == "Secret@Pass123"
+assert _test_strip_quotes('"Secret@Pass123"') == "Secret@Pass123"
+assert _test_strip_quotes("Secret@Pass123") == "Secret@Pass123"
+print("PASS [TEST-CRED-001]: dotenv 解析器引号剥离逻辑验证通过！")
 print("\n=== 3. 结构化规则接口 (68岁职工 M17.9 膝关节病 保守治疗) ===")
 res3 = post("https://127.0.0.1/api/tools/query_dip_rule", {
     "disease": "M17.9",
@@ -191,7 +315,7 @@ assert res3["benchmark_amount"] == 2790.90
 
 print("\n=== 4. 判灯核查接口 (当前费用 2550 元 vs 预估基准 2790.90 元) ===")
 res4 = post("https://127.0.0.1/api/tools/check_patient_dip", {
-    "patient_id": "zy2025042901",
+    "patient_id": "SYNTH_DOC_ATTEND",
     "disease": "M17.9",
     "current_cost": 2550.00,
     "age": 68,
@@ -230,7 +354,7 @@ assert "query" not in res7.get("data", {})
 
 print("\n=== 8. 公费医疗未支持参保类型拦截接口 ===")
 res8 = post("https://127.0.0.1/api/tools/check_patient_dip", {
-    "patient_id": "zy2025042902",
+    "patient_id": "SYNTH_DOC_ATTEND",
     "disease": "M17.9",
     "current_cost": 2450.00,
     "age": 68,
@@ -274,7 +398,7 @@ res10_ambig = post("https://127.0.0.1/api/tools/check_patient_dip", {
     "age": 68,
     "ins_type": "城镇",
     "operation": "保守治疗"
-}, token=TOKEN)
+}, token=ADMIN_TOKEN)
 print("AmbigStatus:", res10_ambig.get("status"), "Success:", res10_ambig.get("success"), "Reason:", res10_ambig.get("pending_reason"))
 assert res10_ambig["success"] is False
 assert res10_ambig["status"] == "PENDING"

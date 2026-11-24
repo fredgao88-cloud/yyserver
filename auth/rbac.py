@@ -165,6 +165,7 @@ def revalidate_operator(payload: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any
         "sub": op["operator_id"],
         "role": op["role_type"],
         "dept": op.get("dept_scope", "") or "",
+        "doctor_id": op.get("doctor_id") or "",
         "cv": int(op.get("cred_version") or 0),
         "iat": payload.get("iat"),
         "exp": payload.get("exp"),
@@ -226,7 +227,7 @@ def get_operator(operator_id: str) -> Optional[Dict[str, Any]]:
     cursor, conn = get_local_db_connection(as_dict=True)
     try:
         cursor.execute(
-            "SELECT operator_id, display_name, password_hash, role_type, dept_scope, dingtalk_userid, can_export_case, status, cred_version "
+            "SELECT operator_id, display_name, password_hash, role_type, dept_scope, dingtalk_userid, can_export_case, doctor_id, status, cred_version "
             "FROM dbo.sys_operator_account WHERE operator_id = %s",
             (operator_id,)
         )
@@ -344,10 +345,13 @@ def get_authorized_dept_ids(dept_scope: str) -> Set[str]:
             for row in cur.fetchall():
                 ks_id_str = str(row["ksid"]).strip()
                 ks_name = (row["ksname"] or "").strip()
-                if ks_id_str in raw_items or ks_name in raw_items:
+                ks_name_clean = re.sub(r'^\d+', '', ks_name).strip()
+                if ks_id_str in raw_items or ks_name in raw_items or (ks_name_clean and ks_name_clean in raw_items):
                     dept_ids.add(ks_id_str)
                     if ks_name:
                         dept_ids.add(ks_name)
+                    if ks_name_clean:
+                        dept_ids.add(ks_name_clean)
         finally:
             conn.close()
     except Exception:
