@@ -510,8 +510,31 @@ def run_phase1_tests():
     assert "2604.84" in res_17b["reply"]
     print("PASS [Case 17b]: “如果审批通过，现已确认审批通过并更正为居民医保” -> 前提结果被确认，更正生效，居民基准 ￥2604.84")
 
+    # ---------------- 用例 18: DIP-INS-001 变体三验收 (确认内容须针对同一前提：核实年龄≠审批通过) ----------------
+    print("\n--- [Case 18] DIP-INS-001 变体三验收 (无关确认不解除待定：已核实年龄 ≠ 审批通过；确认审批通过对照放行) ---")
+    # 18a. 本次职工医保，如果审批通过，已核实年龄并更正为居民医保 -> “已核实年龄”确认的是年龄而非审批前提，
+    #      待定绝不解除，先澄清并省略金额（DIP-INS-001 变体）
+    q_18a = "68岁，本次职工医保，如果审批通过，已核实年龄并更正为居民医保，M17.9，保守治疗"
+    res_18a = parse_local_intent(q_18a)
+    assert res_18a["intent"] == "need_clarification"
+    assert res_18a["data"]["status"] == "PENDING"
+    assert res_18a["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+    assert "2790.90" not in res_18a["reply"]
+    assert "2604.84" not in res_18a["reply"]
+    print("PASS [Case 18a]: “如果审批通过，已核实年龄并更正为居民医保” -> 无关确认不解除待定，PENDING / CORRECTION_UNCONFIRMED，零金额输出")
+
+    # 18b. 对照例：本次职工医保，如果审批通过，已确认审批通过并更正为居民医保 -> 确认内容正是审批前提本身，
+    #      解除待定，更正生效，采用居民基准 ￥2604.84
+    q_18b = "68岁，本次职工医保，如果审批通过，已确认审批通过并更正为居民医保，M17.9，保守治疗"
+    res_18b = parse_local_intent(q_18b)
+    assert res_18b["intent"] == "query_dip_rule"
+    assert res_18b["data"]["matched"] is True
+    assert res_18b["data"]["benchmark_amount"] == 2604.84
+    assert "2604.84" in res_18b["reply"]
+    print("PASS [Case 18b]: “如果审批通过，已确认审批通过并更正为居民医保” -> 确认同一前提，更正生效，居民基准 ￥2604.84")
+
     print("\n" + "=" * 70)
-    print(">>> 恭喜！Phase 1 验收回归测试套件全部 17 大关键测试集 100% 通过！ <<<")
+    print(">>> 恭喜！Phase 1 验收回归测试套件全部 18 大关键测试集 100% 通过！ <<<")
     print("=" * 70)
 
 if __name__ == "__main__":

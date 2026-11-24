@@ -233,13 +233,14 @@ def run_settled_reconciliation_suite():
                         ]
                     return []
                 def fetchone(self):
-                    if "FROM dbo.his_cfmain c" in self._query:
-                        # 已计费未发药处方统计（合成用例无未发药处方）
-                        return {'unfy_count': 0, 'unfy_total': None}
+                    if "unfy_count" in self._query:
+                        # 合并语句（RECON-RX-001）：发药明细 + 未发药处方同一语句快照
+                        # （合成用例无未发药处方）
+                        return {'fy_count': 5, 'fy_total': Decimal('700.00'),
+                                'fy_refund_total': Decimal('0.00'), 'fy_positive_total': Decimal('700.00'),
+                                'unfy_count': 0, 'unfy_total': None}
                     elif "FROM dbo.his_zycz" in self._query:
                         return {'cz_count': 10, 'cz_total': Decimal('1300.00'), 'cz_refund_total': Decimal('-100.00'), 'cz_positive_total': Decimal('1400.00')}
-                    elif "FROM dbo.his_cfmain_fyjl" in self._query:
-                        return {'fy_count': 5, 'fy_total': Decimal('700.00'), 'fy_refund_total': Decimal('0.00'), 'fy_positive_total': Decimal('700.00')}
                     return None
                 def close(self):
                     pass
@@ -282,8 +283,103 @@ def run_settled_reconciliation_suite():
     print("  -> 结算单参数校验核验通过：有效单号严格升级对齐，不存在单号(999)与无效单号严格返回空结果。")
     print("  [PASS] Suite 6 Multi-settlement Reconciliation & Scope Verified.")
 
+    # -------------------------------------------------------------
+    # Test Suite 7: 未发药处方口径独立样例（RECON-TEST-001 / RECON-RX-001）
+    # 非零未发药、未计费、作废、已发药、真实差额五类样例分别断言笔数与金额，
+    # 并断言发药+未发药两组聚合由同一条 SQL 语句完成（语句级一致快照，无读间漏算窗口）
+    # -------------------------------------------------------------
+    print("\n[Suite 7] Verifying undispensed-prescription scope with independent samples...")
+    RX_CFMAIN = [
+        # 已发药：fyjl 有对应记录，绝不计入未发药
+        {'id': 'RX-DISP-0001', 'bmoney': Decimal('30.00'), 'jsrq': '2026-11-24 09:12:00', 'iszf': None},
+        # 已计费未发药：计入未发药（合成编号，非真实就诊流水号）
+        {'id': 'RX-UNFY-0001', 'bmoney': Decimal('12.00'), 'jsrq': '2026-11-24 09:30:00', 'iszf': None},
+        # 未计费弃用处方（jsrq 为空）：不计入
+        {'id': 'RX-UNBILL-01', 'bmoney': Decimal('99.00'), 'jsrq': None, 'iszf': None},
+        # 作废处方：不计入
+        {'id': 'RX-VOID-0001', 'bmoney': Decimal('55.00'), 'jsrq': '2026-11-24 09:40:00', 'iszf': 1},
+    ]
+    RX_FYJL = [
+        {'id': 'RX-DISP-0001', 'bmoney': Decimal('30.00')},
+        {'id': 'RX-DISP-0001', 'bmoney': Decimal('-5.00')},  # 退药对照：发药合计含负数冲减
+    ]
+
+    class RxMockCursor:
+        def __init__(self):
+            self._query = ""
+            self.combined_query_calls = 0
+        def execute(self, sql, params=()):
+            self._query = sql
+            if "unfy_count" in sql:
+                self.combined_query_calls += 1
+        def fetchall(self):
+            if "FROM dbo.his_zyjz" in self._query:
+                return [{'id': 201, 'lsh': 'zy_synth_rx', 'amoney': Decimal('200.00'),
+                         'czmoney': Decimal('0.00'), 'yjmoney': Decimal('0.00'),
+                         'yfmoney': Decimal('37.00'), 'iszf': 0}]
+            if "FROM dbo.his_zycjz" in self._query:
+                return [{'xmsflxid': '01', 'amoney': Decimal('200.00'), 'ssmoney': Decimal('200.00')}]
+            return []
+        def fetchone(self):
+            if "unfy_count" in self._query:
+                # 按读取器判据在内存中模拟同一条合并语句的语义
+                fyjl_ids = {f['id'] for f in RX_FYJL}
+                dispensed = [f for f in RX_FYJL]
+                unfy = [c for c in RX_CFMAIN
+                        if c['jsrq'] is not None and not c['iszf'] and c['id'] not in fyjl_ids]
+                return {
+                    'fy_count': len(dispensed),
+                    'fy_total': sum((f['bmoney'] for f in dispensed), Decimal('0')),
+                    'fy_refund_total': sum((f['bmoney'] for f in dispensed if f['bmoney'] < 0), Decimal('0')),
+                    'fy_positive_total': sum((f['bmoney'] for f in dispensed if f['bmoney'] > 0), Decimal('0')),
+                    'unfy_count': len(unfy),
+                    'unfy_total': sum((c['bmoney'] for c in unfy), Decimal('0')) if unfy else None,
+                }
+            if "FROM dbo.his_zycz" in self._query:
+                return {'cz_count': 0, 'cz_total': Decimal('0.00'),
+                        'cz_refund_total': Decimal('0.00'), 'cz_positive_total': Decimal('0.00')}
+            return None
+        def close(self):
+            pass
+
+    class RxMockReader(HISReader):
+        def __init__(self):
+            self.cursor_obj = RxMockCursor()
+        def get_connection(self):
+            outer = self
+            class MockConn:
+                def cursor(self, as_dict=True):
+                    return outer.cursor_obj
+                def close(self):
+                    pass
+            return MockConn()
+
+    rx_reader = RxMockReader()
+    rx_detail = rx_reader.get_case_fee_detail('zy_synth_rx')
+    # 7a. 未发药处方：仅「已计费+未作废+无发药记录」的 12.00 计入，笔数恰为 1
+    assert rx_detail['fy_stat']['undispensed'] == Decimal('12.00')
+    assert rx_detail['fy_stat']['undispensed_count'] == 1
+    print("PASS [Suite 7a]: 已计费未发药处方精确计入（12.00 元 / 1 笔），未计费(99)与作废(55)正确排除")
+
+    # 7b. 发药明细：含退药冲减，30.00 - 5.00 = 25.00
+    assert rx_detail['fy_stat']['total'] == Decimal('25.00')
+    assert rx_detail['fy_stat']['refund'] == Decimal('-5.00')
+    print("PASS [Suite 7b]: 发药明细含退款冲减（30.00 - 5.00 = 25.00），与未发药不重复计数")
+
+    # 7c. 一致性时点：两组聚合由同一条 SQL 语句完成（每次调用恰好 1 条合并语句）
+    assert rx_reader.cursor_obj.combined_query_calls == 1
+    print("PASS [Suite 7c]: 发药+未发药两组金额取自同一条 SQL 语句（语句级一致快照，无读间漏算窗口）")
+
+    # 7d. 对账判据：25.00 + 12.00 = 37.00 == yfmoney，时序差正确豁免；
+    #     若主单为 50.00（真实差额 13.00），判据正确暴露、绝不放行
+    fy_ok = abs(rx_detail['fy_stat']['total'] + rx_detail['fy_stat']['undispensed'] - Decimal('37.00')) <= Decimal('0.10')
+    fy_bad = abs(rx_detail['fy_stat']['total'] + rx_detail['fy_stat']['undispensed'] - Decimal('50.00')) <= Decimal('0.10')
+    assert fy_ok is True and fy_bad is False
+    print("PASS [Suite 7d]: 时序差（+12.00）正确豁免，真实差额（13.00 > 0.10）正确暴露")
+    print("  [PASS] Suite 7 Undispensed-prescription Scope Verified.")
+
     print("\n" + "=" * 70)
-    print("  ALL 6 RECONCILIATION SUITES PASSED (100.0% COMPLIANT WITH v1.2)")
+    print("  ALL 7 RECONCILIATION SUITES PASSED (100.0% COMPLIANT WITH v1.2)")
     print("=" * 70)
 
 if __name__ == '__main__':

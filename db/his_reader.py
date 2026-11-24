@@ -189,36 +189,41 @@ class HISReader:
             """, (lsh,))
             cz_stat = cur.fetchone()
 
-            # 4. Pharmacy dispensing logs (his_cfmain_fyjl)
-            cur.execute("""
-            SELECT 
-                COUNT(*) as fy_count,
-                SUM(bmoney) as fy_total,
-                SUM(CASE WHEN bmoney < 0 THEN bmoney ELSE 0 END) as fy_refund_total,
-                SUM(CASE WHEN bmoney > 0 THEN bmoney ELSE 0 END) as fy_positive_total
-            FROM dbo.his_cfmain_fyjl
-            WHERE lsh = %s
-            """, (lsh,))
-            fy_stat = cur.fetchone()
-
-            # 5. 已计费但未发药处方（his_cfmain）：出院当天结算常先于药房发药，
-            # 该金额已计入结算主单 yfmoney 但尚无发药记录，属正常业务时序差而非账务差错，
-            # 对账时应单列为预期差额来源；
-            # 发药记录 his_cfmain_fyjl.id 与处方 his_cfmain.id 一一对应，
-            # 故以“已计费（jsrq 非空，未计费/弃用处方 jsrq 为空且本就不计入 yfmoney）
-            # 、非作废、且无任何发药记录”精确识别未发药处方
-            # （isfy 标志在该 HIS 中维护不可靠，不作为判据）
+            # 4. 药房对账（RECON-RX-001）：已发药明细（his_cfmain_fyjl）与
+            # 已计费未发药处方（his_cfmain）必须在**同一条 SQL 语句**内聚合——
+            # SQL Server 在 READ COMMITTED 下提供语句级一致快照，两组金额取自同一时点，
+            # 两次独立查询之间发生发药时的“两边都不算”漏算窗口由此消除。
+            # 未发药处方判据：已计费（jsrq 非空，未计费/弃用处方 jsrq 为空且本就不计入 yfmoney）、
+            # 非作废、且无任何发药记录（his_cfmain_fyjl.id 与 his_cfmain.id 一一对应）；
+            # isfy 标志在该 HIS 中维护不可靠，不作为判据
             cur.execute("""
             SELECT
-                COUNT(*) as unfy_count,
-                SUM(c.bmoney) as unfy_total
-            FROM dbo.his_cfmain c
-            WHERE c.lsh = %s
-              AND c.jsrq IS NOT NULL
-              AND (c.iszf = 0 OR c.iszf IS NULL)
-              AND NOT EXISTS (SELECT 1 FROM dbo.his_cfmain_fyjl f WHERE f.id = c.id)
-            """, (lsh,))
-            unfy_stat = cur.fetchone()
+                fy.fy_count           AS fy_count,
+                fy.fy_total           AS fy_total,
+                fy.fy_refund_total    AS fy_refund_total,
+                fy.fy_positive_total  AS fy_positive_total,
+                un.unfy_count         AS unfy_count,
+                un.unfy_total         AS unfy_total
+            FROM
+                (SELECT
+                    COUNT(*) AS fy_count,
+                    SUM(bmoney) AS fy_total,
+                    SUM(CASE WHEN bmoney < 0 THEN bmoney ELSE 0 END) AS fy_refund_total,
+                    SUM(CASE WHEN bmoney > 0 THEN bmoney ELSE 0 END) AS fy_positive_total
+                 FROM dbo.his_cfmain_fyjl
+                 WHERE lsh = %s) fy
+            CROSS JOIN
+                (SELECT
+                    COUNT(*) AS unfy_count,
+                    SUM(c.bmoney) AS unfy_total
+                 FROM dbo.his_cfmain c
+                 WHERE c.lsh = %s
+                   AND c.jsrq IS NOT NULL
+                   AND (c.iszf = 0 OR c.iszf IS NULL)
+                   AND NOT EXISTS (SELECT 1 FROM dbo.his_cfmain_fyjl f WHERE f.id = c.id)) un
+            """, (lsh, lsh))
+            fy_stat = cur.fetchone()
+            unfy_stat = fy_stat  # 同一语句快照，两组金额天然同时点
 
             return {
                 'reconciliation_scope': reconciliation_scope,

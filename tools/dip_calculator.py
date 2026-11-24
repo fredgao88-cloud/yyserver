@@ -203,7 +203,17 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
     # 仅当后续分句以陈述事实口吻明确确认同一前提结果（含完成态词且无假设词）时才解除待定（DIP-INS-002 变体）
     corr_hypothetical = re.compile(r'(?:如果|若|假如|一旦)')
 
+    def _premise_core_confirmed(core_text, clause_text):
+        """跨分句前提解除判据（DIP-INS-001 变体）：确认分句须覆盖前提核心内容的二字片段，
+        避免“已核实年龄”等无关确认误解除“如果审批通过”的待定"""
+        if not core_text:
+            return False  # 前提核心为空时绝不自动解除，保持澄清
+        if core_text in clause_text:
+            return True
+        return any(core_text[i:i + 2] in clause_text for i in range(len(core_text) - 1))
+
     pending_cond_clause_idx = -1  # 最近一个含未决前提（有条件词且无完成态确认）的分句序号；该前提修饰其后第一条更正指令
+    pending_cond_core = ""  # 该未决前提的核心内容（剥除假设/条件标记与标点），用于核对后续确认是否针对同一前提
     for idx, ci in enumerate(clause_info):
         if ci['is_historical'] or ci['is_negated']:
             continue
@@ -233,13 +243,18 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
             # 绝不污染更靠后的已确认指令（如“…，已确认更正为职工”仍以确认更正为准）
             cross_clause_conditional = False
             if 0 <= pending_cond_clause_idx < idx:
-                if bool(corr_fulfilled_pre.search(c)) and not bool(corr_hypothetical.search(c)):
-                    # 后续分句以陈述事实口吻明确确认了前提结果（如“现已确认审批通过并更正为居民医保”），
-                    # 解除跨分句待定，更正正常生效（DIP-INS-002 变体）
+                if (bool(corr_fulfilled_pre.search(c)) and not bool(corr_hypothetical.search(c))
+                        and _premise_core_confirmed(pending_cond_core, c)):
+                    # 后续分句以陈述事实口吻明确确认了**同一前提**的结果
+                    # （如“现已确认审批通过并更正为居民医保”对应“如果审批通过”），
+                    # 解除跨分句待定，更正正常生效（DIP-INS-002 变体）；
+                    # 确认内容与前提无关的（如“已核实年龄”对应“如果审批通过”）绝不解除（DIP-INS-001 变体）
                     pending_cond_clause_idx = -1
+                    pending_cond_core = ""
                 else:
                     cross_clause_conditional = is_corr_verb
                     pending_cond_clause_idx = -1
+                    pending_cond_core = ""
 
             # 疑问/条件性更正（“是否需要更正为居民医保？”/“需要更正为居民医保吗？”/“更正为居民医保？”/
             # “待核实后再更正为居民医保”/“如果符合条件则更正为居民医保”）：先澄清，绝不擅自更改口径
@@ -314,6 +329,9 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
         # 修饰其后第一条更正指令（如“如果审批通过，再更正为居民医保”）
         if clause_has_pending_cond and not ci['is_correction'] and pending_cond_clause_idx < 0:
             pending_cond_clause_idx = idx
+            # 记录前提核心内容（剥除假设/条件标记、语气词与标点），供后续分句确认同一前提时比对
+            _core = re.sub(r'(?:如果|若|假如|一旦|待核实|待确认|待核准|待审批|必要时|视情况|则|就|再|的|了|吗|呢)', '', c)
+            pending_cond_core = re.sub(r'[\s，。；,;、？?！!：:（）()【】"“”]+', '', _core)
 
     # 3.0 更正询问未确认：先澄清，保留当前口径，绝不擅自更改险种
     # 按语句先后判断最后一次更正请求的状态：以(分句序号, 分句内字符位置)精确定位，
