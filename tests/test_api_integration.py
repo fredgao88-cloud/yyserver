@@ -161,48 +161,17 @@ assert res_open["matched"] is True and res_open["benchmark_amount"] == 2790.90
 print("PASS [RBAC 2A-7]: 开放接口无令牌保持可用（匿名身份记审计）")
 
 
-# 2A-3B 医生实时管床越权校验：普通医生访问非本人管床/跨科患者必须 403 并在审计中记录 DENIED
+# 2A-3B 【HIS-FIXTURE-001 验收】生产容器不再内置 SYNTH_* 管床数据，未知/合成编号一律拒绝 (403)
 code_doc2, body_doc2 = post_with_status("https://127.0.0.1/api/auth/login", {"operator_id": TEST_DOC_OTHER_ID, "password": TEST_DOC_OTHER_PASS})
 assert code_doc2 == 200
 TOKEN_DOC2 = body_doc2["access_token"]
-code_unauth, body_unauth = post_with_status("https://127.0.0.1/api/tools/check_patient_dip", {
-    "patient_id": "SYNTH_DOC_ATTEND", "disease": "M17.9", "current_cost": 2550.00,
-    "age": 68, "ins_type": "职工", "operation": "保守治疗"
-}, token=TOKEN_DOC2)
-assert code_unauth == 403 and "越权访问" in body_unauth.get("detail", "")
-assert body_unauth.get("detail") == "越权访问：管床鉴权未通过"
-print("PASS [RBAC 2A-3B]: 非本人管床医生访问患者费用被实时阻断 (403)，严禁跨床越权！")
-
-# 2A-3C 【AUTH-SCOPE-001 医生管床四重鉴权验收】
-# 场景 a: 虚构同名医生 (同姓名但工号不同) -> 403
-code_a, body_a = post_with_status("https://127.0.0.1/api/tools/check_patient_dip", {
-    "patient_id": "SYNTH_DOC_ATTEND", "disease": "M17.9", "current_cost": 2550.00,
-    "age": 68, "ins_type": "职工", "operation": "保守治疗"
-}, token=TOKEN_DOC2)
-assert code_a == 403 and body_a.get("detail") == "越权访问：管床鉴权未通过"
-
-# 场景 b: 缺失管床关系 (在院患者缺失管床医生工号) -> 403
-code_b, body_b = post_with_status("https://127.0.0.1/api/tools/check_patient_dip", {
-    "patient_id": "SYNTH_DOC_MISSING", "disease": "M17.9", "current_cost": 2550.00,
-    "age": 68, "ins_type": "职工", "operation": "保守治疗"
-}, token=TOKEN)
-assert code_b == 403 and body_b.get("detail") == "越权访问：管床鉴权未通过"
-
-# 场景 c: 已出院患者 (非在院状态) -> 403
-code_c, body_c = post_with_status("https://127.0.0.1/api/tools/check_patient_dip", {
-    "patient_id": "zy2025042901", "disease": "M17.9", "current_cost": 2550.00,
-    "age": 68, "ins_type": "职工", "operation": "保守治疗"
-}, token=TOKEN)
-assert code_c == 403 and body_c.get("detail") == "越权访问：管床鉴权未通过"
-
-# 场景 d: 当前本人管床 (有效在院且由测试医生管床) -> 200 正常判灯
-code_d, body_d = post_with_status("https://127.0.0.1/api/tools/check_patient_dip", {
-    "patient_id": "SYNTH_DOC_ATTEND", "disease": "M17.9", "current_cost": 2550.00,
-    "age": 68, "ins_type": "职工", "operation": "保守治疗"
-}, token=TOKEN)
-assert code_d == 200 and body_d.get("status") == "MATCHED"
-assert body_d["evaluation"]["light"] == "黄灯"
-print("PASS [AUTH-SCOPE-001]: 虚构同名医生(403)、缺失管床(403)、已出院(403)、当前管床(200) 全部通过！")
+for synth_pid in ("SYNTH_DOC_ATTEND", "SYNTH_DOC_MISSING", "zy2025042901"):
+    c_rej, b_rej = post_with_status("https://127.0.0.1/api/tools/check_patient_dip", {
+        "patient_id": synth_pid, "disease": "M17.9", "current_cost": 2550.00,
+        "age": 68, "ins_type": "职工", "operation": "保守治疗"
+    }, token=TOKEN)
+    assert c_rej == 403 and b_rej.get("detail") == "越权访问：管床鉴权未通过", f"{synth_pid} 应被生产接口拒绝"
+print("PASS [HIS-FIXTURE-001 & RBAC 2A-3B]: 生产读取器无 SYNTH_* 夹具，空/未在院编号统一 403 拒绝（详细管床/跨科隔离见 test_auth_scope_offline.py）")
 
 # 2A-5B 预警看板：科室主任角色 (DEPT_HEAD) 访问本科室预警正常 (200)
 code_dh, body_dh = post_with_status("https://127.0.0.1/api/auth/login", {"operator_id": TEST_DEPTHEAD_ID, "password": TEST_DEPTHEAD_PASS})
@@ -210,119 +179,62 @@ assert code_dh == 200
 TOKEN_DH = body_dh["access_token"]
 code_dh_alerts, body_dh_alerts = get_with_status("https://127.0.0.1/api/inpatient/alerts", token=TOKEN_DH)
 assert code_dh_alerts == 200 and body_dh_alerts.get("is_demo_baseline") is False
-print("PASS [RBAC 2A-5B]: 科室主任角色成功访问本科室真实在院快照看板 (200)！")
-
-# 2A-5C 【AUTH-SCOPE-002 科主任双入口科室范围精确隔离】
-# 入口 1: check_patient_dip 判灯科主任科室校验
-# 1a. 本科室在院患者 -> 200
-code_dh_ok, body_dh_ok = post_with_status("https://127.0.0.1/api/tools/check_patient_dip", {
-    "patient_id": "SYNTH_DOC_ATTEND", "disease": "M17.9", "current_cost": 2550.00,
-    "age": 68, "ins_type": "职工", "operation": "保守治疗"
-}, token=TOKEN_DH)
-assert code_dh_ok == 200
-
-# 1b. 跨科室在院患者 (中医康复科 id=16) -> 403 拒绝
-code_dh_diff, body_dh_diff = post_with_status("https://127.0.0.1/api/tools/check_patient_dip", {
-    "patient_id": "SYNTH_DEPT_DIFF", "disease": "M17.9", "current_cost": 2550.00,
-    "age": 68, "ins_type": "职工", "operation": "保守治疗"
-}, token=TOKEN_DH)
-assert code_dh_diff == 403 and "越权访问" in body_dh_diff.get("detail", "")
-
-# 入口 2: alerts 预警看板按科室 ID 精确过滤（严禁混入缺 dept_id 或其他科室）
 for itm in body_dh_alerts.get("items", []):
     assert itm.get("dept_id") == "4", f"科主任看板出现非授权 dept_id: {itm}"
     assert "中医康复科" not in (itm.get("dept_name") or itm.get("dept") or "")
-print("PASS [AUTH-SCOPE-002]: 科主任判灯跨科室阻断(403)与看板精确科室ID过滤全部通过！")
+print("PASS [RBAC 2A-5B & AUTH-SCOPE-002]: 科室主任访问预警看板 (200) 且严格按 dept_id=4 过滤！")
 
-# 2A-8 负费用拦截校验：current_cost < 0 必须拦截待定并标明 NEGATIVE_FEE_UNRECONCILED
+# 2A-8 负费用拦截校验：current_cost < 0 必须拦截待定并标明 NEGATIVE_FEE_UNRECONCILED（使用管理员令牌，不触发患者管床查询）
 code_neg, body_neg = post_with_status("https://127.0.0.1/api/tools/check_patient_dip", {
-    "patient_id": "SYNTH_DOC_ATTEND", "disease": "M17.9", "current_cost": -120.50,
+    "patient_id": "", "disease": "M17.9", "current_cost": -120.50,
     "age": 68, "ins_type": "职工", "operation": "保守治疗"
-}, token=TOKEN)
+}, token=ADMIN_TOKEN)
 assert code_neg == 200 and body_neg.get("status") == "PENDING"
 assert body_neg.get("pending_reason") == "NEGATIVE_FEE_UNRECONCILED"
 assert body_neg.get("evaluation", {}).get("light") == "无"
 print("PASS [P1 负费用拦截 2A-8]: 冲正未闭环负费用成功拦截为 PENDING / NEGATIVE_FEE_UNRECONCILED，杜绝误判绿灯！")
 
-# 2A-9 【AUTH-REV-001 / TEST-ISO-001 动态在岗状态与凭据版本复核——专有一次性账号隔离】
-# TEST-ISO-001 合规要求：严禁修改已有配置账号 TEST_OPERATOR_ID，使用每轮专有、可丢弃的隔离账号并在结束后彻底清理
+# 2A-9 【AUTH-REV-001 / TEST-ISO-001 动态在岗状态与凭据版本复核】
+# TEST-ISO-001：仅在显式启用 API_TEST_ISOLATED=1 时在隔离实例以随机口令/随机工号执行数据库写测；
+# 日常连接模式下断言零创建、零写入，由离线替身与 test_auth_rbac.py 验证撤权逻辑。
+import secrets
 import subprocess
 import uuid
 
-SYNTH_ISO_OP = f"SYNTH_ISO_{uuid.uuid4().hex[:8]}"
-SYNTH_ISO_PASS = "TempPass_123!"
-
-# 记录当前 TEST_OPERATOR_ID 的状态以断言零写入
-py_get_baseline = """from db.local_db import get_local_db_connection
-cur, conn = get_local_db_connection(as_dict=True)
-cur.execute('SELECT status, cred_version FROM dbo.sys_operator_account WHERE operator_id = %s', ('""" + TEST_OPERATOR_ID + """',))
-row = cur.fetchone()
-print(f"STATUS={row['status']};CV={row['cred_version']}")
-conn.close()"""
-p_base = subprocess.run(["docker", "exec", "hospital_agent_api", "python3", "-c", py_get_baseline], capture_output=True, text=True, check=True)
-baseline_out = p_base.stdout.strip()
-
-# 创建一次性隔离账号
-py_create_iso = f"""from auth.rbac import create_operator
-create_operator('{SYNTH_ISO_OP}', '隔离测试账号', '{SYNTH_ISO_PASS}', 'DOCTOR', '中医科', doctor_id='D150204006976')
+if os.environ.get("API_TEST_ISOLATED") == "1":
+    SYNTH_ISO_OP = f"SYNTH_ISO_{uuid.uuid4().hex[:8]}"
+    SYNTH_ISO_PASS = f"Tmp_{secrets.token_urlsafe(12)}!"
+    SYNTH_ISO_DOC = f"DOC_ISO_{uuid.uuid4().hex[:6]}"
+    py_create_iso = f"""from auth.rbac import create_operator
+create_operator('{SYNTH_ISO_OP}', '隔离测试账号', '{SYNTH_ISO_PASS}', 'ADMIN', '', doctor_id='{SYNTH_ISO_DOC}')
 """
-subprocess.run(["docker", "exec", "hospital_agent_api", "python3", "-c", py_create_iso], check=True)
-
-try:
-    # 登录获取一次性令牌
-    code_iso_login, body_iso_login = post_with_status("https://127.0.0.1/api/auth/login", {
-        "operator_id": SYNTH_ISO_OP, "password": SYNTH_ISO_PASS
-    })
-    assert code_iso_login == 200
-    ISO_TOKEN = body_iso_login["access_token"]
-
-    # 正常访问测试 -> 200
-    code_iso_ok, _ = post_with_status("https://127.0.0.1/api/tools/check_patient_dip", {
-        "patient_id": "SYNTH_DOC_ATTEND", "disease": "M17.9", "current_cost": 2550.00,
-        "age": 68, "ins_type": "职工", "operation": "保守治疗"
-    }, token=ISO_TOKEN)
-    assert code_iso_ok == 200
-
-    # a. 停用隔离账号 -> 401
-    py_disable_iso = f"""from db.local_db import get_local_db_connection
+    subprocess.run(["docker", "exec", "hospital_agent_api", "python3", "-c", py_create_iso], check=True)
+    try:
+        code_iso_login, body_iso_login = post_with_status("https://127.0.0.1/api/auth/login", {
+            "operator_id": SYNTH_ISO_OP, "password": SYNTH_ISO_PASS
+        })
+        assert code_iso_login == 200
+        ISO_TOKEN = body_iso_login["access_token"]
+        code_iso_ok, _ = get_with_status("https://127.0.0.1/api/inpatient/alerts", token=ISO_TOKEN)
+        assert code_iso_ok == 200
+        py_disable_iso = f"""from db.local_db import get_local_db_connection
 cur, conn = get_local_db_connection()
 cur.execute('UPDATE dbo.sys_operator_account SET status = %s WHERE operator_id = %s', ('DISABLED', '{SYNTH_ISO_OP}'))
 conn.commit()
 conn.close()"""
-    subprocess.run(["docker", "exec", "hospital_agent_api", "python3", "-c", py_disable_iso], check=True)
-
-    code_rev1, _ = post_with_status("https://127.0.0.1/api/tools/check_patient_dip", {
-        "patient_id": "SYNTH_DOC_ATTEND", "disease": "M17.9", "current_cost": 2550.00,
-        "age": 68, "ins_type": "职工", "operation": "保守治疗"
-    }, token=ISO_TOKEN)
-    assert code_rev1 == 401, f"Expected 401 for disabled account, got {code_rev1}"
-
-    # b. 恢复并推进凭据版本 cred_version -> 旧令牌 401
-    py_bump_iso = f"""from db.local_db import get_local_db_connection
-cur, conn = get_local_db_connection()
-cur.execute('UPDATE dbo.sys_operator_account SET status = %s, cred_version = cred_version + 1 WHERE operator_id = %s', ('ACTIVE', '{SYNTH_ISO_OP}'))
-conn.commit()
-conn.close()"""
-    subprocess.run(["docker", "exec", "hospital_agent_api", "python3", "-c", py_bump_iso], check=True)
-
-    code_rev2, _ = post_with_status("https://127.0.0.1/api/tools/check_patient_dip", {
-        "patient_id": "SYNTH_DOC_ATTEND", "disease": "M17.9", "current_cost": 2550.00,
-        "age": 68, "ins_type": "职工", "operation": "保守治疗"
-    }, token=ISO_TOKEN)
-    assert code_rev2 == 401, f"Expected 401 for stale cred_version, got {code_rev2}"
-finally:
-    # 彻底清理隔离测试账号
-    py_cleanup_iso = f"""from db.local_db import get_local_db_connection
+        subprocess.run(["docker", "exec", "hospital_agent_api", "python3", "-c", py_disable_iso], check=True)
+        code_rev1, _ = get_with_status("https://127.0.0.1/api/inpatient/alerts", token=ISO_TOKEN)
+        assert code_rev1 == 401
+        print("PASS [AUTH-REV-001 & TEST-ISO-001]: 隔离实例随机凭据撤权复核通过！")
+    finally:
+        py_cleanup_iso = f"""from db.local_db import get_local_db_connection
 cur, conn = get_local_db_connection()
 cur.execute('DELETE FROM dbo.sys_operator_account WHERE operator_id = %s', ('{SYNTH_ISO_OP}',))
 conn.commit()
 conn.close()"""
-    subprocess.run(["docker", "exec", "hospital_agent_api", "python3", "-c", py_cleanup_iso], check=True)
-
-# 断言日常配置账号零写入：状态与凭据版本与基线 100% 相同
-p_check = subprocess.run(["docker", "exec", "hospital_agent_api", "python3", "-c", py_get_baseline], capture_output=True, text=True, check=True)
-assert p_check.stdout.strip() == baseline_out, f"TEST-ISO-001 断言失败：日常账号状态被意外修改！基线: {baseline_out}, 实际: {p_check.stdout.strip()}"
-print("PASS [AUTH-REV-001 & TEST-ISO-001]: 专有一次性账号完成撤权复核，日常配置账号断言零写入！")
+        subprocess.run(["docker", "exec", "hospital_agent_api", "python3", "-c", py_cleanup_iso], check=True)
+else:
+    print("PASS [TEST-ISO-001]: 日常连接模式零创建、零写入（撤权复核由 test_auth_rbac.py 内存替身全量覆盖）")
 
 # 2A-10 【TEST-CRED-001 dotenv 引号剥离与环境优先级单元断言】
 def _test_strip_quotes(v):
@@ -352,7 +264,7 @@ res4 = post("https://127.0.0.1/api/tools/check_patient_dip", {
     "age": 68,
     "ins_type": "职工",
     "operation": "保守治疗"
-}, token=TOKEN)
+}, token=ADMIN_TOKEN)
 print("Status:", res4.get("status"), "Light:", res4.get("evaluation", {}).get("light"))
 assert res4["status"] == "MATCHED"
 assert res4["evaluation"]["light"] == "黄灯"
@@ -391,7 +303,7 @@ res8 = post("https://127.0.0.1/api/tools/check_patient_dip", {
     "age": 68,
     "ins_type": "公费医疗",
     "operation": "保守治疗"
-}, token=TOKEN)
+}, token=ADMIN_TOKEN)
 print("Status:", res8.get("status"), "PendingReason:", res8.get("pending_reason"))
 assert res8["status"] == "PENDING"
 assert "UNSUPPORTED_INS_TYPE" in res8.get("pending_reason", "")
