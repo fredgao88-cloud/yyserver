@@ -10,7 +10,7 @@ Verifies:
 4. Accounting Formula Verification:
    - his_zyjz.amoney == sum(his_zycjz.amoney) (100% exact match across all cases)
    - his_zyjz.czmoney + his_zyjz.yjmoney == sum(his_zycz.money) (exact in 48/50, 2 cases with category 30 other fee)
-   - his_zyjz.yfmoney ~= sum(his_cfmain_fyjl.bmoney) (within rounding tolerance)
+   - his_zyjz.yfmoney ~= sum(his_cfmain_fyjl.bmoney) + 已计费未发药处方(his_cfmain isfy=0 且未作废) (within rounding tolerance)
 5. Ward & Bed Transfer Tracking: his_zk transition consistency
 6. Batch Idempotency: Multiple reconciliation runs yield identical deterministic outcomes
 """
@@ -101,7 +101,10 @@ def run_settled_reconciliation_suite():
             exact_clinical_matches += 1
 
         # Check Pharmacy Dispensing (his_cfmain_fyjl vs yfmoney)
-        diff_fy = abs(fy_total - yfmoney)
+        # 口径：发药明细合计 + 已计费未发药处方（出院当天结算常先于药房发药，属正常时序差，
+        # 由 his_reader 单列 undispensed 统计）≈ 结算主单 yfmoney；放松该时序差但不掩盖真实漏记
+        fy_undispensed = Decimal(str(detail['fy_stat'].get('undispensed', 0)))
+        diff_fy = abs(fy_total + fy_undispensed - yfmoney)
         if diff_fy <= Decimal('0.10'):
             close_pharmacy_matches += 1
 
@@ -121,7 +124,7 @@ def run_settled_reconciliation_suite():
 
     print(f"  -> Category Ledger (his_zycjz) Exact Match: {exact_category_matches}/{len(admission_cases)} ({category_match_rate:.1%})")
     print(f"  -> Clinical Item (his_zycz vs cz+yj) Match (<=0.05Y): {exact_clinical_matches}/{len(admission_cases)} ({clinical_match_rate:.1%})")
-    print(f"  -> Pharmacy Dispensing Match (within 0.10Y): {close_pharmacy_matches}/{len(admission_cases)} ({pharmacy_match_rate:.1%})")
+    print(f"  -> Pharmacy Dispensing Match (dispensed + charged-undispensed vs master, within 0.10Y): {close_pharmacy_matches}/{len(admission_cases)} ({pharmacy_match_rate:.1%})")
     assert category_match_rate == 1.0, f"Expected 100% category match, got {category_match_rate:.1%}"
     assert clinical_match_rate >= 0.90, f"Expected >=90.0% clinical matches, got {clinical_match_rate:.1%}"
     assert pharmacy_match_rate >= 0.95, f"Expected >=95.0% pharmacy matches, got {pharmacy_match_rate:.1%}"
@@ -230,7 +233,10 @@ def run_settled_reconciliation_suite():
                         ]
                     return []
                 def fetchone(self):
-                    if "FROM dbo.his_zycz" in self._query:
+                    if "FROM dbo.his_cfmain c" in self._query:
+                        # 已计费未发药处方统计（合成用例无未发药处方）
+                        return {'unfy_count': 0, 'unfy_total': None}
+                    elif "FROM dbo.his_zycz" in self._query:
                         return {'cz_count': 10, 'cz_total': Decimal('1300.00'), 'cz_refund_total': Decimal('-100.00'), 'cz_positive_total': Decimal('1400.00')}
                     elif "FROM dbo.his_cfmain_fyjl" in self._query:
                         return {'fy_count': 5, 'fy_total': Decimal('700.00'), 'fy_refund_total': Decimal('0.00'), 'fy_positive_total': Decimal('700.00')}
@@ -253,6 +259,8 @@ def run_settled_reconciliation_suite():
     assert detail_no_id['zyjz']['amoney'] == Decimal('2000.00')
     assert detail_no_id['cz_stat']['total'] == Decimal('1300.00')
     assert detail_no_id['fy_stat']['total'] == Decimal('700.00')
+    assert detail_no_id['fy_stat']['undispensed'] == Decimal('0.00')
+    assert detail_no_id['fy_stat']['undispensed_count'] == 0
 
     # 调用路径 2: 逐单传入有效 settlement_id（仍保证对账范围与明细一致，自动升级 ADMISSION_LEVEL）
     detail_with_id = multi_reader.get_case_fee_detail('zy_multi_synth', settlement_id='101')

@@ -201,6 +201,25 @@ class HISReader:
             """, (lsh,))
             fy_stat = cur.fetchone()
 
+            # 5. 已计费但未发药处方（his_cfmain）：出院当天结算常先于药房发药，
+            # 该金额已计入结算主单 yfmoney 但尚无发药记录，属正常业务时序差而非账务差错，
+            # 对账时应单列为预期差额来源；
+            # 发药记录 his_cfmain_fyjl.id 与处方 his_cfmain.id 一一对应，
+            # 故以“已计费（jsrq 非空，未计费/弃用处方 jsrq 为空且本就不计入 yfmoney）
+            # 、非作废、且无任何发药记录”精确识别未发药处方
+            # （isfy 标志在该 HIS 中维护不可靠，不作为判据）
+            cur.execute("""
+            SELECT
+                COUNT(*) as unfy_count,
+                SUM(c.bmoney) as unfy_total
+            FROM dbo.his_cfmain c
+            WHERE c.lsh = %s
+              AND c.jsrq IS NOT NULL
+              AND (c.iszf = 0 OR c.iszf IS NULL)
+              AND NOT EXISTS (SELECT 1 FROM dbo.his_cfmain_fyjl f WHERE f.id = c.id)
+            """, (lsh,))
+            unfy_stat = cur.fetchone()
+
             return {
                 'reconciliation_scope': reconciliation_scope,
                 'settlement_count': len(valid_settlements),
@@ -217,7 +236,9 @@ class HISReader:
                     'count': fy_stat['fy_count'],
                     'total': Decimal(str(fy_stat['fy_total'] or 0)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP),
                     'refund': Decimal(str(fy_stat['fy_refund_total'] or 0)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP),
-                    'positive': Decimal(str(fy_stat['fy_positive_total'] or 0)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                    'positive': Decimal(str(fy_stat['fy_positive_total'] or 0)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP),
+                    'undispensed_count': unfy_stat['unfy_count'],
+                    'undispensed': Decimal(str(unfy_stat['unfy_total'] or 0)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
                 }
             }
         finally:
