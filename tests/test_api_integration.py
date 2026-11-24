@@ -6,6 +6,16 @@ import ssl
 import sys
 import os
 
+# TEST-ISO-001：在首个 HTTP/数据库请求之前校验专用隔离测试环境配置
+# 若未显式配置专用隔离环境 (API_TEST_ISOLATED=1 + API_TEST_BASE_URL + API_TEST_CONTAINER)，
+# 立即安全跳过并退出，确保对日常生产实例和数据库零外部调用、零写入。
+API_TEST_ISOLATED = os.environ.get("API_TEST_ISOLATED") == "1"
+API_TEST_BASE_URL = (os.environ.get("API_TEST_BASE_URL") or "").strip().rstrip("/")
+API_TEST_CONTAINER = (os.environ.get("API_TEST_CONTAINER") or "").strip()
+if not (API_TEST_ISOLATED and API_TEST_BASE_URL and API_TEST_CONTAINER):
+    print("[SKIP] TEST-ISO-001: 未配置专用隔离测试实例 (API_TEST_ISOLATED=1 / API_TEST_BASE_URL / API_TEST_CONTAINER)，跳过集成测试并保证零外部调用与零写入")
+    sys.exit(0)
+
 ctx = ssl.create_default_context()
 ctx.check_hostname = False
 ctx.verify_mode = ssl.CERT_NONE
@@ -102,7 +112,7 @@ with urllib.request.urlopen("http://127.0.0.1:8000/health") as resp:
     assert res1["status"] == "ok"
 
 print("\n=== 2. Nginx HTTPS Health Check (HTTPS 443) ===")
-with urllib.request.urlopen("https://127.0.0.1/health", context=ctx) as resp:
+with urllib.request.urlopen(f"{API_TEST_BASE_URL}/health", context=ctx) as resp:
     res2 = json.loads(resp.read().decode("utf-8"))
     print(res2)
     assert res2["status"] == "ok"
@@ -113,19 +123,19 @@ if not TEST_OPERATOR_PASS or not TEST_ADMIN_PASS:
     sys.exit(1)
 
 # 2A-1 错误口令必须 401
-code, body = post_with_status("https://127.0.0.1/api/auth/login", {"operator_id": TEST_OPERATOR_ID, "password": "wrong-password-xxx"})
+code, body = post_with_status(f"{API_TEST_BASE_URL}/api/auth/login", {"operator_id": TEST_OPERATOR_ID, "password": "wrong-password-xxx"})
 assert code == 401
 print("PASS [RBAC 2A-1]: 错误口令登录被拒绝 (401)")
 
 # 2A-2 正确口令签发令牌
-code, body = post_with_status("https://127.0.0.1/api/auth/login", {"operator_id": TEST_OPERATOR_ID, "password": TEST_OPERATOR_PASS})
+code, body = post_with_status(f"{API_TEST_BASE_URL}/api/auth/login", {"operator_id": TEST_OPERATOR_ID, "password": TEST_OPERATOR_PASS})
 assert code == 200 and body.get("access_token")
 TOKEN = body["access_token"]
 assert body.get("role_type") == "DOCTOR"
 print(f"PASS [RBAC 2A-2]: 正确口令登录成功，令牌签发（角色 {body.get('role_type')}）")
 
 # 2A-3 患者判灯接口无令牌必须 401
-code, body = post_with_status("https://127.0.0.1/api/tools/check_patient_dip", {
+code, body = post_with_status(f"{API_TEST_BASE_URL}/api/tools/check_patient_dip", {
     "patient_id": "zy2025042901", "disease": "M17.9", "current_cost": 2550.00,
     "age": 68, "ins_type": "职工", "operation": "保守治疗"
 })
@@ -133,7 +143,7 @@ assert code == 401
 print("PASS [RBAC 2A-3]: 患者判灯接口无令牌被拒绝 (401)")
 
 # 2A-4 伪造令牌必须 401
-code, body = post_with_status("https://127.0.0.1/api/tools/check_patient_dip", {
+code, body = post_with_status(f"{API_TEST_BASE_URL}/api/tools/check_patient_dip", {
     "patient_id": "zy2025042901", "disease": "M17.9", "current_cost": 2550.00,
     "age": 68, "ins_type": "职工", "operation": "保守治疗"
 }, token="v1.forged.payload")
@@ -141,20 +151,20 @@ assert code == 401
 print("PASS [RBAC 2A-4]: 伪造令牌被拒绝 (401)")
 
 # 2A-5 预警看板：医生角色 403（角色矩阵生效）
-code, body = get_with_status("https://127.0.0.1/api/inpatient/alerts", token=TOKEN)
+code, body = get_with_status(f"{API_TEST_BASE_URL}/api/inpatient/alerts", token=TOKEN)
 assert code == 403
 print("PASS [RBAC 2A-5]: 医生角色访问预警看板被拒绝 (403)")
 
 # 2A-6 预警看板：管理员角色 200
-code, body = post_with_status("https://127.0.0.1/api/auth/login", {"operator_id": TEST_ADMIN_ID, "password": TEST_ADMIN_PASS})
+code, body = post_with_status(f"{API_TEST_BASE_URL}/api/auth/login", {"operator_id": TEST_ADMIN_ID, "password": TEST_ADMIN_PASS})
 assert code == 200 and body.get("access_token")
 ADMIN_TOKEN = body["access_token"]
-code, body = get_with_status("https://127.0.0.1/api/inpatient/alerts", token=ADMIN_TOKEN)
+code, body = get_with_status(f"{API_TEST_BASE_URL}/api/inpatient/alerts", token=ADMIN_TOKEN)
 assert code == 200 and body.get("total") is not None
 print("PASS [RBAC 2A-6]: 管理员角色访问预警看板正常 (200)")
 
 # 2A-7 开放接口（科室级 DIP 基准查询）无令牌保持可用
-res_open = post("https://127.0.0.1/api/tools/query_dip_rule", {
+res_open = post(f"{API_TEST_BASE_URL}/api/tools/query_dip_rule", {
     "disease": "M17.9", "age": 68, "ins_type": "职工", "operation": "保守治疗"
 })
 assert res_open["matched"] is True and res_open["benchmark_amount"] == 2790.90
@@ -162,11 +172,11 @@ print("PASS [RBAC 2A-7]: 开放接口无令牌保持可用（匿名身份记审�
 
 
 # 2A-3B 【HIS-FIXTURE-001 验收】生产容器不再内置 SYNTH_* 管床数据，未知/合成编号一律拒绝 (403)
-code_doc2, body_doc2 = post_with_status("https://127.0.0.1/api/auth/login", {"operator_id": TEST_DOC_OTHER_ID, "password": TEST_DOC_OTHER_PASS})
+code_doc2, body_doc2 = post_with_status(f"{API_TEST_BASE_URL}/api/auth/login", {"operator_id": TEST_DOC_OTHER_ID, "password": TEST_DOC_OTHER_PASS})
 assert code_doc2 == 200
 TOKEN_DOC2 = body_doc2["access_token"]
 for synth_pid in ("SYNTH_DOC_ATTEND", "SYNTH_DOC_MISSING", "zy2025042901"):
-    c_rej, b_rej = post_with_status("https://127.0.0.1/api/tools/check_patient_dip", {
+    c_rej, b_rej = post_with_status(f"{API_TEST_BASE_URL}/api/tools/check_patient_dip", {
         "patient_id": synth_pid, "disease": "M17.9", "current_cost": 2550.00,
         "age": 68, "ins_type": "职工", "operation": "保守治疗"
     }, token=TOKEN)
@@ -174,10 +184,10 @@ for synth_pid in ("SYNTH_DOC_ATTEND", "SYNTH_DOC_MISSING", "zy2025042901"):
 print("PASS [HIS-FIXTURE-001 & RBAC 2A-3B]: 生产读取器无 SYNTH_* 夹具，空/未在院编号统一 403 拒绝（详细管床/跨科隔离见 test_auth_scope_offline.py）")
 
 # 2A-5B 预警看板：科室主任角色 (DEPT_HEAD) 访问本科室预警正常 (200)
-code_dh, body_dh = post_with_status("https://127.0.0.1/api/auth/login", {"operator_id": TEST_DEPTHEAD_ID, "password": TEST_DEPTHEAD_PASS})
+code_dh, body_dh = post_with_status(f"{API_TEST_BASE_URL}/api/auth/login", {"operator_id": TEST_DEPTHEAD_ID, "password": TEST_DEPTHEAD_PASS})
 assert code_dh == 200
 TOKEN_DH = body_dh["access_token"]
-code_dh_alerts, body_dh_alerts = get_with_status("https://127.0.0.1/api/inpatient/alerts", token=TOKEN_DH)
+code_dh_alerts, body_dh_alerts = get_with_status(f"{API_TEST_BASE_URL}/api/inpatient/alerts", token=TOKEN_DH)
 assert code_dh_alerts == 200 and body_dh_alerts.get("is_demo_baseline") is False
 for itm in body_dh_alerts.get("items", []):
     assert itm.get("dept_id") == "4", f"科主任看板出现非授权 dept_id: {itm}"
@@ -185,7 +195,7 @@ for itm in body_dh_alerts.get("items", []):
 print("PASS [RBAC 2A-5B & AUTH-SCOPE-002]: 科室主任访问预警看板 (200) 且严格按 dept_id=4 过滤！")
 
 # 2A-8 负费用拦截校验：current_cost < 0 必须拦截待定并标明 NEGATIVE_FEE_UNRECONCILED（使用管理员令牌，不触发患者管床查询）
-code_neg, body_neg = post_with_status("https://127.0.0.1/api/tools/check_patient_dip", {
+code_neg, body_neg = post_with_status(f"{API_TEST_BASE_URL}/api/tools/check_patient_dip", {
     "patient_id": "", "disease": "M17.9", "current_cost": -120.50,
     "age": 68, "ins_type": "职工", "operation": "保守治疗"
 }, token=ADMIN_TOKEN)
@@ -206,24 +216,24 @@ if os.environ.get("API_TEST_ISOLATED") == "1":
     SYNTH_ISO_PASS = f"Tmp_{secrets.token_urlsafe(12)}!"
     SYNTH_ISO_DOC = f"DOC_ISO_{uuid.uuid4().hex[:6]}"
     py_create_iso = f"""from auth.rbac import create_operator
-create_operator('{SYNTH_ISO_OP}', '隔离测试账号', '{SYNTH_ISO_PASS}', 'ADMIN', '', doctor_id='{SYNTH_ISO_DOC}')
+create_operator('{SYNTH_ISO_OP}', '隔离测试账号', '{SYNTH_ISO_PASS}', 'DOCTOR', '', doctor_id='{SYNTH_ISO_DOC}')
 """
-    subprocess.run(["docker", "exec", "hospital_agent_api", "python3", "-c", py_create_iso], check=True)
+    subprocess.run(["docker", "exec", API_TEST_CONTAINER, "python3", "-c", py_create_iso], check=True)
     try:
-        code_iso_login, body_iso_login = post_with_status("https://127.0.0.1/api/auth/login", {
+        code_iso_login, body_iso_login = post_with_status(f"{API_TEST_BASE_URL}/api/auth/login", {
             "operator_id": SYNTH_ISO_OP, "password": SYNTH_ISO_PASS
         })
         assert code_iso_login == 200
         ISO_TOKEN = body_iso_login["access_token"]
-        code_iso_ok, _ = get_with_status("https://127.0.0.1/api/inpatient/alerts", token=ISO_TOKEN)
+        code_iso_ok, _ = post_with_status(f"{API_TEST_BASE_URL}/api/tools/check_patient_dip", {"patient_id": "", "disease": "M17.9", "current_cost": -120.50, "age": 68, "ins_type": "职工", "operation": "保守治疗"}, token=ISO_TOKEN)
         assert code_iso_ok == 200
         py_disable_iso = f"""from db.local_db import get_local_db_connection
 cur, conn = get_local_db_connection()
 cur.execute('UPDATE dbo.sys_operator_account SET status = %s WHERE operator_id = %s', ('DISABLED', '{SYNTH_ISO_OP}'))
 conn.commit()
 conn.close()"""
-        subprocess.run(["docker", "exec", "hospital_agent_api", "python3", "-c", py_disable_iso], check=True)
-        code_rev1, _ = get_with_status("https://127.0.0.1/api/inpatient/alerts", token=ISO_TOKEN)
+        subprocess.run(["docker", "exec", API_TEST_CONTAINER, "python3", "-c", py_disable_iso], check=True)
+        code_rev1, _ = post_with_status(f"{API_TEST_BASE_URL}/api/tools/check_patient_dip", {"patient_id": "", "disease": "M17.9", "current_cost": -120.50, "age": 68, "ins_type": "职工", "operation": "保守治疗"}, token=ISO_TOKEN)
         assert code_rev1 == 401
         print("PASS [AUTH-REV-001 & TEST-ISO-001]: 隔离实例随机凭据撤权复核通过！")
     finally:
@@ -232,7 +242,7 @@ cur, conn = get_local_db_connection()
 cur.execute('DELETE FROM dbo.sys_operator_account WHERE operator_id = %s', ('{SYNTH_ISO_OP}',))
 conn.commit()
 conn.close()"""
-        subprocess.run(["docker", "exec", "hospital_agent_api", "python3", "-c", py_cleanup_iso], check=True)
+        subprocess.run(["docker", "exec", API_TEST_CONTAINER, "python3", "-c", py_cleanup_iso], check=True)
 else:
     print("PASS [TEST-ISO-001]: 日常连接模式零创建、零写入（撤权复核由 test_auth_rbac.py 内存替身全量覆盖）")
 
@@ -246,7 +256,7 @@ assert _test_strip_quotes('"Secret@Pass123"') == "Secret@Pass123"
 assert _test_strip_quotes("Secret@Pass123") == "Secret@Pass123"
 print("PASS [TEST-CRED-001]: dotenv 解析器引号剥离逻辑验证通过！")
 print("\n=== 3. 结构化规则接口 (68岁职工 M17.9 膝关节病 保守治疗) ===")
-res3 = post("https://127.0.0.1/api/tools/query_dip_rule", {
+res3 = post(f"{API_TEST_BASE_URL}/api/tools/query_dip_rule", {
     "disease": "M17.9",
     "age": 68,
     "ins_type": "职工",
@@ -257,7 +267,7 @@ assert res3["matched"] is True
 assert res3["benchmark_amount"] == 2790.90
 
 print("\n=== 4. 判灯核查接口 (当前费用 2550 元 vs 预估基准 2790.90 元) ===")
-res4 = post("https://127.0.0.1/api/tools/check_patient_dip", {
+res4 = post(f"{API_TEST_BASE_URL}/api/tools/check_patient_dip", {
     "patient_id": "SYNTH_DOC_ATTEND",
     "disease": "M17.9",
     "current_cost": 2550.00,
@@ -270,7 +280,7 @@ assert res4["status"] == "MATCHED"
 assert res4["evaluation"]["light"] == "黄灯"
 
 print("\n=== 5. 自然语言意图分流与问答接口 (POST /api/chat) ===")
-res5 = post("https://127.0.0.1/api/chat", {
+res5 = post(f"{API_TEST_BASE_URL}/api/chat", {
     "text": "68岁职工，诊断 M17.9 膝关节病保守治疗预估分值与基准是多少？"
 })
 print("Intent:", res5.get("intent"), "Has 2790.90 in reply:", ("2790.90" in res5.get("reply", "")))
@@ -278,14 +288,14 @@ assert res5["intent"] == "query_dip_rule"
 assert "2790.90" in res5["reply"]
 
 print("\n=== 6. 缺省关键信息时的追问逻辑 (缺少年龄与操作) ===")
-res6 = post("https://127.0.0.1/api/tools/query_dip_rule", {
+res6 = post(f"{API_TEST_BASE_URL}/api/tools/query_dip_rule", {
     "disease": "M17.9"
 })
 print("Status:", res6.get("status"), "PendingReason:", res6.get("pending_reason"))
 assert res6["status"] == "PENDING"
 
 print("\n=== 7. 钉钉群聊渠道隐私盾牌 (POST /api/chat, channel=DINGTALK_GROUP) ===")
-res7 = post("https://127.0.0.1/api/chat", {
+res7 = post(f"{API_TEST_BASE_URL}/api/chat", {
     "text": "帮我查一下3床张大爷现在花了多少钱",
     "channel": "DINGTALK_GROUP"
 })
@@ -296,7 +306,7 @@ assert "3床" not in res7["reply"]
 assert "query" not in res7.get("data", {})
 
 print("\n=== 8. 公费医疗未支持参保类型拦截接口 ===")
-res8 = post("https://127.0.0.1/api/tools/check_patient_dip", {
+res8 = post(f"{API_TEST_BASE_URL}/api/tools/check_patient_dip", {
     "patient_id": "SYNTH_DOC_ATTEND",
     "disease": "M17.9",
     "current_cost": 2450.00,
@@ -310,7 +320,7 @@ assert "UNSUPPORTED_INS_TYPE" in res8.get("pending_reason", "")
 
 print("\n=== 9. 【审查关键验收】城镇居民医保 vs 居民医保 接口判定一致性 ===")
 # 同一合成病例：68岁、M17.9、保守治疗、费用 2450 元
-res9_resident = post("https://127.0.0.1/api/tools/check_patient_dip", {
+res9_resident = post(f"{API_TEST_BASE_URL}/api/tools/check_patient_dip", {
     "patient_id": "zy_synth_res_01",
     "disease": "M17.9",
     "current_cost": 2450.00,
@@ -318,7 +328,7 @@ res9_resident = post("https://127.0.0.1/api/tools/check_patient_dip", {
     "ins_type": "居民医保",
     "operation": "保守治疗"
 }, token=ADMIN_TOKEN)
-res9_city_res = post("https://127.0.0.1/api/tools/check_patient_dip", {
+res9_city_res = post(f"{API_TEST_BASE_URL}/api/tools/check_patient_dip", {
     "patient_id": "zy_synth_res_02",
     "disease": "M17.9",
     "current_cost": 2450.00,
@@ -334,7 +344,7 @@ print("PASS [审查对齐]: 居民医保与城镇居民医保基准与灯色 100
 
 print("\n=== 10. 【审查关键验收】零基准接口顶层状态一致性 ===")
 # 缺省有效参保类型或无效参数时绝不返回 top-level MATCHED
-res10_ambig = post("https://127.0.0.1/api/tools/check_patient_dip", {
+res10_ambig = post(f"{API_TEST_BASE_URL}/api/tools/check_patient_dip", {
     "patient_id": "zy_synth_zero_01",
     "disease": "M17.9",
     "current_cost": 2450.00,
@@ -348,7 +358,7 @@ assert res10_ambig["status"] == "PENDING"
 assert res10_ambig["pending_reason"] == "AMBIGUOUS_INS_TYPE"
 
 print("\n=== 11. 【审查关键验收 P1】退休+公费医疗 聊天接口严禁误判为职工医保 ===")
-res11_retire_gf = post("https://127.0.0.1/api/chat", {
+res11_retire_gf = post(f"{API_TEST_BASE_URL}/api/chat", {
     "text": "68岁，退休，公费医疗，M17.9，保守治疗，请查询医院 DIP 预估支付额"
 })
 print("Intent:", res11_retire_gf.get("intent"), "Status:", res11_retire_gf.get("data", {}).get("status"), "PendingReason:", res11_retire_gf.get("data", {}).get("pending_reason"))
@@ -359,7 +369,7 @@ assert "UNSUPPORTED_INS_TYPE:公费医疗" in res11_retire_gf.get("data", {}).ge
 print("PASS [P1 对齐]: 退休+公费医疗 正确识别为公费医疗拦截，绝不返回职工医保基准！")
 
 print("\n=== 12. 【审查关键验收 P1】仅输入“已退休”职业状态 聊天接口主动追问险种 ===")
-res12_retire = post("https://127.0.0.1/api/chat", {
+res12_retire = post(f"{API_TEST_BASE_URL}/api/chat", {
     "text": "68岁，已退休，M17.9 保守治疗"
 })
 print("Intent:", res12_retire.get("intent"), "Status:", res12_retire.get("data", {}).get("status"), "PendingReason:", res12_retire.get("data", {}).get("pending_reason"))
@@ -370,7 +380,7 @@ assert "2790.90" not in res12_retire.get("reply", "")
 print("PASS [P1 对齐]: 仅输入“已退休”职业状态 正确拦截并追问具体险种！")
 
 print("\n=== 13. 【审查关键验收 P1】职工+工伤保险 优先识别工伤保险并拦截 ===")
-res13_work_inj = post("https://127.0.0.1/api/chat", {
+res13_work_inj = post(f"{API_TEST_BASE_URL}/api/chat", {
     "text": "68岁职工，工伤保险，M17.9 保守治疗"
 })
 print("Intent:", res13_work_inj.get("intent"), "Status:", res13_work_inj.get("data", {}).get("status"), "PendingReason:", res13_work_inj.get("data", {}).get("pending_reason"))
@@ -381,7 +391,7 @@ assert "2790.90" not in res13_work_inj.get("reply", "")
 print("PASS [P1 对齐]: 职工+工伤保险 正确优先识别工伤保险并进入待定拦截！")
 
 print("\n=== 14. 【审查关键验收 P1 (Round 7)】企业职工，参保类型待查 拦截与省略金额 ===")
-res14_unknown = post("https://127.0.0.1/api/chat", {
+res14_unknown = post(f"{API_TEST_BASE_URL}/api/chat", {
     "text": "68岁，企业职工，参保类型待查，M17.9，保守治疗"
 })
 print("Intent:", res14_unknown.get("intent"), "Status:", res14_unknown.get("data", {}).get("status"), "PendingReason:", res14_unknown.get("data", {}).get("pending_reason"))
@@ -392,7 +402,7 @@ assert "2790.90" not in res14_unknown.get("reply", "")
 print("PASS [Round 7 P1 对齐]: “企业职工，参保类型待查” 正确追问并彻底省略金额！")
 
 print("\n=== 15. 【审查关键验收 P1 (Round 7)】原居民医保，本次按职工医保结算 明确指令优先 ===")
-res15_directive = post("https://127.0.0.1/api/chat", {
+res15_directive = post(f"{API_TEST_BASE_URL}/api/chat", {
     "text": "68岁，原居民医保，本次按职工医保结算，M17.9，保守治疗"
 })
 print("Intent:", res15_directive.get("intent"), "Status:", res15_directive.get("data", {}).get("status"), "Benchmark:", res15_directive.get("data", {}).get("benchmark_amount"))
@@ -403,7 +413,7 @@ assert "2790.90" in res15_directive.get("reply", "")
 print("PASS [Round 7 P1 对齐]: “原居民医保，本次按职工医保结算” 准确优先采用本次职工基准 ￥2790.90，杜绝少算 186.06 元！")
 
 print("\n=== 16. 【审查关键验收 P2 (Round 7)】职工医保，非工伤 否定词排除 ===")
-res16_negation = post("https://127.0.0.1/api/chat", {
+res16_negation = post(f"{API_TEST_BASE_URL}/api/chat", {
     "text": "68岁，职工医保，非工伤，M17.9，保守治疗"
 })
 print("Intent:", res16_negation.get("intent"), "Status:", res16_negation.get("data", {}).get("status"), "Benchmark:", res16_negation.get("data", {}).get("benchmark_amount"))
@@ -414,7 +424,7 @@ assert "2790.90" in res16_negation.get("reply", "")
 print("PASS [Round 7 P2 对齐]: “职工医保，非工伤” 正确排除否定词按职工医保测算 ￥2790.90！")
 
 print("\n=== 17. 【审查关键验收 P2 (Round 7)】本次职工医保结算，既往工伤已结案 既往词排除 ===")
-res17_history = post("https://127.0.0.1/api/chat", {
+res17_history = post(f"{API_TEST_BASE_URL}/api/chat", {
     "text": "68岁，本次职工医保结算，既往工伤已结案，M17.9，保守治疗"
 })
 print("Intent:", res17_history.get("intent"), "Status:", res17_history.get("data", {}).get("status"), "Benchmark:", res17_history.get("data", {}).get("benchmark_amount"))
@@ -426,7 +436,7 @@ print("PASS [Round 7 P2 对齐]: “本次职工医保结算，既往工伤已�
 
 print("\n=== 18. 【审查关键验收 P1 (Round 8)】带空格待查接口统一拦截与省略金额 ===")
 # 18a: /api/chat 测试“企业职工，参保类型 待查”
-res18_chat = post("https://127.0.0.1/api/chat", {
+res18_chat = post(f"{API_TEST_BASE_URL}/api/chat", {
     "text": "68岁，企业职工，参保类型 待查，M17.9，保守治疗"
 })
 print("[18a chat] Intent:", res18_chat.get("intent"), "Status:", res18_chat.get("data", {}).get("status"), "PendingReason:", res18_chat.get("data", {}).get("pending_reason"))
@@ -436,7 +446,7 @@ assert res18_chat["data"]["pending_reason"] == "MISSING_INS_TYPE"
 assert "2790.90" not in res18_chat.get("reply", "")
 
 # 18b: /api/tools/query_dip_rule 测试“企业职工，参保类型 待查”
-res18_rule = post("https://127.0.0.1/api/tools/query_dip_rule", {
+res18_rule = post(f"{API_TEST_BASE_URL}/api/tools/query_dip_rule", {
     "disease": "M17.9",
     "age": 68,
     "ins_type": "企业职工，参保类型 待查",
@@ -450,7 +460,7 @@ assert res18_rule.get("benchmark_amount") is None
 print("PASS [Round 8 P1 对齐]: “企业职工，参保类型 待查”在 /api/chat 与 /api/tools/query_dip_rule 中双重严格拦截并省略金额！")
 
 print("\n=== 19. 【审查关键验收 P1 (Round 8)】分句时态冲突：既往按居民结算，本次按职工结算 ===")
-res19 = post("https://127.0.0.1/api/chat", {
+res19 = post(f"{API_TEST_BASE_URL}/api/chat", {
     "text": "68岁，既往按居民医保结算，本次按职工医保结算，M17.9，保守治疗"
 })
 print("Intent:", res19.get("intent"), "Status:", res19.get("data", {}).get("status"), "Benchmark:", res19.get("data", {}).get("benchmark_amount"))
@@ -461,7 +471,7 @@ assert "2790.90" in res19.get("reply", "")
 print("PASS [Round 8 P1 对齐]: “既往按居民医保结算，本次按职工医保结算” 准确优先选取本次肯定指令 ￥2790.90，杜绝少算 186.06 元！")
 
 print("\n=== 20. 【审查关键验收 P1 (Round 8)】分句否定冲突：本次不按职工医保结算，按居民医保结算 ===")
-res20 = post("https://127.0.0.1/api/chat", {
+res20 = post(f"{API_TEST_BASE_URL}/api/chat", {
     "text": "68岁，本次不按职工医保结算，按居民医保结算，M17.9，保守治疗"
 })
 print("Intent:", res20.get("intent"), "Status:", res20.get("data", {}).get("status"), "Benchmark:", res20.get("data", {}).get("benchmark_amount"))
@@ -472,7 +482,7 @@ assert "2604.84" in res20.get("reply", "")
 print("PASS [Round 8 P1 对齐]: “本次不按职工医保结算，按居民医保结算” 排除否定分句，准确采用居民基准 ￥2604.84！")
 
 print("\n=== 21. 【审查关键验收 P2 (Round 8)】非医保类型待查保护：职工医保，病理类型待查 ===")
-res21 = post("https://127.0.0.1/api/chat", {
+res21 = post(f"{API_TEST_BASE_URL}/api/chat", {
     "text": "68岁，职工医保，病理类型待查，M17.9，保守治疗"
 })
 print("Intent:", res21.get("intent"), "Status:", res21.get("data", {}).get("status"), "Benchmark:", res21.get("data", {}).get("benchmark_amount"))
@@ -483,7 +493,7 @@ assert "2790.90" in res21.get("reply", "")
 print("PASS [Round 8 P2 对齐]: “职工医保，病理类型待查” 病理类型待查不误拦截医保，正常测算 ￥2790.90！")
 
 print("\n=== 22. 【审查关键验收 P2 (Round 8)】历史待查不压制当前确认：原参保类型待查，现已确认本次按职工医保结算 ===")
-res22 = post("https://127.0.0.1/api/chat", {
+res22 = post(f"{API_TEST_BASE_URL}/api/chat", {
     "text": "68岁，原参保类型待查，现已确认本次按职工医保结算，M17.9，保守治疗"
 })
 print("Intent:", res22.get("intent"), "Status:", res22.get("data", {}).get("status"), "Benchmark:", res22.get("data", {}).get("benchmark_amount"))
@@ -494,7 +504,7 @@ assert "2790.90" in res22.get("reply", "")
 print("PASS [Round 8 P2 对齐]: “原参保类型待查，现已确认本次按职工医保结算” 历史待查不压制当前确认 ￥2790.90！")
 
 print("\n=== 23. 【审查关键验收 P1 (Round 9)】本次未按职工医保结算 仅有否定险种双接口拦截 ===")
-res23_chat = post("https://127.0.0.1/api/chat", {
+res23_chat = post(f"{API_TEST_BASE_URL}/api/chat", {
     "text": "68岁，本次未按职工医保结算，M17.9，保守治疗"
 })
 print("[23 chat] Intent:", res23_chat.get("intent"), "Status:", res23_chat.get("data", {}).get("status"), "PendingReason:", res23_chat.get("data", {}).get("pending_reason"))
@@ -503,7 +513,7 @@ assert res23_chat["data"]["status"] == "PENDING"
 assert res23_chat["data"]["pending_reason"] == "MISSING_INS_TYPE"
 assert "2790.90" not in res23_chat.get("reply", "")
 
-res23_rule = post("https://127.0.0.1/api/tools/query_dip_rule", {
+res23_rule = post(f"{API_TEST_BASE_URL}/api/tools/query_dip_rule", {
     "disease": "M17.9",
     "age": 68,
     "ins_type": "本次未按职工医保结算",
@@ -517,7 +527,7 @@ assert res23_rule.get("benchmark_amount") is None
 print("PASS [Round 9 P1 对齐]: “本次未按职工医保结算” 双接口拦截并省略金额！")
 
 print("\n=== 24. 【审查关键验收 P1 (Round 9)】本次不采用居民医保 仅有否定险种双接口拦截 ===")
-res24_chat = post("https://127.0.0.1/api/chat", {
+res24_chat = post(f"{API_TEST_BASE_URL}/api/chat", {
     "text": "68岁，本次不采用居民医保，M17.9，保守治疗"
 })
 print("[24 chat] Intent:", res24_chat.get("intent"), "Status:", res24_chat.get("data", {}).get("status"), "PendingReason:", res24_chat.get("data", {}).get("pending_reason"))
@@ -526,7 +536,7 @@ assert res24_chat["data"]["status"] == "PENDING"
 assert res24_chat["data"]["pending_reason"] == "MISSING_INS_TYPE"
 assert "2604.84" not in res24_chat.get("reply", "")
 
-res24_rule = post("https://127.0.0.1/api/tools/query_dip_rule", {
+res24_rule = post(f"{API_TEST_BASE_URL}/api/tools/query_dip_rule", {
     "disease": "M17.9",
     "age": 68,
     "ins_type": "本次不采用居民医保",
@@ -540,7 +550,7 @@ assert res24_rule.get("benchmark_amount") is None
 print("PASS [Round 9 P1 对齐]: “本次不采用居民医保” 双接口拦截并省略金额！")
 
 print("\n=== 25. 【审查关键验收 P1 (Round 9)】待查含中文冒号：企业职工，参保类型：待查 ===")
-res25_chat = post("https://127.0.0.1/api/chat", {
+res25_chat = post(f"{API_TEST_BASE_URL}/api/chat", {
     "text": "68岁，企业职工，参保类型：待查，M17.9，保守治疗"
 })
 print("[25 chat] Intent:", res25_chat.get("intent"), "Status:", res25_chat.get("data", {}).get("status"), "PendingReason:", res25_chat.get("data", {}).get("pending_reason"))
@@ -549,7 +559,7 @@ assert res25_chat["data"]["status"] == "PENDING"
 assert res25_chat["data"]["pending_reason"] == "MISSING_INS_TYPE"
 assert "2790.90" not in res25_chat.get("reply", "")
 
-res25_rule = post("https://127.0.0.1/api/tools/query_dip_rule", {
+res25_rule = post(f"{API_TEST_BASE_URL}/api/tools/query_dip_rule", {
     "disease": "M17.9",
     "age": 68,
     "ins_type": "企业职工，参保类型：待查",
@@ -563,7 +573,7 @@ assert res25_rule.get("benchmark_amount") is None
 print("PASS [Round 9 P1 对齐]: “企业职工，参保类型：待查”(含冒号) 双接口严格拦截！")
 
 print("\n=== 26. 【审查关键验收 P1 (Round 9)】多字段待查解耦：企业职工，病理类型待查且参保类型待查 ===")
-res26_chat = post("https://127.0.0.1/api/chat", {
+res26_chat = post(f"{API_TEST_BASE_URL}/api/chat", {
     "text": "68岁，企业职工，病理类型待查且参保类型待查，M17.9，保守治疗"
 })
 print("[26 chat] Intent:", res26_chat.get("intent"), "Status:", res26_chat.get("data", {}).get("status"), "PendingReason:", res26_chat.get("data", {}).get("pending_reason"))
@@ -572,7 +582,7 @@ assert res26_chat["data"]["status"] == "PENDING"
 assert res26_chat["data"]["pending_reason"] == "MISSING_INS_TYPE"
 assert "2790.90" not in res26_chat.get("reply", "")
 
-res26_rule = post("https://127.0.0.1/api/tools/query_dip_rule", {
+res26_rule = post(f"{API_TEST_BASE_URL}/api/tools/query_dip_rule", {
     "disease": "M17.9",
     "age": 68,
     "ins_type": "企业职工，病理类型待查且参保类型待查",
@@ -586,7 +596,7 @@ assert res26_rule.get("benchmark_amount") is None
 print("PASS [Round 9 P1 对齐]: “企业职工，病理类型待查且参保类型待查” 多字段解耦，参保待查不被屏蔽！")
 
 print("\n=== 27. 【审查关键验收 P1 (Round 9)】选择疑问句消歧：按职工医保还是按居民医保结算？ ===")
-res27_chat = post("https://127.0.0.1/api/chat", {
+res27_chat = post(f"{API_TEST_BASE_URL}/api/chat", {
     "text": "68岁，按职工医保还是按居民医保结算？M17.9，保守治疗"
 })
 print("[27 chat] Intent:", res27_chat.get("intent"), "Status:", res27_chat.get("data", {}).get("status"), "PendingReason:", res27_chat.get("data", {}).get("pending_reason"))
@@ -596,7 +606,7 @@ assert res27_chat["data"]["pending_reason"] == "AMBIGUOUS_INS_TYPE"
 assert "2790.90" not in res27_chat.get("reply", "")
 assert "2604.84" not in res27_chat.get("reply", "")
 
-res27_rule = post("https://127.0.0.1/api/tools/query_dip_rule", {
+res27_rule = post(f"{API_TEST_BASE_URL}/api/tools/query_dip_rule", {
     "disease": "M17.9",
     "age": 68,
     "ins_type": "按职工医保还是按居民医保结算？",
@@ -610,7 +620,7 @@ assert res27_rule.get("benchmark_amount") is None
 print("PASS [Round 9 P1 对齐]: “按职工医保还是按居民医保结算？” 识别选择疑问句并进入 PENDING！")
 
 print("\n=== 28. 【审查关键验收 P2 (Round 9)】项目级自费兼容：职工医保，部分项目自费 ===")
-res28_chat = post("https://127.0.0.1/api/chat", {
+res28_chat = post(f"{API_TEST_BASE_URL}/api/chat", {
     "text": "68岁，职工医保，部分项目自费，M17.9，保守治疗"
 })
 print("[28 chat] Intent:", res28_chat.get("intent"), "Status:", res28_chat.get("data", {}).get("status"), "Benchmark:", res28_chat.get("data", {}).get("benchmark_amount"))
@@ -619,7 +629,7 @@ assert res28_chat["data"]["matched"] is True
 assert res28_chat["data"]["benchmark_amount"] == 2790.90
 assert "2790.90" in res28_chat.get("reply", "")
 
-res28_rule = post("https://127.0.0.1/api/tools/query_dip_rule", {
+res28_rule = post(f"{API_TEST_BASE_URL}/api/tools/query_dip_rule", {
     "disease": "M17.9",
     "age": 68,
     "ins_type": "职工医保，部分项目自费",
@@ -632,7 +642,7 @@ assert res28_rule["benchmark_amount"] == 2790.90
 print("PASS [Round 9 P2 对齐]: “职工医保，部分项目自费” 项目级自费不拦截整单医保，正常测算 ￥2790.90！")
 
 print("\n=== 29. 【审查关键验收 P1 (Round 10)】本次未按城乡居民医保结算 别名否定双接口拦截 ===")
-res29_chat = post("https://127.0.0.1/api/chat", {
+res29_chat = post(f"{API_TEST_BASE_URL}/api/chat", {
     "text": "68岁，本次未按城乡居民医保结算，M17.9，保守治疗"
 })
 print("[29 chat] Intent:", res29_chat.get("intent"), "Status:", res29_chat.get("data", {}).get("status"), "PendingReason:", res29_chat.get("data", {}).get("pending_reason"))
@@ -641,7 +651,7 @@ assert res29_chat["data"]["status"] == "PENDING"
 assert res29_chat["data"]["pending_reason"] == "MISSING_INS_TYPE"
 assert "2604.84" not in res29_chat.get("reply", "")
 
-res29_rule = post("https://127.0.0.1/api/tools/query_dip_rule", {
+res29_rule = post(f"{API_TEST_BASE_URL}/api/tools/query_dip_rule", {
     "disease": "M17.9",
     "age": 68,
     "ins_type": "本次未按城乡居民医保结算",
@@ -655,7 +665,7 @@ assert res29_rule.get("benchmark_amount") is None
 print("PASS [Round 10 P1 对齐]: “本次未按城乡居民医保结算” 双接口拦截否定险种并省略金额！")
 
 print("\n=== 30. 【审查关键验收 P1 (Round 10)】按职工医保或居民医保结算？ 单字'或'双接口消歧 ===")
-res30_chat = post("https://127.0.0.1/api/chat", {
+res30_chat = post(f"{API_TEST_BASE_URL}/api/chat", {
     "text": "68岁，按职工医保或居民医保结算？M17.9，保守治疗"
 })
 print("[30 chat] Intent:", res30_chat.get("intent"), "Status:", res30_chat.get("data", {}).get("status"), "PendingReason:", res30_chat.get("data", {}).get("pending_reason"))
@@ -665,7 +675,7 @@ assert res30_chat["data"]["pending_reason"] == "AMBIGUOUS_INS_TYPE"
 assert "2790.90" not in res30_chat.get("reply", "")
 assert "2604.84" not in res30_chat.get("reply", "")
 
-res30_rule = post("https://127.0.0.1/api/tools/query_dip_rule", {
+res30_rule = post(f"{API_TEST_BASE_URL}/api/tools/query_dip_rule", {
     "disease": "M17.9",
     "age": 68,
     "ins_type": "按职工医保或居民医保结算？",
@@ -679,7 +689,7 @@ assert res30_rule.get("benchmark_amount") is None
 print("PASS [Round 10 P1 对齐]: “按职工医保或居民医保结算？” 单字'或'双接口识别选择疑问句并进入 PENDING！")
 
 print("\n=== 31. 【审查关键验收 P1 (Round 10)】更正为居民医保 指令优先覆盖 ===")
-res31_chat = post("https://127.0.0.1/api/chat", {
+res31_chat = post(f"{API_TEST_BASE_URL}/api/chat", {
     "text": "68岁，本次按职工医保结算，核实后更正为居民医保，M17.9，保守治疗"
 })
 print("[31 chat] Intent:", res31_chat.get("intent"), "Status:", res31_chat.get("data", {}).get("status"), "Benchmark:", res31_chat.get("data", {}).get("benchmark_amount"))
@@ -688,7 +698,7 @@ assert res31_chat["data"]["matched"] is True
 assert res31_chat["data"]["benchmark_amount"] == 2604.84
 assert "2604.84" in res31_chat.get("reply", "")
 
-res31_rule = post("https://127.0.0.1/api/tools/query_dip_rule", {
+res31_rule = post(f"{API_TEST_BASE_URL}/api/tools/query_dip_rule", {
     "disease": "M17.9",
     "age": 68,
     "ins_type": "本次按职工医保结算，核实后更正为居民医保",
@@ -701,7 +711,7 @@ assert res31_rule["benchmark_amount"] == 2604.84
 print("PASS [Round 10 P1 对齐]: “核实后更正为居民医保” 准确覆盖前置指令采用居民基准 ￥2604.84，杜绝多算 186.06 元！")
 
 print("\n=== 32. 【审查关键验收 P2 (Round 10)】耗材按自费项目结算 支付范围隔离 ===")
-res32_chat = post("https://127.0.0.1/api/chat", {
+res32_chat = post(f"{API_TEST_BASE_URL}/api/chat", {
     "text": "68岁，职工医保，耗材按自费项目结算，M17.9，保守治疗"
 })
 print("[32 chat] Intent:", res32_chat.get("intent"), "Status:", res32_chat.get("data", {}).get("status"), "Benchmark:", res32_chat.get("data", {}).get("benchmark_amount"))
@@ -710,7 +720,7 @@ assert res32_chat["data"]["matched"] is True
 assert res32_chat["data"]["benchmark_amount"] == 2790.90
 assert "2790.90" in res32_chat.get("reply", "")
 
-res32_rule = post("https://127.0.0.1/api/tools/query_dip_rule", {
+res32_rule = post(f"{API_TEST_BASE_URL}/api/tools/query_dip_rule", {
     "disease": "M17.9",
     "age": 68,
     "ins_type": "职工医保，耗材按自费项目结算",
@@ -723,7 +733,7 @@ assert res32_rule["benchmark_amount"] == 2790.90
 print("PASS [Round 10 P2 对齐]: “职工医保，耗材按自费项目结算” 范围隔离，正常测算职工基准 ￥2790.90！")
 
 print("\n=== 33. 【审查关键验收 P1 (Round 10)】临床方案选择不误拦截已确认险种 ===")
-res33_chat = post("https://127.0.0.1/api/chat", {
+res33_chat = post(f"{API_TEST_BASE_URL}/api/chat", {
     "text": "68岁，本次按职工医保结算，M17.9，保守还是手术？"
 })
 print("[33 chat] Intent:", res33_chat.get("intent"), "Status:", res33_chat.get("data", {}).get("status"), "Benchmark:", res33_chat.get("data", {}).get("benchmark_amount"))

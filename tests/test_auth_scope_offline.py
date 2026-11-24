@@ -161,7 +161,18 @@ def test_auth_scope_001_doctor_precedence():
         except HTTPException as e:
             assert e.status_code == 403
 
-    print("PASS [AUTH-SCOPE-001]: 显式映射防工号碰撞、重置后旧关系拒绝、旧账号兼容及空记录拒绝全部通过")
+        # 6) 保留虚构在院记录，但操作员记录消失 (get_operator 返回 None) -> 一律拒绝 403
+        op_ghost = {"sub": "GHOST_DOC", "role": "DOCTOR", "dept": "中医科"}
+        req_ghost_pat = api_main.CheckPatientDipRequest(
+            patient_id="PAT_A", disease="M17.9", current_cost=-1.0, age=68, ins_type="职工", operation="保守治疗"
+        )
+        try:
+            asyncio.run(api_main.check_patient_dip(req_ghost_pat, operator=op_ghost))
+            raise AssertionError("不存在的操作员即使有在院记录也必须拒绝 403")
+        except HTTPException as e:
+            assert e.status_code == 403
+
+    print("PASS [AUTH-SCOPE-001]: 显式映射防工号碰撞、重置后旧关系拒绝、操作员消失拒绝、旧账号兼容及空记录拒绝全部通过")
 
 
 def test_auth_scope_002_and_snap_query_001():
@@ -214,7 +225,14 @@ def test_auth_scope_002_and_snap_query_001():
         {"ksid": 102, "ksname": "综合科"},
     ]
 
+    alert_operators = {
+        "dh101": {"operator_id": "dh101", "role_type": "DEPT_HEAD", "dept_scope": "101", "status": "ACTIVE", "cred_version": 1},
+        "dh_ambig": {"operator_id": "dh_ambig", "role_type": "DEPT_HEAD", "dept_scope": "综合科", "status": "ACTIVE", "cred_version": 1},
+        "admin01": {"operator_id": "admin01", "role_type": "ADMIN", "dept_scope": "", "status": "ACTIVE", "cred_version": 1},
+    }
+
     with patch.object(api_main, "get_local_db_connection", return_value=(_SnapCursor(), _SnapConn())), \
+         patch.object(api_main, "get_operator", side_effect=lambda oid: alert_operators.get(oid)), \
          patch.object(api_main, "get_authorized_dept_ids", side_effect=lambda s: rbac_mod.resolve_authorized_dept_ids(s, his_ks_rows=his_ks_mock)), \
          patch.object(api_main, "record_audit_log"):
 
@@ -252,9 +270,17 @@ if __name__ == "__main__":
     print("=" * 70)
     print(">>> 开始执行全链路离线鉴权与 HIS 读取器单元测试 <<<")
     print("=" * 70)
-    test_his_fixture_removed()
-    test_auth_scope_001_doctor_precedence()
-    test_auth_scope_002_and_snap_query_001()
+    # TEST-OFFLINE-001：全局禁止任何真实数据库连接与外部网络调用，确保连接次数为 0
+    import db.local_db as local_db_mod
+    def _forbid_db(*args, **kwargs):
+        raise AssertionError("TEST-OFFLINE-001 违规：离线测试严禁打开真实数据库连接！")
+    with patch.object(local_db_mod, "get_local_db_connection", side_effect=_forbid_db), \
+         patch.object(rbac_mod, "get_local_db_connection", side_effect=_forbid_db), \
+         patch.object(api_main, "get_local_db_connection", side_effect=_forbid_db), \
+         patch.object(HISReader, "get_connection", side_effect=_forbid_db):
+        test_his_fixture_removed()
+        test_auth_scope_001_doctor_precedence()
+        test_auth_scope_002_and_snap_query_001()
     print("=" * 70)
-    print(">>> 全部离线鉴权与 HIS 读取器测试 100% 通过！ <<<")
+    print(">>> 全部离线鉴权与 HIS 读取器测试 100% 通过！（真实 DB/网络调用次数 = 0） <<<")
     print("=" * 70)

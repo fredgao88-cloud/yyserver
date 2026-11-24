@@ -215,7 +215,10 @@ def run_auth_tests():
     # 11c. 直接传入精确 ID（20）可唯一命中
     res_exact_id = rbac_mod.resolve_authorized_dept_ids("20", his_ks_rows=sample_ks)
     assert res_exact_id == {"20"}, f"直接传 ID 20 应返回 {{'20'}}，实际 {res_exact_id}"
-    print("PASS [Auth 11]: AUTH-SCOPE-002 仅用可信科室 ID 裁决及同名歧义拒绝验证通过")
+    # 11d. 空目录与目录故障（None）均严格拒绝返回空集，绝不扩大范围
+    assert rbac_mod.resolve_authorized_dept_ids("99", his_ks_rows=[]) == set()
+    assert rbac_mod.resolve_authorized_dept_ids("99", his_ks_rows=None) == set()
+    print("PASS [Auth 11]: AUTH-SCOPE-002 仅用可信科室 ID 裁决、同名歧义拒绝及目录故障拒绝验证通过")
 
     print("\n" + "=" * 70)
     print(">>> 恭喜！auth/rbac.py 全部 11 组离线单元测试 100% 通过！ <<<")

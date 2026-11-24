@@ -172,15 +172,19 @@ async def check_patient_dip(req: CheckPatientDipRequest, operator: Dict[str, Any
 
         if role == ROLE_DOCTOR:
             cur_doc_id = (adm.get("attending_doctor_id") or "").strip()
-            op_rec = get_operator(operator["sub"]) or {}
-            mapped_doc_id = (op_rec.get("doctor_id") or "").strip()
-            if mapped_doc_id:
-                # 存在显式 HIS 工号映射时，仅采信当前有效映射的 HIS 工号，严禁同时放行登录名以防工号碰撞越权
-                valid_doc_ids = {mapped_doc_id}
+            op_rec = get_operator(operator["sub"])
+            if not op_rec or op_rec.get("status") != "ACTIVE":
+                # AUTH-SCOPE-001：操作员账号不存在或已停用，一律拒绝，绝不回退登录名
+                valid_doc_ids = set()
             else:
-                # 旧账号未配置显式映射时兼容使用操作员登录工号
-                fallback_id = (op_rec.get("operator_id") or operator["sub"] or "").strip()
-                valid_doc_ids = {fallback_id} if fallback_id else set()
+                mapped_doc_id = (op_rec.get("doctor_id") or "").strip()
+                if mapped_doc_id:
+                    # 存在显式 HIS 工号映射时，仅采信当前有效映射的 HIS 工号，严禁同时放行登录名以防工号碰撞越权
+                    valid_doc_ids = {mapped_doc_id}
+                else:
+                    # 有效旧账号未配置显式映射时兼容使用操作员表内 operator_id
+                    fallback_id = (op_rec.get("operator_id") or "").strip()
+                    valid_doc_ids = {fallback_id} if fallback_id else set()
             # 严格使用唯一工号和有效在院关系精确授权，关系缺失时拒绝；严禁根据科室放行，对外统一拒绝信息
             is_attending = bool(cur_doc_id and cur_doc_id in valid_doc_ids)
             if not is_attending:

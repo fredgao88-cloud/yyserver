@@ -255,6 +255,9 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
         for w in _premise_outcome_words:
             topic_core = topic_core.replace(w, '')
         topic_core = topic_core.strip()
+        _allowed_approval_pre = re.compile(
+            r'(?:^|已确认|现已确认|确认|已核实|经核实|核实|明确|关于|该|此|本|其|上述|本次|医保|参保|险种|更正|且|并|，|,)$'
+        )
         if topic_core:
             topic_tokens = [topic_core] if len(topic_core) <= 2 else [
                 topic_core[i:i + 2] for i in range(len(topic_core) - 1)
@@ -262,13 +265,18 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
             topic_hit = False
             for tok in topic_tokens:
                 for tm in re.finditer(re.escape(tok), clause_text):
-                    if not _unrelated_topic_prefixes.search(clause_text[:tm.start()]):
-                        topic_hit = True
-                        break
+                    pre_seg = clause_text[:tm.start()].strip()
+                    if _unrelated_topic_prefixes.search(pre_seg):
+                        continue
+                    if tok == "审批" and not _allowed_approval_pre.search(pre_seg):
+                        continue  # 拒绝“手术审批”“采购申请审批”等其他业务主语修饰的审批
+                    topic_hit = True
+                    break
                 if topic_hit:
                     break
             if not topic_hit and topic_core == "审批" and ("终审通过" in clause_text or "已通过终审" in clause_text):
-                if not _unrelated_topic_prefixes.search(clause_text.split("终审")[0]):
+                pre_final = clause_text.split("终审")[0].strip()
+                if not _unrelated_topic_prefixes.search(pre_final) and _allowed_approval_pre.search(pre_final):
                     topic_hit = True
         else:
             topic_hit = core_text in clause_text  # 前提只剩结果词时从严整体匹配

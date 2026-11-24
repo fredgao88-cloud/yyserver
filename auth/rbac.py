@@ -353,7 +353,8 @@ def resolve_authorized_dept_ids(dept_scope: str, his_ks_rows: Optional[List[Dict
             rows = None
 
     if rows is None:
-        return {x for x in raw_items if x.isdigit()}
+        # AUTH-SCOPE-002：科室目录不可用时一律拒绝，绝不扩大或猜测授权范围
+        return set()
 
     id_set = set()
     name_to_ids: Dict[str, set] = {}
