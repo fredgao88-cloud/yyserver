@@ -203,14 +203,28 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
     # 仅当后续分句以陈述事实口吻明确确认同一前提结果（含完成态词且无假设词）时才解除待定（DIP-INS-002 变体）
     corr_hypothetical = re.compile(r'(?:如果|若|假如|一旦)')
 
+    # 前提中的肯定结果词（DIP-INS-001 变体四）：前提既含“事项”又含“结果”，
+    # 确认分句必须同时覆盖事项话题与前提中出现的结果词，才视为同一前提已被确认；
+    # “审批尚在办理”（无结果词）、“审批材料齐全”（事项相关但结果不符）均不得解除待定
+    _premise_outcome_words = ('通过', '获批', '批准', '核准', '同意', '符合', '满足', '成功', '完成', '落实', '到位')
+
     def _premise_core_confirmed(core_text, clause_text):
-        """跨分句前提解除判据（DIP-INS-001 变体）：确认分句须覆盖前提核心内容的二字片段，
-        避免“已核实年龄”等无关确认误解除“如果审批通过”的待定"""
+        """跨分句前提解除判据（DIP-INS-001 变体三/四）：
+        1) 事项话题重叠：确认分句须覆盖前提核心内容的二字片段（“已核实年龄”不含“审批”，不放行）；
+        2) 结果词同现：前提中出现的结果词（如“通过”）必须在确认分句中同现
+           （“审批尚在办理”“审批材料齐全”不含“通过”，不放行）；
+        3) 前提无明确结果词时从严：要求前提核心整体出现在确认分句中"""
         if not core_text:
             return False  # 前提核心为空时绝不自动解除，保持澄清
-        if core_text in clause_text:
-            return True
-        return any(core_text[i:i + 2] in clause_text for i in range(len(core_text) - 1))
+        topic_hit = (core_text in clause_text) or any(
+            core_text[i:i + 2] in clause_text for i in range(len(core_text) - 1)
+        )
+        if not topic_hit:
+            return False
+        core_outcomes = [w for w in _premise_outcome_words if w in core_text]
+        if core_outcomes:
+            return any(w in clause_text for w in core_outcomes)
+        return core_text in clause_text
 
     pending_cond_clause_idx = -1  # 最近一个含未决前提（有条件词且无完成态确认）的分句序号；该前提修饰其后第一条更正指令
     pending_cond_core = ""  # 该未决前提的核心内容（剥除假设/条件标记与标点），用于核对后续确认是否针对同一前提

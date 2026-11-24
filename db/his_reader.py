@@ -117,6 +117,14 @@ class HISReader:
         conn = self.get_connection()
         cur = conn.cursor(as_dict=True)
         try:
+            # RECON-RX-001：主单（his_zyjz）、类目账、临嘱与药费聚合必须在同一受保证的
+            # 一致性边界内读取。生产 HIS 库实测 snapshot_isolation_state=OFF 且未开启 RCSI，
+            # 不能依赖行版本快照，普通 READ COMMITTED 下独立语句仍可能取自不同时点；
+            # 这里显式采用 SERIALIZABLE 只读事务（键范围锁仅作用于本 lsh 的少量行；
+            # 本函数仅供对账审计低频调用，无 API 在线路径），
+            # 保证并发结算/发药提交时对账只读到完整旧账或完整新账。
+            conn.autocommit(False)
+            cur.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
             # 1. Query valid settlements for lsh
             cur.execute("SELECT * FROM dbo.his_zyjz WHERE lsh = %s AND iszf = 0 ORDER BY jzrq ASC", (lsh,))
             valid_settlements = cur.fetchall()
@@ -190,9 +198,9 @@ class HISReader:
             cz_stat = cur.fetchone()
 
             # 4. 药房对账（RECON-RX-001）：已发药明细（his_cfmain_fyjl）与
-            # 已计费未发药处方（his_cfmain）必须在**同一条 SQL 语句**内聚合——
-            # SQL Server 在 READ COMMITTED 下提供语句级一致快照，两组金额取自同一时点，
-            # 两次独立查询之间发生发药时的“两边都不算”漏算窗口由此消除。
+            # 已计费未发药处方（his_cfmain）在同一条 SQL 语句内聚合，
+            # 且与主单读取同处上文建立的 SERIALIZABLE 显式事务，
+            # 两组金额与对账基准天然对应同一时点，无读间漏算窗口。
             # 未发药处方判据：已计费（jsrq 非空，未计费/弃用处方 jsrq 为空且本就不计入 yfmoney）、
             # 非作废、且无任何发药记录（his_cfmain_fyjl.id 与 his_cfmain.id 一一对应）；
             # isfy 标志在该 HIS 中维护不可靠，不作为判据
@@ -225,7 +233,7 @@ class HISReader:
             fy_stat = cur.fetchone()
             unfy_stat = fy_stat  # 同一语句快照，两组金额天然同时点
 
-            return {
+            result = {
                 'reconciliation_scope': reconciliation_scope,
                 'settlement_count': len(valid_settlements),
                 'zyjz': zyjz_record,
@@ -246,6 +254,14 @@ class HISReader:
                     'undispensed': Decimal(str(unfy_stat['unfy_total'] or 0)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
                 }
             }
+            conn.commit()  # 结束 SERIALIZABLE 只读事务，及时释放键范围锁
+            return result
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
         finally:
             conn.close()
 

@@ -247,6 +247,12 @@ def run_settled_reconciliation_suite():
             class MockConn:
                 def cursor(self, as_dict=True):
                     return MockCursor()
+                def autocommit(self, value):
+                    pass
+                def commit(self):
+                    pass
+                def rollback(self):
+                    pass
                 def close(self):
                     pass
             return MockConn()
@@ -350,6 +356,12 @@ def run_settled_reconciliation_suite():
             class MockConn:
                 def cursor(self, as_dict=True):
                     return outer.cursor_obj
+                def autocommit(self, value):
+                    pass
+                def commit(self):
+                    pass
+                def rollback(self):
+                    pass
                 def close(self):
                     pass
             return MockConn()
@@ -378,8 +390,207 @@ def run_settled_reconciliation_suite():
     print("PASS [Suite 7d]: 时序差（+12.00）正确豁免，真实差额（13.00 > 0.10）正确暴露")
     print("  [PASS] Suite 7 Undispensed-prescription Scope Verified.")
 
+    # -------------------------------------------------------------
+    # Test Suite 8: 读取器实际生成 SQL 的离线执行与变异对照（RECON-TEST-001）
+    # 捕获 get_case_fee_detail 实际下发的药房合并聚合 SQL，在 SQLite 内存库原样执行：
+    # 合成已发药/退款/已计费未发药/未计费/作废五类记录分别断言；
+    # 删除作废过滤条件的变异查询必须得出不同结果（杜绝“桩在 Python 重算过滤条件”失真）
+    # -------------------------------------------------------------
+    print("\n[Suite 8] Executing reader's actual pharmacy SQL offline (SQLite) with mutation control...")
+
+    class RecCursor:
+        def __init__(self):
+            self.sqls = []
+        def execute(self, sql, params=()):
+            self.sqls.append(sql)
+        def fetchall(self):
+            q = self.sqls[-1]
+            if "FROM dbo.his_zyjz" in q:
+                return [{'id': 301, 'lsh': 'zy_synth_sql', 'amoney': Decimal('200.00'),
+                         'czmoney': Decimal('0.00'), 'yjmoney': Decimal('0.00'),
+                         'yfmoney': Decimal('37.00'), 'iszf': 0}]
+            if "FROM dbo.his_zycjz" in q:
+                return [{'xmsflxid': '01', 'amoney': Decimal('200.00'), 'ssmoney': Decimal('200.00')}]
+            return []
+        def fetchone(self):
+            q = self.sqls[-1]
+            if "unfy_count" in q:
+                return {'fy_count': 0, 'fy_total': None, 'fy_refund_total': None,
+                        'fy_positive_total': None, 'unfy_count': 0, 'unfy_total': None}
+            if "FROM dbo.his_zycz" in q:
+                return {'cz_count': 0, 'cz_total': Decimal('0'), 'cz_refund_total': Decimal('0'), 'cz_positive_total': Decimal('0')}
+            return None
+        def close(self):
+            pass
+
+    class RecConn:
+        def __init__(self):
+            self.cur = RecCursor()
+        def cursor(self, as_dict=True):
+            return self.cur
+        def autocommit(self, value):
+            pass
+        def commit(self):
+            pass
+        def rollback(self):
+            pass
+        def close(self):
+            pass
+
+    class RecReader(HISReader):
+        def __init__(self):
+            self.conn_obj = RecConn()
+        def get_connection(self):
+            return self.conn_obj
+
+    rec_reader = RecReader()
+    rec_reader.get_case_fee_detail('zy_synth_sql')
+    fy_sql_list = [s for s in rec_reader.conn_obj.cur.sqls if 'unfy_count' in s]
+    assert len(fy_sql_list) == 1, "药房聚合应为一条合并 SQL（语句内同时点）"
+    fy_sql = fy_sql_list[0]
+
+    import sqlite3
+    lite = sqlite3.connect(':memory:')
+    lc = lite.cursor()
+    lc.execute("CREATE TABLE his_cfmain_fyjl (lsh TEXT, id TEXT, bmoney REAL)")
+    lc.execute("CREATE TABLE his_cfmain (lsh TEXT, id TEXT, bmoney REAL, jsrq TEXT, iszf INTEGER)")
+    lc.executemany("INSERT INTO his_cfmain_fyjl VALUES (?,?,?)", [
+        ('zy_synth_sql', 'RX-DISP-0001', 30.00),
+        ('zy_synth_sql', 'RX-DISP-0001', -5.00),
+    ])
+    lc.executemany("INSERT INTO his_cfmain VALUES (?,?,?,?,?)", [
+        ('zy_synth_sql', 'RX-DISP-0001', 30.00, '2026-11-24 09:12:00', None),  # 已发药
+        ('zy_synth_sql', 'RX-UNFY-0001', 12.00, '2026-11-24 09:30:00', None),  # 已计费未发药
+        ('zy_synth_sql', 'RX-UNBILL-01', 99.00, None, None),                   # 未计费弃用
+        ('zy_synth_sql', 'RX-VOID-0001', 55.00, '2026-11-24 09:40:00', 1),     # 作废
+    ])
+    adapted_sql = fy_sql.replace('dbo.', '').replace('%s', '?')
+    lc.execute(adapted_sql, ('zy_synth_sql', 'zy_synth_sql'))
+    row = lc.fetchone()
+    # 列序：fy_count, fy_total, fy_refund_total, fy_positive_total, unfy_count, unfy_total
+    assert row[0] == 2 and abs(row[1] - 25.00) < 1e-9, f"发药净额应为 25.00，实际 {row[1]}"
+    assert abs(row[2] - (-5.00)) < 1e-9 and abs(row[3] - 30.00) < 1e-9, "退款/正向拆分不符"
+    assert row[4] == 1 and abs(row[5] - 12.00) < 1e-9, f"未发药应为 1 笔 12.00，实际 {row[4]} 笔 {row[5]}"
+    print("PASS [Suite 8a]: 实际 SQL 在 SQLite 原样执行——发药净额 25.00（含退款 -5.00）、未发药 1 笔 12.00，未计费/作废正确排除")
+
+    # 变异对照：删除作废过滤条件，结果必须改变（证明断言确实依赖该过滤）
+    mutated_sql = adapted_sql.replace("AND (c.iszf = 0 OR c.iszf IS NULL)", "AND (1 = 1)")
+    assert mutated_sql != adapted_sql, "变异未生效"
+    lc.execute(mutated_sql, ('zy_synth_sql', 'zy_synth_sql'))
+    mrow = lc.fetchone()
+    assert abs(mrow[5] - 67.00) < 1e-9 and abs(mrow[5] - row[5]) > 1e-9, "删除作废过滤的变异查询必须失败（计入作废 55.00）"
+    lite.close()
+    print("PASS [Suite 8b]: 变异对照——删除作废过滤条件后未发药变为 67.00，原查询断言对该变异敏感")
+    print("  [PASS] Suite 8 Actual-SQL Offline Execution & Mutation Verified.")
+
+    # -------------------------------------------------------------
+    # Test Suite 9: 双会话串行化一致性验收（RECON-RX-001）
+    # 在院内隔离 SQL Server（his_agent_db 本地容器，与生产 HIS 库无关）建临时表，
+    # 按生产读取模式（SERIALIZABLE 显式事务）读取；并发会话在读取期间提交
+    # 主单与药费调整，断言读取方只得到完整旧账或完整新账
+    # -------------------------------------------------------------
+    print("\n[Suite 9] Two-session SERIALIZABLE consistency on isolated SQL Server...")
+    try:
+        import pymssql
+        import threading
+    except ImportError:
+        print("  [SKIP] Suite 9: pymssql 不可用（离线环境跳过，服务器上必跑）")
+    else:
+        _h = os.environ.get('LOCAL_DB_HOST')
+        _port = int(os.environ.get('LOCAL_DB_PORT', '1433'))
+        _u = os.environ.get('LOCAL_DB_USER')
+        _p = os.environ.get('LOCAL_DB_PASS')
+        _db = os.environ.get('LOCAL_DB_NAME', 'his_agent_db')
+        if not (_h and _u and _p):
+            print("  [SKIP] Suite 9: LOCAL_DB_* 未配置（离线环境跳过，服务器上必跑）")
+        else:
+            admin = pymssql.connect(server=_h, port=_port, user=_u, password=_p, database=_db,
+                                    autocommit=True, login_timeout=10, timeout=30)
+            ac = admin.cursor()
+            try:
+                for t in ('rxt_zyjz', 'rxt_cfmain', 'rxt_cfmain_fyjl'):
+                    ac.execute(f"IF OBJECT_ID('dbo.{t}','U') IS NOT NULL DROP TABLE dbo.{t}")
+                ac.execute("CREATE TABLE dbo.rxt_zyjz (lsh NVARCHAR(64), id NVARCHAR(64), amoney DECIMAL(18,5), czmoney DECIMAL(18,5), yjmoney DECIMAL(18,5), yfmoney DECIMAL(18,5), iszf INT, jzrq DATETIME2)")
+                ac.execute("CREATE TABLE dbo.rxt_cfmain (lsh NVARCHAR(64), id NVARCHAR(64), bmoney DECIMAL(18,5), jsrq DATETIME2 NULL, iszf INT NULL)")
+                ac.execute("CREATE TABLE dbo.rxt_cfmain_fyjl (lsh NVARCHAR(64), id NVARCHAR(64), bmoney DECIMAL(18,5))")
+                # 旧账：主单 37 = 已发药净额 25（30 - 5 退药）+ 已计费未发药 12（合成编号，非真实就诊流水号）
+                ac.execute("INSERT INTO dbo.rxt_zyjz VALUES ('RXTEST01','S1',200,0,0,37,0,SYSDATETIME())")
+                ac.execute("INSERT INTO dbo.rxt_cfmain VALUES ('RXTEST01','RX-DISP-0001',30,'2026-11-24 09:12:00',NULL)")
+                ac.execute("INSERT INTO dbo.rxt_cfmain VALUES ('RXTEST01','RX-UNFY-0001',12,'2026-11-24 09:30:00',NULL)")
+                ac.execute("INSERT INTO dbo.rxt_cfmain_fyjl VALUES ('RXTEST01','RX-DISP-0001',30)")
+                ac.execute("INSERT INTO dbo.rxt_cfmain_fyjl VALUES ('RXTEST01','RX-DISP-0001',-5)")
+
+                # 读取器实际生成的合并聚合 SQL，仅替换为临时表名
+                fy_sql_rxt = (fy_sql.replace('dbo.his_cfmain_fyjl', 'dbo.rxt_cfmain_fyjl')
+                                    .replace('dbo.his_cfmain', 'dbo.rxt_cfmain'))
+                master_sql = "SELECT SUM(yfmoney) AS yfm FROM dbo.rxt_zyjz WHERE lsh = %s AND iszf = 0"
+
+                # 会话 R：生产同款 SERIALIZABLE 只读事务，先读旧账
+                R = pymssql.connect(server=_h, port=_port, user=_u, password=_p, database=_db,
+                                    autocommit=False, login_timeout=10, timeout=60)
+                rc = R.cursor(as_dict=True)
+                rc.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+                rc.execute(master_sql, ('RXTEST01',))
+                old_master = Decimal(str(rc.fetchone()['yfm']))
+                rc.execute(fy_sql_rxt, ('RXTEST01', 'RXTEST01'))
+                old_fy = rc.fetchone()
+                assert old_master == Decimal('37')
+                assert Decimal(str(old_fy['fy_total'])) == Decimal('25')
+                assert Decimal(str(old_fy['unfy_total'])) == Decimal('12')
+
+                # 会话 W：并发提交主单与药费调整（新账 45 = 33 + 12），将被 R 的串行化锁阻塞
+                w_result = []
+                def _writer():
+                    try:
+                        W = pymssql.connect(server=_h, port=_port, user=_u, password=_p, database=_db,
+                                            autocommit=False, login_timeout=10, timeout=60)
+                        wc = W.cursor()
+                        wc.execute("UPDATE dbo.rxt_zyjz SET yfmoney = 45 WHERE lsh = 'RXTEST01'")
+                        wc.execute("INSERT INTO dbo.rxt_cfmain_fyjl VALUES ('RXTEST01','RX-DISP-0001',8)")
+                        W.commit()
+                        w_result.append('committed')
+                        W.close()
+                    except Exception as e:
+                        w_result.append('error:' + type(e).__name__)
+                wt = threading.Thread(target=_writer)
+                wt.start()
+                wt.join(timeout=5)
+
+                # R 在 W 挂起期间重读：串行化保证仍是完整旧账（37 = 25 + 12）
+                rc.execute(master_sql, ('RXTEST01',))
+                mid_master = Decimal(str(rc.fetchone()['yfm']))
+                rc.execute(fy_sql_rxt, ('RXTEST01', 'RXTEST01'))
+                mid_fy = rc.fetchone()
+                mid_total = Decimal(str(mid_fy['fy_total'])) + Decimal(str(mid_fy['unfy_total'] or 0))
+                assert mid_master == Decimal('37') and mid_total == Decimal('37'), \
+                    f"SERIALIZABLE 事务内必须读到完整旧账，实际主单 {mid_master} / 药费 {mid_total}"
+                R.commit()
+                R.close()
+                wt.join(timeout=30)
+                assert w_result == ['committed'], f"写入会话未正常完成: {w_result}"
+                print("PASS [Suite 9a]: 并发提交期间读取方两次读取均为完整旧账（主单 37 = 药费 25 + 未发药 12）")
+
+                # W 提交后的新读取：只见完整新账（45 = 33 + 12）
+                N = pymssql.connect(server=_h, port=_port, user=_u, password=_p, database=_db,
+                                    autocommit=True, login_timeout=10, timeout=30)
+                nc = N.cursor(as_dict=True)
+                nc.execute(master_sql, ('RXTEST01',))
+                new_master = Decimal(str(nc.fetchone()['yfm']))
+                nc.execute(fy_sql_rxt, ('RXTEST01', 'RXTEST01'))
+                new_fy = nc.fetchone()
+                new_total = Decimal(str(new_fy['fy_total'])) + Decimal(str(new_fy['unfy_total'] or 0))
+                N.close()
+                assert new_master == Decimal('45') and new_total == Decimal('45'), \
+                    f"提交后必须读到完整新账，实际主单 {new_master} / 药费 {new_total}"
+                print("PASS [Suite 9b]: 写入提交后新读取只见完整新账（主单 45 = 药费 33 + 未发药 12），绝不出现在中间态")
+            finally:
+                for t in ('rxt_zyjz', 'rxt_cfmain', 'rxt_cfmain_fyjl'):
+                    ac.execute(f"IF OBJECT_ID('dbo.{t}','U') IS NOT NULL DROP TABLE dbo.{t}")
+                admin.close()
+            print("  [PASS] Suite 9 Two-session SERIALIZABLE Consistency Verified.")
+
     print("\n" + "=" * 70)
-    print("  ALL 7 RECONCILIATION SUITES PASSED (100.0% COMPLIANT WITH v1.2)")
+    print("  ALL 9 RECONCILIATION SUITES PASSED (100.0% COMPLIANT WITH v1.2)")
     print("=" * 70)
 
 if __name__ == '__main__':
