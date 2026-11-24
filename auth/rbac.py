@@ -34,14 +34,15 @@ from db.local_db import get_local_db_connection, record_audit_log
 
 PBKDF2_ITERATIONS = 200_000  # 口令哈希迭代次数
 
-ROLE_DOCTOR = "DOCTOR"                  # 医生：DIP 规则查询、患者判灯核查
-ROLE_INSURANCE = "INSURANCE_OFFICER"    # 医保办：DIP 查询、判灯核查、在院预警看板
+ROLE_DOCTOR = "DOCTOR"                  # 医生：DIP 规则查询、本人管床患者判灯核查
+ROLE_DEPT_HEAD = "DEPT_HEAD"            # 科室主任：DIP 查询、本科室患者判灯核查、本科室预警看板
+ROLE_INSURANCE = "INSURANCE_OFFICER"    # 医保办：DIP 查询、全院判灯核查、在院预警看板
 ROLE_ADMIN = "ADMIN"                    # 管理员：全部权限 + 账号管理
-ALL_ROLES = (ROLE_DOCTOR, ROLE_INSURANCE, ROLE_ADMIN)
+ALL_ROLES = (ROLE_DOCTOR, ROLE_DEPT_HEAD, ROLE_INSURANCE, ROLE_ADMIN)
 
 # 接口级角色矩阵
-PATIENT_QUERY_ROLES = (ROLE_DOCTOR, ROLE_INSURANCE, ROLE_ADMIN)  # 患者判灯核查：全体在岗角色
-ALERTS_ROLES = (ROLE_INSURANCE, ROLE_ADMIN)                      # 在院控费预警看板：医保办与管理职责
+PATIENT_QUERY_ROLES = (ROLE_DOCTOR, ROLE_DEPT_HEAD, ROLE_INSURANCE, ROLE_ADMIN)  # 患者判灯核查：全体在岗角色
+ALERTS_ROLES = (ROLE_DEPT_HEAD, ROLE_INSURANCE, ROLE_ADMIN)                      # 在院控费预警看板：科室主任、医保办与管理职责
 
 TOKEN_TTL_MINUTES = int(os.getenv("AUTH_TOKEN_TTL_MINUTES", "720"))  # 令牌有效期，默认 12 小时
 
@@ -155,21 +156,27 @@ def role_permitted(role_type: str, allowed_roles: Tuple[str, ...]) -> bool:
 # ----------------- 数据库：账号表与操作员管理 -----------------
 
 def ensure_auth_schema() -> None:
-    """创建操作员账号表 dbo.sys_operator_account（幂等）"""
+    """创建操作员账号表 dbo.sys_operator_account（幂等，并补齐与 DDL sys_user_role 一致字段）"""
     cursor, conn = get_local_db_connection(as_dict=False)
     try:
         cursor.execute("""
         IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'sys_operator_account' AND schema_id = SCHEMA_ID('dbo'))
         CREATE TABLE dbo.sys_operator_account (
-            operator_id   NVARCHAR(64)  NOT NULL PRIMARY KEY,
-            display_name  NVARCHAR(64)  NOT NULL,
-            password_hash NVARCHAR(256) NOT NULL,
-            role_type     NVARCHAR(30)  NOT NULL,
-            dept_scope    NVARCHAR(300) NOT NULL CONSTRAINT DF_opacct_dept DEFAULT '',
-            status        NVARCHAR(20)  NOT NULL CONSTRAINT DF_opacct_status DEFAULT 'ACTIVE',
-            created_at    DATETIME2     NOT NULL CONSTRAINT DF_opacct_created DEFAULT SYSDATETIME(),
-            updated_at    DATETIME2     NOT NULL CONSTRAINT DF_opacct_updated DEFAULT SYSDATETIME()
-        )
+            operator_id     NVARCHAR(64)  NOT NULL PRIMARY KEY,
+            display_name    NVARCHAR(64)  NOT NULL,
+            password_hash   NVARCHAR(256) NOT NULL,
+            role_type       NVARCHAR(30)  NOT NULL,
+            dept_scope      NVARCHAR(300) NOT NULL CONSTRAINT DF_opacct_dept DEFAULT '',
+            dingtalk_userid NVARCHAR(100) NULL,
+            can_export_case BIT           NOT NULL CONSTRAINT DF_opacct_export DEFAULT 0,
+            status          NVARCHAR(20)  NOT NULL CONSTRAINT DF_opacct_status DEFAULT 'ACTIVE',
+            created_at      DATETIME2     NOT NULL CONSTRAINT DF_opacct_created DEFAULT SYSDATETIME(),
+            updated_at      DATETIME2     NOT NULL CONSTRAINT DF_opacct_updated DEFAULT SYSDATETIME()
+        );
+        IF COL_LENGTH('dbo.sys_operator_account', 'dingtalk_userid') IS NULL
+            ALTER TABLE dbo.sys_operator_account ADD dingtalk_userid NVARCHAR(100) NULL;
+        IF COL_LENGTH('dbo.sys_operator_account', 'can_export_case') IS NULL
+            ALTER TABLE dbo.sys_operator_account ADD can_export_case BIT NOT NULL CONSTRAINT DF_opacct_export DEFAULT 0;
         """)
         conn.commit()
     finally:
@@ -181,7 +188,7 @@ def get_operator(operator_id: str) -> Optional[Dict[str, Any]]:
     cursor, conn = get_local_db_connection(as_dict=True)
     try:
         cursor.execute(
-            "SELECT operator_id, display_name, password_hash, role_type, dept_scope, status "
+            "SELECT operator_id, display_name, password_hash, role_type, dept_scope, dingtalk_userid, can_export_case, status "
             "FROM dbo.sys_operator_account WHERE operator_id = %s",
             (operator_id,)
         )
@@ -195,7 +202,7 @@ def list_operators() -> List[Dict[str, Any]]:
     cursor, conn = get_local_db_connection(as_dict=True)
     try:
         cursor.execute(
-            "SELECT operator_id, display_name, role_type, dept_scope, status, updated_at "
+            "SELECT operator_id, display_name, role_type, dept_scope, dingtalk_userid, can_export_case, status, updated_at "
             "FROM dbo.sys_operator_account ORDER BY operator_id ASC"
         )
         return cursor.fetchall()
@@ -204,7 +211,8 @@ def list_operators() -> List[Dict[str, Any]]:
 
 
 def create_operator(operator_id: str, display_name: str, password: str,
-                    role_type: str, dept_scope: str = "") -> None:
+                    role_type: str, dept_scope: str = "", dingtalk_userid: str = "",
+                    can_export_case: bool = False) -> None:
     """创建或重置操作员账号（口令只存哈希，绝不落明文）"""
     operator_id = (operator_id or "").strip()
     if not operator_id or len(operator_id) > 64:
@@ -219,14 +227,14 @@ def create_operator(operator_id: str, display_name: str, password: str,
         if exists:
             cursor.execute(
                 "UPDATE dbo.sys_operator_account SET display_name=%s, password_hash=%s, role_type=%s, "
-                "dept_scope=%s, status='ACTIVE', updated_at=SYSDATETIME() WHERE operator_id=%s",
-                (display_name, pwd_hash, role_type, dept_scope or "", operator_id)
+                "dept_scope=%s, dingtalk_userid=%s, can_export_case=%s, status='ACTIVE', updated_at=SYSDATETIME() WHERE operator_id=%s",
+                (display_name, pwd_hash, role_type, dept_scope or "", dingtalk_userid or None, 1 if can_export_case else 0, operator_id)
             )
         else:
             cursor.execute(
-                "INSERT INTO dbo.sys_operator_account (operator_id, display_name, password_hash, role_type, dept_scope) "
-                "VALUES (%s, %s, %s, %s, %s)",
-                (operator_id, display_name, pwd_hash, role_type, dept_scope or "")
+                "INSERT INTO dbo.sys_operator_account (operator_id, display_name, password_hash, role_type, dept_scope, dingtalk_userid, can_export_case) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                (operator_id, display_name, pwd_hash, role_type, dept_scope or "", dingtalk_userid or None, 1 if can_export_case else 0)
             )
         conn.commit()
     finally:
@@ -325,6 +333,8 @@ def _cli() -> None:
     p_create.add_argument("--name", required=True, help="姓名/显示名")
     p_create.add_argument("--role", required=True, choices=list(ALL_ROLES), help="角色")
     p_create.add_argument("--dept", default="", help="科室范围")
+    p_create.add_argument("--dingtalk-id", default="", help="钉钉 userid 映射")
+    p_create.add_argument("--can-export", action="store_true", default=False, help="是否允许导出完整病例")
     p_create.add_argument("--password", default=None, help="初始口令（缺省时随机生成并打印一次）")
 
     p_status = sub.add_parser("set-status", help="停用/启用账号")
@@ -341,7 +351,7 @@ def _cli() -> None:
     elif args.cmd == "create-operator":
         ensure_auth_schema()
         password = args.password or secrets.token_urlsafe(12)
-        create_operator(args.id, args.name, password, args.role, args.dept)
+        create_operator(args.id, args.name, password, args.role, args.dept, dingtalk_userid=args.dingtalk_id, can_export_case=args.can_export)
         print(f"OK: 账号 {args.id} ({args.role}) 已创建/重置")
         if args.password is None:
             # 随机口令只在此打印一次，请立即记录并妥善保管

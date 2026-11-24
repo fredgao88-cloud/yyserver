@@ -329,8 +329,8 @@ class HISReader:
                 sy.xm AS patient_name,
                 sy.xb AS gender,
                 sy.years AS age,
-                sy.rykb AS current_dept,
-                sy.rybf AS current_bed,
+                COALESCE(zk_latest.xksname, sy.zkkb, sy.rykb) AS current_dept,
+                COALESCE(zk_latest.xbfname, sy.rybf) AS current_bed,
                 sy.rysj AS admission_time,
                 sy.zyts AS current_stay_days,
                 sy.zyysname AS attending_doctor,
@@ -345,15 +345,65 @@ class HISReader:
             FROM dbo.his_bl_sy sy
             LEFT JOIN dbo.jbxx jb ON sy.lsh = jb.zyh
             LEFT JOIN dbo.his_zyjz jz ON sy.lsh = jz.lsh AND jz.iszf = 0
+            LEFT JOIN (
+                SELECT zk.lsh, ks.ksname AS xksname, bf.bfname AS xbfname,
+                       ROW_NUMBER() OVER(PARTITION BY zk.lsh ORDER BY zk.sqrq DESC) as rn
+                FROM dbo.his_zk zk
+                LEFT JOIN dbo.his_ks ks ON zk.xksid = ks.ksid
+                LEFT JOIN dbo.his_bf bf ON zk.xbfid = bf.bfid
+                WHERE zk.iszk = 1
+            ) zk_latest ON sy.lsh = zk_latest.lsh AND zk_latest.rn = 1
             WHERE sy.cysj IS NULL AND jz.lsh IS NULL
             """
             params = []
             if department:
-                sql += " AND sy.rykb = %s"
-                params.append(department)
+                sql += " AND (COALESCE(zk_latest.xksname, sy.zkkb, sy.rykb) = %s OR COALESCE(zk_latest.xksname, sy.zkkb, sy.rykb) LIKE %s)"
+                params.extend([department, f"%{department}%"])
 
             sql += " ORDER BY sy.rysj DESC"
             cur.execute(sql, tuple(params))
             return cur.fetchall()
+        finally:
+            conn.close()
+
+    def get_patient_realtime_admission(self, lsh: str) -> Optional[Dict[str, Any]]:
+        """
+        实时穿透 HIS 查询患者当前在院信息（管床医生、最新转科换床与科室）。
+        严禁使用 15 分钟快照授权，用于 DOCTOR 角色实时管床鉴权。
+        """
+        conn = self.get_connection()
+        cur = conn.cursor(as_dict=True)
+        try:
+            sql = """
+            SELECT TOP 1
+                sy.lsh AS zyh,
+                sy.xm AS patient_name,
+                sy.xb AS gender,
+                sy.years AS age,
+                COALESCE(zk_latest.xksname, sy.zkkb, sy.rykb) AS current_dept,
+                COALESCE(zk_latest.xbfname, sy.rybf) AS current_bed,
+                sy.rysj AS admission_time,
+                sy.cysj AS discharge_time,
+                sy.zyysname AS attending_doctor,
+                sy.kszrname AS dept_director,
+                sy.ryzdbm AS admission_diag_code,
+                sy.ryzd AS admission_diag_name,
+                sy.ylzffs,
+                jb.fylx AS insurance_type
+            FROM dbo.his_bl_sy sy
+            LEFT JOIN dbo.jbxx jb ON sy.lsh = jb.zyh
+            LEFT JOIN (
+                SELECT zk.lsh, ks.ksname AS xksname, bf.bfname AS xbfname,
+                       ROW_NUMBER() OVER(PARTITION BY zk.lsh ORDER BY zk.sqrq DESC) as rn
+                FROM dbo.his_zk zk
+                LEFT JOIN dbo.his_ks ks ON zk.xksid = ks.ksid
+                LEFT JOIN dbo.his_bf bf ON zk.xbfid = bf.bfid
+                WHERE zk.iszk = 1
+            ) zk_latest ON sy.lsh = zk_latest.lsh AND zk_latest.rn = 1
+            WHERE sy.lsh = %s
+            ORDER BY sy.rysj DESC
+            """
+            cur.execute(sql, (lsh,))
+            return cur.fetchone()
         finally:
             conn.close()

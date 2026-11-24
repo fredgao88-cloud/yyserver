@@ -124,6 +124,35 @@ res_open = post("https://127.0.0.1/api/tools/query_dip_rule", {
 assert res_open["matched"] is True and res_open["benchmark_amount"] == 2790.90
 print("PASS [RBAC 2A-7]: 开放接口无令牌保持可用（匿名身份记审计）")
 
+
+# 2A-3B 医生实时管床越权校验：普通医生访问非本人管床/跨科患者必须 403 并在审计中记录 DENIED
+code_doc2, body_doc2 = post_with_status("https://127.0.0.1/api/auth/login", {"operator_id": "doctor_other", "password": "Doc@Other2026!"})
+assert code_doc2 == 200
+TOKEN_DOC2 = body_doc2["access_token"]
+code_unauth, body_unauth = post_with_status("https://127.0.0.1/api/tools/check_patient_dip", {
+    "patient_id": "zy2025042901", "disease": "M17.9", "current_cost": 2550.00,
+    "age": 68, "ins_type": "职工", "operation": "保守治疗"
+}, token=TOKEN_DOC2)
+assert code_unauth == 403 and "越权访问" in body_unauth.get("detail", "")
+print("PASS [RBAC 2A-3B]: 非本人管床医生访问患者费用被实时阻断 (403)，严禁跨床越权！")
+
+# 2A-5B 预警看板：科室主任角色 (DEPT_HEAD) 访问本科室预警正常 (200)
+code_dh, body_dh = post_with_status("https://127.0.0.1/api/auth/login", {"operator_id": "depthead01", "password": "Head@Yy2026!Test"})
+assert code_dh == 200
+TOKEN_DH = body_dh["access_token"]
+code_dh_alerts, body_dh_alerts = get_with_status("https://127.0.0.1/api/inpatient/alerts", token=TOKEN_DH)
+assert code_dh_alerts == 200 and body_dh_alerts.get("is_demo_baseline") is False
+print("PASS [RBAC 2A-5B]: 科室主任角色成功访问本科室真实在院快照看板 (200)！")
+
+# 2A-8 负费用拦截校验：current_cost < 0 必须拦截待定并标明 NEGATIVE_FEE_UNRECONCILED
+code_neg, body_neg = post_with_status("https://127.0.0.1/api/tools/check_patient_dip", {
+    "patient_id": "zy2025042901", "disease": "M17.9", "current_cost": -120.50,
+    "age": 68, "ins_type": "职工", "operation": "保守治疗"
+}, token=TOKEN)
+assert code_neg == 200 and body_neg.get("status") == "PENDING"
+assert body_neg.get("pending_reason") == "NEGATIVE_FEE_UNRECONCILED"
+assert body_neg.get("evaluation", {}).get("light") == "无"
+print("PASS [P1 负费用拦截 2A-8]: 冲正未闭环负费用成功拦截为 PENDING / NEGATIVE_FEE_UNRECONCILED，杜绝误判绿灯！")
 print("\n=== 3. 结构化规则接口 (68岁职工 M17.9 膝关节病 保守治疗) ===")
 res3 = post("https://127.0.0.1/api/tools/query_dip_rule", {
     "disease": "M17.9",
@@ -196,7 +225,7 @@ res9_resident = post("https://127.0.0.1/api/tools/check_patient_dip", {
     "age": 68,
     "ins_type": "居民医保",
     "operation": "保守治疗"
-}, token=TOKEN)
+}, token=ADMIN_TOKEN)
 res9_city_res = post("https://127.0.0.1/api/tools/check_patient_dip", {
     "patient_id": "zy_synth_res_02",
     "disease": "M17.9",
@@ -204,7 +233,7 @@ res9_city_res = post("https://127.0.0.1/api/tools/check_patient_dip", {
     "age": 68,
     "ins_type": "城镇居民医保",
     "operation": "保守治疗"
-}, token=TOKEN)
+}, token=ADMIN_TOKEN)
 print("居民医保:", res9_resident.get("benchmark_amount"), "Light:", res9_resident.get("evaluation", {}).get("light"))
 print("城镇居民医保:", res9_city_res.get("benchmark_amount"), "Light:", res9_city_res.get("evaluation", {}).get("light"))
 assert res9_resident["benchmark_amount"] == res9_city_res["benchmark_amount"] == 2604.84
@@ -220,7 +249,7 @@ res10_ambig = post("https://127.0.0.1/api/tools/check_patient_dip", {
     "age": 68,
     "ins_type": "城镇",
     "operation": "保守治疗"
-}, token=TOKEN)
+}, token=ADMIN_TOKEN)
 print("AmbigStatus:", res10_ambig.get("status"), "Success:", res10_ambig.get("success"), "Reason:", res10_ambig.get("pending_reason"))
 assert res10_ambig["success"] is False
 assert res10_ambig["status"] == "PENDING"

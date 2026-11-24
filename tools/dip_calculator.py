@@ -538,6 +538,18 @@ def evaluate_traffic_light(
        cost > benchmark * high_threshold -> 红灯
     3. 临界浮动判定（如 110.004% 标注“略高于 110%”，89.99% 标注“略低于 90%”）
     """
+    if current_cost < Decimal("0"):
+        return {
+            "light": "无",
+            "status": "PENDING",
+            "pending_reason": "NEGATIVE_FEE_UNRECONCILED",
+            "message": "当前费用为负数（可能存在冲正退费未闭环或结算重算明细），暂停判灯并进入待定核查",
+            "ratio_percent": None,
+            "boundary_note": None,
+            "lower_bound": None,
+            "upper_bound": None
+        }
+
     if "自费" in ins_type:
         return {
             "light": "无",
@@ -575,8 +587,8 @@ def evaluate_traffic_light(
     if cost_val < lower_limit:
         light = "绿灯"
         status = "费用正常（<90%）"
-        # 临界判定：89.5% <= ratio < 90%
-        if ratio >= Decimal("89.5"):
+        # 临界判定：89.95% <= ratio < 90%
+        if ratio >= Decimal("89.95") or ratio_display == 90.00:
             boundary_note = "略低于 90%"
     elif cost_val <= upper_limit:
         light = "黄灯"
@@ -584,8 +596,8 @@ def evaluate_traffic_light(
     else:
         light = "红灯"
         status = "费用超标（>110%）"
-        # 临界判定：110% < ratio <= 110.5% (例如 110.004%)
-        if ratio <= Decimal("110.5"):
+        # 临界判定：110% < ratio <= 110.05% 或展示四舍五入为 110.00 且原值越界 (如 110.004%)
+        if (ratio <= Decimal("110.05") and cost_val > upper_limit) or (ratio_display == 110.00 and cost_val > upper_limit):
             boundary_note = "略高于 110%"
 
     return {

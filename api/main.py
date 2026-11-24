@@ -21,10 +21,12 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from tools.dip_calculator import match_dip_rule, evaluate_traffic_light
 from agent.llm_router import parse_local_intent
-from db.local_db import record_audit_log
+from db.local_db import record_audit_log, get_local_db_connection
+from db.his_reader import HISReader
 from auth.rbac import (
     authenticate, issue_token, operator_from_optional_token, require_roles,
-    ensure_auth_schema, TOKEN_TTL_MINUTES, PATIENT_QUERY_ROLES, ALERTS_ROLES
+    ensure_auth_schema, TOKEN_TTL_MINUTES, PATIENT_QUERY_ROLES, ALERTS_ROLES,
+    ROLE_DEPT_HEAD, get_operator
 )
 
 app = FastAPI(
@@ -47,7 +49,7 @@ class QueryDipRuleRequest(BaseModel):
 class CheckPatientDipRequest(BaseModel):
     patient_id: Optional[str] = Field(None, description="患者唯一流水号，如 zy2025042901")
     disease: str = Field(..., description="主要诊断编码或名称")
-    current_cost: float = Field(..., description="当前住院累计费用（元）")
+    current_cost: Decimal = Field(..., description="当前住院累计费用（元）")
     age: Optional[int] = Field(None, description="患者周岁年龄")
     ins_type: Optional[str] = Field(None, description="参保类型：职工/居民/自费，缺失时触发待定追问")
     operation: Optional[str] = Field(None, description="已完成手术或操作名称")
@@ -148,6 +150,76 @@ async def check_patient_dip(req: CheckPatientDipRequest, operator: Dict[str, Any
     根据患者累计费用与数据库生效 DIP 规则，执行高精度未舍入 Decimal 交叉相乘判灯分析。
     患者级接口：强制有效令牌 + 角色校验（医生/医保办/管理员），操作人身份只取自令牌。
     """
+    # 实时管床医生权限穿透核验（严禁使用 15 分钟快照授权）
+    if operator.get("role") == "DOCTOR" and req.patient_id:
+        reader = HISReader()
+        adm = reader.get_patient_realtime_admission(req.patient_id)
+        if not adm:
+            record_audit_log(
+                operator_id=operator["sub"],
+                role_type=operator["role"],
+                channel="API",
+                action_type="CHECK_PATIENT_DIP",
+                target_ref=f"PATIENT:{req.patient_id}",
+                auth_result="DENIED"
+            )
+            raise HTTPException(
+                status_code=403,
+                detail=f"越权访问：在 HIS 中未检索到患者 {req.patient_id} 的当前在院记录，管床鉴权未通过"
+            )
+        cur_doc = (adm.get("attending_doctor") or "").strip()
+        cur_dept = (adm.get("current_dept") or "").strip()
+        op_rec = get_operator(operator["sub"])
+        op_name = (op_rec.get("display_name") or operator["sub"]).strip()
+        op_dept = (operator.get("dept") or (op_rec.get("dept_scope") if op_rec else "")).strip()
+
+        is_attending = (operator["sub"] == cur_doc) or (op_name == cur_doc) or (op_name and op_name in cur_doc) or (cur_doc and cur_doc in op_name)
+        dept_match = bool(op_dept and (op_dept in cur_dept or cur_dept in op_dept))
+
+        if not (is_attending or (dept_match and not cur_doc)):
+            record_audit_log(
+                operator_id=operator["sub"],
+                role_type=operator["role"],
+                channel="API",
+                action_type="CHECK_PATIENT_DIP",
+                target_ref=f"PATIENT:{req.patient_id}",
+                auth_result="DENIED"
+            )
+            raise HTTPException(
+                status_code=403,
+                detail=f"越权访问：管床医生仅能查看本人管床患者费用（当前管床医生为 {cur_doc}，科室 {cur_dept}），转科或跨科访问已被拒绝"
+            )
+
+    cost_dec = Decimal(str(req.current_cost))
+
+    # 负费用拦截（未闭环冲正退费明细）
+    if cost_dec < Decimal("0"):
+        record_audit_log(
+            operator_id=operator["sub"],
+            role_type=operator["role"],
+            channel="API",
+            action_type="CHECK_PATIENT_DIP",
+            target_ref=f"PATIENT:{re.sub(r'[^a-zA-Z0-9_-]', '', req.patient_id or '')[:30]}",
+            auth_result="PERMITTED",
+            rule_version=req.rule_version
+        )
+        return {
+            "success": False,
+            "patient_id": req.patient_id,
+            "status": "PENDING",
+            "pending_reason": "NEGATIVE_FEE_UNRECONCILED",
+            "message": "当前费用为负数（可能存在冲正退费未闭环或结算重算明细），暂停判灯并进入待定核查",
+            "current_cost": float(cost_dec),
+            "evaluation": {
+                "light": "无",
+                "status": "PENDING",
+                "pending_reason": "NEGATIVE_FEE_UNRECONCILED",
+                "message": "当前费用为负数（可能存在冲正退费未闭环或结算重算明细），暂停判灯并进入待定核查",
+                "ratio_percent": None,
+                "boundary_note": None
+            }
+        }
+
     rule_res = match_dip_rule(
         disease=req.disease,
         age=req.age,
@@ -175,7 +247,6 @@ async def check_patient_dip(req: CheckPatientDipRequest, operator: Dict[str, Any
     )
     
     status = rule_res.get("status")
-    cost_dec = Decimal(str(req.current_cost))
 
     # 自费患者
     if status == "NOT_APPLICABLE":
@@ -235,6 +306,16 @@ async def check_patient_dip(req: CheckPatientDipRequest, operator: Dict[str, Any
         high_threshold=high_th,
         ins_type=rule_res.get("ins_type") or "职工"
     )
+    if light_eval.get("status") == "PENDING":
+        return {
+            "success": False,
+            "patient_id": req.patient_id,
+            "status": "PENDING",
+            "pending_reason": light_eval.get("pending_reason"),
+            "message": light_eval.get("message"),
+            "current_cost": float(cost_dec),
+            "evaluation": light_eval
+        }
     
     return {
         "success": True,
@@ -255,43 +336,108 @@ async def check_patient_dip(req: CheckPatientDipRequest, operator: Dict[str, Any
 async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="科室筛选，如 中医科"),
                                operator: Dict[str, Any] = Depends(require_roles(*ALERTS_ROLES))):
     """
-    获取当前住院患者红黄绿灯控费预警清单（一期演示基线数据，第二步历史回放后接入实时快照）。
-    患者级接口：强制有效令牌，仅医保办与管理员角色可访问。
+    获取当前住院患者红黄绿灯控费预警清单（穿透读取 dbo.inpatient_dip_snapshot 最新批次）。
+    患者级接口：强制有效令牌，仅科室主任、医保办与管理员角色可访问。
+    支持按角色实施科室范围 (dept_scope) 行级数据隔离及快照过期检测。
     """
-    sample_alerts = [
-        {
-            "zyh": "zy2025042901",
-            "name": "马**",
-            "dept": "中医科",
-            "disease": "膝关节病 (M17.9)",
-            "ins_type": "城镇职工",
-            "current_cost": 2150.00,
-            "benchmark": 2790.90,
-            "light": "绿灯",
-            "status": "费用正常（<90%）",
-            "ratio_percent": 77.04
-        },
-        {
-            "zyh": "zy2025042902",
-            "name": "郭**",
-            "dept": "中医科",
-            "disease": "头痛 (R51.x)",
-            "ins_type": "城乡居民",
-            "current_cost": 1820.00,
-            "benchmark": 1745.10,
-            "light": "黄灯",
-            "status": "预警观察（90%~110%）",
-            "ratio_percent": 104.29
+    from datetime import datetime, timedelta
+    role = operator.get("role")
+    op_info = get_operator(operator["sub"])
+    user_dept = operator.get("dept") or (op_info.get("dept_scope") if op_info else "")
+
+    # 行级权限过滤：科室主任仅允许查看本科室数据
+    effective_dept = dept
+    if role == ROLE_DEPT_HEAD:
+        if not user_dept:
+            raise HTTPException(status_code=403, detail="科室主任账号未配置科室范围 (dept_scope)，无法访问预警看板")
+        effective_dept = user_dept
+
+    cursor, conn = get_local_db_connection(as_dict=True)
+    try:
+        cursor.execute("""
+        SELECT TOP 1 batch_id, data_cutoff_time, synced_at
+        FROM dbo.inpatient_dip_snapshot
+        ORDER BY synced_at DESC
+        """)
+        latest_batch = cursor.fetchone()
+
+        if not latest_batch:
+            return {
+                "is_demo_baseline": False,
+                "total": 0,
+                "batch_id": None,
+                "batch_time": None,
+                "is_stale": True,
+                "stale_warning": "系统尚未生成任何在院快照批次，请先触发在院扫描任务",
+                "items": []
+            }
+
+        batch_id = latest_batch["batch_id"]
+        cutoff_time = latest_batch["data_cutoff_time"]
+        synced_at = latest_batch["synced_at"]
+
+        now_dt = datetime.now()
+        is_stale = False
+        stale_warning = None
+        if synced_at and (now_dt - synced_at) > timedelta(hours=24):
+            is_stale = True
+            stale_warning = f"快照数据生成于 {synced_at.strftime('%Y-%m-%d %H:%M:%S')}，已超过 24 小时未更新，请及时运行定时巡检任务"
+
+        sql = """
+        SELECT visit_id, ward_name, bed_no, dept_name, doctor_id, age,
+               ins_type, primary_icd, matched_rule_id, current_fee, target_base,
+               fee_ratio, alert_level, pending_reason, data_cutoff_time
+        FROM dbo.inpatient_dip_snapshot
+        WHERE batch_id = %s
+        """
+        params = [batch_id]
+        if effective_dept:
+            sql += " AND (dept_name = %s OR dept_name LIKE %s)"
+            params.extend([effective_dept, f"%{effective_dept}%"])
+        sql += " ORDER BY alert_level ASC, current_fee DESC"
+
+        cursor.execute(sql, tuple(params))
+        rows = cursor.fetchall()
+
+        items = []
+        for r in rows:
+            level = r["alert_level"]
+            light_map = {"GREEN": "绿灯", "YELLOW": "黄灯", "RED": "红灯", "PENDING": "待定"}
+            status_desc_map = {
+                "GREEN": "费用正常（<90%）",
+                "YELLOW": "预警观察（90%~110%）",
+                "RED": "费用超标（>110%）",
+                "PENDING": f"待定核查（{r.get('pending_reason') or '信息待补充'}）"
+            }
+            ratio = float(r["fee_ratio"] * Decimal("100")) if r["fee_ratio"] is not None else None
+            items.append({
+                "zyh": r["visit_id"],
+                "dept": r["dept_name"],
+                "ward": r["ward_name"],
+                "bed": r["bed_no"],
+                "doctor_id": r["doctor_id"],
+                "disease": r["primary_icd"] or "未明确",
+                "ins_type": r["ins_type"],
+                "current_cost": float(r["current_fee"]),
+                "benchmark": float(r["target_base"]) if r["target_base"] is not None else None,
+                "light": light_map.get(level, level),
+                "alert_level": level,
+                "status": status_desc_map.get(level, level),
+                "pending_reason": r.get("pending_reason"),
+                "ratio_percent": round(ratio, 2) if ratio is not None else None
+            })
+
+        return {
+            "is_demo_baseline": False,
+            "total": len(items),
+            "batch_id": batch_id,
+            "batch_time": cutoff_time.strftime("%Y-%m-%d %H:%M:%S") if cutoff_time else None,
+            "is_stale": is_stale,
+            "stale_warning": stale_warning,
+            "items": items
         }
-    ]
-    if dept:
-        sample_alerts = [a for a in sample_alerts if dept in a["dept"]]
-    return {
-        "is_demo_baseline": True,
-        "total": len(sample_alerts),
-        "batch_time": "2026-11-22 09:30:00",
-        "items": sample_alerts
-    }
+    finally:
+        conn.close()
 
 @app.post("/api/chat", summary="院内本地自然语言意图分类与规则问答接口")
 async def chat_interaction(req: ChatRequest, authorization: Optional[str] = Header(None)):

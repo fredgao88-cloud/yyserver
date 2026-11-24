@@ -101,7 +101,7 @@ BEGIN
 END
 GO
 
--- 4. 用户权限与身份映射表
+-- 4. 用户权限与身份映射表（统一服务端 RBAC 鉴权与钉钉映射）
 IF OBJECT_ID(N'dbo.sys_user_role', N'U') IS NULL
 BEGIN
     CREATE TABLE dbo.sys_user_role (
@@ -111,6 +111,23 @@ BEGIN
         dept_scope      NVARCHAR(300)  NOT NULL DEFAULT N'',
         can_export_case BIT            NOT NULL DEFAULT 0,
         status          NVARCHAR(20)   NOT NULL DEFAULT N'ACTIVE',
+        updated_at      DATETIME2      NOT NULL DEFAULT SYSDATETIME()
+    );
+END
+GO
+
+IF OBJECT_ID(N'dbo.sys_operator_account', N'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.sys_operator_account (
+        operator_id     NVARCHAR(64)   PRIMARY KEY,
+        display_name    NVARCHAR(64)   NOT NULL,
+        password_hash   NVARCHAR(256)  NOT NULL,
+        role_type       NVARCHAR(30)   NOT NULL,
+        dept_scope      NVARCHAR(300)  NOT NULL DEFAULT N'',
+        dingtalk_userid NVARCHAR(100)  NULL,
+        can_export_case BIT            NOT NULL DEFAULT 0,
+        status          NVARCHAR(20)   NOT NULL DEFAULT N'ACTIVE',
+        created_at      DATETIME2      NOT NULL DEFAULT SYSDATETIME(),
         updated_at      DATETIME2      NOT NULL DEFAULT SYSDATETIME()
     );
 END

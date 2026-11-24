@@ -53,6 +53,13 @@ def run_tests():
     assert res5["boundary_note"] is None, f"Expected None, got {res5['boundary_note']}"
     print(f"PASS: 1250.00 / 1000.00 -> {res5['light']}, 提示: {res5['boundary_note']}, 比率: {res5['ratio_percent']}%")
 
+    # 负费用拦截测试 (NEGATIVE_FEE_UNRECONCILED，严禁误判为绿灯)
+    res_neg = evaluate_traffic_light(Decimal("-150.00"), bm)
+    assert res_neg["status"] == "PENDING"
+    assert res_neg["pending_reason"] == "NEGATIVE_FEE_UNRECONCILED"
+    assert res_neg["light"] == "无"
+    print("PASS: 负费用 -150.00 -> 拦截待定 PENDING / NEGATIVE_FEE_UNRECONCILED (杜绝误判绿灯)")
+
     # 2. 测试自费拦截
     print("\n--- [Test 2] 自费患者拦截测试 (NOT_APPLICABLE) ---")
     res_self = evaluate_traffic_light(Decimal("3000.00"), bm, ins_type="自费")

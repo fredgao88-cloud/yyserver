@@ -19,6 +19,7 @@ os.environ.setdefault("AUTH_TOKEN_TTL_MINUTES", "720")
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from auth.rbac import (
+    ROLE_DEPT_HEAD,
     hash_password, verify_password, issue_token, verify_token,
     extract_bearer_token, role_permitted,
     ROLE_DOCTOR, ROLE_INSURANCE, ROLE_ADMIN, ALL_ROLES,
@@ -98,11 +99,13 @@ def run_auth_tests():
     assert extract_bearer_token("") is None
     print("PASS [Auth 6]: Authorization 头 Bearer 提取边界全部正确")
 
-    # 7. 角色矩阵：患者判灯全体在岗角色可访问；预警看板仅医保办/管理员
+    # 7. 角色矩阵：患者判灯全体在岗角色可访问；预警看板允许科室主任/医保办/管理员
     assert role_permitted(ROLE_DOCTOR, PATIENT_QUERY_ROLES) is True
+    assert role_permitted(ROLE_DEPT_HEAD, PATIENT_QUERY_ROLES) is True
     assert role_permitted(ROLE_INSURANCE, PATIENT_QUERY_ROLES) is True
     assert role_permitted(ROLE_ADMIN, PATIENT_QUERY_ROLES) is True
     assert role_permitted(ROLE_DOCTOR, ALERTS_ROLES) is False
+    assert role_permitted(ROLE_DEPT_HEAD, ALERTS_ROLES) is True
     assert role_permitted(ROLE_INSURANCE, ALERTS_ROLES) is True
     assert role_permitted(ROLE_ADMIN, ALERTS_ROLES) is True
     assert role_permitted("ROOT", PATIENT_QUERY_ROLES) is False
