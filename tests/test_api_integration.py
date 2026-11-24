@@ -15,6 +15,14 @@ TEST_OPERATOR_ID = os.environ.get("TEST_OPERATOR_ID", "doctor01")
 TEST_OPERATOR_PASS = os.environ.get("TEST_OPERATOR_PASS", "")
 TEST_ADMIN_ID = os.environ.get("TEST_ADMIN_ID", "admin")
 TEST_ADMIN_PASS = os.environ.get("TEST_ADMIN_PASS", "")
+if (not TEST_OPERATOR_PASS or not TEST_ADMIN_PASS) and os.path.exists(".env"):
+    with open(".env", "r", encoding="utf-8") as _ef:
+        for _line in _ef:
+            _line = _line.strip()
+            if _line.startswith("TEST_OPERATOR_PASS="):
+                TEST_OPERATOR_PASS = TEST_OPERATOR_PASS or _line.split("=", 1)[1]
+            elif _line.startswith("TEST_ADMIN_PASS="):
+                TEST_ADMIN_PASS = TEST_ADMIN_PASS or _line.split("=", 1)[1]
 
 def post(url, payload, token=None):
     headers = {"Content-Type": "application/json"}
