@@ -198,8 +198,27 @@ def run_auth_tests():
     finally:
         rbac_mod.get_operator = orig_get_op10
 
+    # 11. AUTH-SCOPE-002 科室 ID 严格解析与同名歧义拒绝（离线模拟 his_ks）
+    sample_ks = [
+        {"ksid": 4, "ksname": "01中医科"},
+        {"ksid": 10, "ksname": "02内科"},
+        {"ksid": 11, "ksname": "03内科"},
+        {"ksid": 20, "ksname": "综合病房"},
+        {"ksid": 21, "ksname": "综合病房"},
+    ]
+    # 11a. 唯一名称/去数字前缀名称只解析为精确 ID 集合，绝不混入名称字符串
+    res_unique = rbac_mod.resolve_authorized_dept_ids("中医科", his_ks_rows=sample_ks)
+    assert res_unique == {"4"}, f"期望仅返回 {{'4'}}，实际 {res_unique}"
+    # 11b. 同名不同 ID（综合病房 -> 20, 21）存在歧义，拒绝名称映射，返回空集
+    res_ambig = rbac_mod.resolve_authorized_dept_ids("综合病房", his_ks_rows=sample_ks)
+    assert res_ambig == set(), f"同名不同 ID 应拒绝映射返回空集，实际 {res_ambig}"
+    # 11c. 直接传入精确 ID（20）可唯一命中
+    res_exact_id = rbac_mod.resolve_authorized_dept_ids("20", his_ks_rows=sample_ks)
+    assert res_exact_id == {"20"}, f"直接传 ID 20 应返回 {{'20'}}，实际 {res_exact_id}"
+    print("PASS [Auth 11]: AUTH-SCOPE-002 仅用可信科室 ID 裁决及同名歧义拒绝验证通过")
+
     print("\n" + "=" * 70)
-    print(">>> 恭喜！auth/rbac.py 全部 10 组离线单元测试 100% 通过！ <<<")
+    print(">>> 恭喜！auth/rbac.py 全部 11 组离线单元测试 100% 通过！ <<<")
     print("=" * 70)
 
 

@@ -326,37 +326,66 @@ def authenticate(operator_id: str, password: str) -> Tuple[Optional[Dict[str, An
 
 
 
-def get_authorized_dept_ids(dept_scope: str) -> Set[str]:
+def resolve_authorized_dept_ids(dept_scope: str, his_ks_rows: Optional[List[Dict[str, Any]]] = None) -> Set[str]:
     """
-    根据操作员配置的科室范围 (dept_scope)，精确解析授权科室 ID 与名称集合。
-    支持以逗号分隔的科室编号或名称，并查询 his_ks 进行精准 ID 映射，绝不使用模糊子串匹配。
+    AUTH-SCOPE-002：严格解析授权科室 ID 集合，仅返回可信的科室 ID（ksid），绝不混入科室名称。
+    若 dept_scope 中包含名称且在 his_ks 中对应多个不同 ID（同名歧义），拒绝该名称映射。
     """
     if not dept_scope:
         return set()
     raw_items = [x.strip() for x in re.split(r'[,;，；]', str(dept_scope)) if x.strip()]
-    dept_ids = set(raw_items)
-    try:
-        from db.his_reader import HISReader
-        r = HISReader()
-        conn = r.get_connection()
-        cur = conn.cursor(as_dict=True)
+    if not raw_items:
+        return set()
+
+    rows = his_ks_rows
+    if rows is None:
         try:
-            cur.execute("SELECT ksid, ksname FROM dbo.his_ks WHERE ksid IS NOT NULL")
-            for row in cur.fetchall():
-                ks_id_str = str(row["ksid"]).strip()
-                ks_name = (row["ksname"] or "").strip()
-                ks_name_clean = re.sub(r'^\d+', '', ks_name).strip()
-                if ks_id_str in raw_items or ks_name in raw_items or (ks_name_clean and ks_name_clean in raw_items):
-                    dept_ids.add(ks_id_str)
-                    if ks_name:
-                        dept_ids.add(ks_name)
-                    if ks_name_clean:
-                        dept_ids.add(ks_name_clean)
-        finally:
-            conn.close()
-    except Exception:
-        pass
+            from db.his_reader import HISReader
+            r = HISReader()
+            conn = r.get_connection()
+            cur = conn.cursor(as_dict=True)
+            try:
+                cur.execute("SELECT ksid, ksname FROM dbo.his_ks WHERE ksid IS NOT NULL")
+                rows = cur.fetchall()
+            finally:
+                conn.close()
+        except Exception:
+            rows = None
+
+    if rows is None:
+        return {x for x in raw_items if x.isdigit()}
+
+    id_set = set()
+    name_to_ids: Dict[str, set] = {}
+    clean_name_to_ids: Dict[str, set] = {}
+    for row in rows:
+        ks_id_str = str(row.get("ksid") if row.get("ksid") is not None else "").strip()
+        if not ks_id_str:
+            continue
+        id_set.add(ks_id_str)
+        ks_name = (row.get("ksname") or "").strip()
+        if ks_name:
+            name_to_ids.setdefault(ks_name, set()).add(ks_id_str)
+            ks_clean = re.sub(r'^\d+', '', ks_name).strip()
+            if ks_clean:
+                clean_name_to_ids.setdefault(ks_clean, set()).add(ks_id_str)
+
+    dept_ids = set()
+    for item in raw_items:
+        if item in id_set:
+            dept_ids.add(item)
+        elif item in name_to_ids:
+            if len(name_to_ids[item]) == 1:
+                dept_ids.update(name_to_ids[item])
+        elif item in clean_name_to_ids:
+            if len(clean_name_to_ids[item]) == 1:
+                dept_ids.update(clean_name_to_ids[item])
     return dept_ids
+
+
+def get_authorized_dept_ids(dept_scope: str) -> Set[str]:
+    """根据操作员配置的科室范围 (dept_scope)，严格解析授权科室 ID 集合。"""
+    return resolve_authorized_dept_ids(dept_scope)
 
 def require_roles(*allowed_roles: str):
     """患者级/受保护接口依赖：强制有效令牌 + 角色矩阵校验，拒绝即写审计日志"""

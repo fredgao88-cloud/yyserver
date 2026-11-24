@@ -173,13 +173,14 @@ async def check_patient_dip(req: CheckPatientDipRequest, operator: Dict[str, Any
         if role == ROLE_DOCTOR:
             cur_doc_id = (adm.get("attending_doctor_id") or "").strip()
             op_rec = get_operator(operator["sub"]) or {}
-            valid_doc_ids = {
-                operator["sub"].strip(),
-                (op_rec.get("operator_id") or "").strip(),
-                (op_rec.get("doctor_id") or "").strip(),
-                (operator.get("doctor_id") or "").strip()
-            }
-            valid_doc_ids.discard("")
+            mapped_doc_id = (op_rec.get("doctor_id") or "").strip()
+            if mapped_doc_id:
+                # 存在显式 HIS 工号映射时，仅采信当前有效映射的 HIS 工号，严禁同时放行登录名以防工号碰撞越权
+                valid_doc_ids = {mapped_doc_id}
+            else:
+                # 旧账号未配置显式映射时兼容使用操作员登录工号
+                fallback_id = (op_rec.get("operator_id") or operator["sub"] or "").strip()
+                valid_doc_ids = {fallback_id} if fallback_id else set()
             # 严格使用唯一工号和有效在院关系精确授权，关系缺失时拒绝；严禁根据科室放行，对外统一拒绝信息
             is_attending = bool(cur_doc_id and cur_doc_id in valid_doc_ids)
             if not is_attending:
@@ -198,12 +199,9 @@ async def check_patient_dip(req: CheckPatientDipRequest, operator: Dict[str, Any
 
         elif role == ROLE_DEPT_HEAD:
             cur_dept_id = str(adm.get("current_dept_id") or "").strip()
-            cur_dept_name = str(adm.get("current_dept") or "").strip()
             auth_dept_ids = get_authorized_dept_ids(operator.get("dept") or "")
-            is_authorized_dept = bool(
-                (cur_dept_id and cur_dept_id in auth_dept_ids) or
-                (cur_dept_name and cur_dept_name in auth_dept_ids)
-            )
+            # AUTH-SCOPE-002：仅用可信科室 ID 裁决，缺少科室 ID 或映射不明确一律拒绝
+            is_authorized_dept = bool(cur_dept_id and cur_dept_id in auth_dept_ids)
             if not is_authorized_dept:
                 record_audit_log(
                     operator_id=operator["sub"],
@@ -422,11 +420,11 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
         if role == ROLE_DEPT_HEAD:
             auth_dept_ids = get_authorized_dept_ids(user_dept)
             if not auth_dept_ids:
-                raise HTTPException(status_code=403, detail="科室主任账号未配置科室范围 (dept_scope)，无法访问预警看板")
-            dept_list = list(auth_dept_ids)
+                raise HTTPException(status_code=403, detail="科室主任账号未配置有效科室 ID 或存在同名歧义，无法访问预警看板")
+            dept_list = sorted(auth_dept_ids)
             placeholders = ', '.join(['%s'] * len(dept_list))
-            sql += f" AND (dept_id IN ({placeholders}) OR dept_name IN ({placeholders}))"
-            params.extend(dept_list)
+            # AUTH-SCOPE-002 & SNAP-QUERY-001：严格按可信 dept_id 过滤，缺失 dept_id 的历史行对科主任不可见
+            sql += f" AND dept_id IN ({placeholders})"
             params.extend(dept_list)
         elif dept:
             sql += " AND (dept_id = %s OR dept_name = %s)"
@@ -449,6 +447,8 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
             ratio = float(r["fee_ratio"] * Decimal("100")) if r["fee_ratio"] is not None else None
             items.append({
                 "zyh": r["visit_id"],
+                "dept_id": r.get("dept_id"),
+                "dept_name": r["dept_name"],
                 "dept": r["dept_name"],
                 "ward": r["ward_name"],
                 "bed": r["bed_no"],

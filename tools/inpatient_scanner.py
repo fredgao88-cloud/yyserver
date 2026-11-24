@@ -145,9 +145,7 @@ class InpatientScanner:
                 ward_name = pat.get('current_dept') or '默认病区'
                 bed_no = str(pat.get('current_bed') or '-')
                 dept_name = pat.get('current_dept') or '默认科室'
-                dept_id = str(pat.get('current_dept_id') or pat.get('dept_id') or '')
-                if not dept_id and dept_name == '01中医科':
-                    dept_id = '4'
+                dept_id = str(pat.get('current_dept_id') or pat.get('dept_id') or '').strip() or None
                 doctor_id = str(pat.get('attending_doctor_id') or pat.get('attending_doctor') or 'UNKNOWN')
                 age = self.parse_age(pat.get('age'))
                 ins_type = self.map_insurance_type(pat.get('ylzffs'), pat.get('insurance_type'))

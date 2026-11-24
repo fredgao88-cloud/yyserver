@@ -233,13 +233,19 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
     # 5. 阶段后缀（“通过初审”“通过预审”等）
     _premise_stage_suffix = re.compile(r'(?:初审|预审|初核|预核|一审)')
 
+    # 无关业务事项前缀（DIP-INS-001 变体九）：排班/费用/采购等其他业务审批/审核不得解除医保险种更正前提
+    _unrelated_topic_prefixes = re.compile(
+        r'(?:排班|费用|采购|人事|考勤|请假|预算|设备|物资|合同|科研|教学|出差|值班|调休|加班|绩效|身份核验|报销)(?:的)?$'
+    )
+
     def _premise_core_confirmed(core_text, clause_text):
-        """跨分句前提解除判据（DIP-INS-001 变体三/四/五/六/七/八）：
-        1) 事项话题重叠：核心内容先剥除结果词再做二字片段比对——
-           “身份核验通过”不含“审批/审/批”，不放行（变体五）；
-        2) 全局否决与冲突判定：整句含“终审未通过”“未予通过”“被否决”等任何否定审批结果的，绝不放行（变体八）；
-        3) 全局撤回与辟谣判定：整句含“消息有误”“消息不实”“已被撤回”等撤销消息的，绝不放行（变体八）；
-        4) 全局阶段性未决判定：含“仍待终审/尚无结论”，或仅有“初审通过/通过初审”而无终审结果的，绝不放行（变体八）；
+        """跨分句前提解除判据（DIP-INS-001 变体三/四/五/六/七/八/九）：
+        1) 事项话题严格绑定：核心内容先剥除结果词做完整/二字片段匹配（绝不做单字匹配），
+           且话题前不得带有“排班/费用/采购/人事”等无关业务前缀；
+           仅当核心为“审批”时允许“终审通过/已通过终审”精确语义作为最终审批对照；
+        2) 全局否决与冲突判定：整句含“终审未通过”“未予通过”“被否决”等任何否定审批结果的，绝不放行；
+        3) 全局撤回与辟谣判定：整句含“消息有误”“消息不实”“已被撤回”等撤销消息的，绝不放行；
+        4) 全局阶段性未决判定：含“仍待终审/尚无结论”，或仅有“初审通过/通过初审”而无终审结果的，绝不放行；
         5) 结果词肯定同现：前提中的结果词（如“通过”）须在确认分句以肯定形式出现，
            且前后无否定词、阶段词、辟谣词修饰；
         6) 肯定对照放行：“审批通过”“终审通过”“已确认审批通过”等无冲突明确结果正常放行。"""
@@ -250,9 +256,20 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
             topic_core = topic_core.replace(w, '')
         topic_core = topic_core.strip()
         if topic_core:
-            topic_hit = (topic_core in clause_text) or any(
-                topic_core[i:i + 2] in clause_text for i in range(len(topic_core) - 1)
-            ) or any(ch in clause_text for ch in topic_core if ch in '审评批核准')
+            topic_tokens = [topic_core] if len(topic_core) <= 2 else [
+                topic_core[i:i + 2] for i in range(len(topic_core) - 1)
+            ]
+            topic_hit = False
+            for tok in topic_tokens:
+                for tm in re.finditer(re.escape(tok), clause_text):
+                    if not _unrelated_topic_prefixes.search(clause_text[:tm.start()]):
+                        topic_hit = True
+                        break
+                if topic_hit:
+                    break
+            if not topic_hit and topic_core == "审批" and ("终审通过" in clause_text or "已通过终审" in clause_text):
+                if not _unrelated_topic_prefixes.search(clause_text.split("终审")[0]):
+                    topic_hit = True
         else:
             topic_hit = core_text in clause_text  # 前提只剩结果词时从严整体匹配
         if not topic_hit:

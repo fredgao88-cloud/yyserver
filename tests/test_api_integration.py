@@ -228,10 +228,10 @@ code_dh_diff, body_dh_diff = post_with_status("https://127.0.0.1/api/tools/check
 }, token=TOKEN_DH)
 assert code_dh_diff == 403 and "越权访问" in body_dh_diff.get("detail", "")
 
-# 入口 2: alerts 预警看板按科室 ID 精确过滤（严禁混入 中医康复科 id=16）
+# 入口 2: alerts 预警看板按科室 ID 精确过滤（严禁混入缺 dept_id 或其他科室）
 for itm in body_dh_alerts.get("items", []):
-    assert itm.get("dept_id") in ("4", None) or "中医科" in itm.get("dept_name", "")
-    assert "中医康复科" not in itm.get("dept_name", "")
+    assert itm.get("dept_id") == "4", f"科主任看板出现非授权 dept_id: {itm}"
+    assert "中医康复科" not in (itm.get("dept_name") or itm.get("dept") or "")
 print("PASS [AUTH-SCOPE-002]: 科主任判灯跨科室阻断(403)与看板精确科室ID过滤全部通过！")
 
 # 2A-8 负费用拦截校验：current_cost < 0 必须拦截待定并标明 NEGATIVE_FEE_UNRECONCILED
