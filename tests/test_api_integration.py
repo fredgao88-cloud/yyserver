@@ -16,9 +16,14 @@ if not (API_TEST_ISOLATED and API_TEST_BASE_URL and API_TEST_CONTAINER):
     print("[SKIP] TEST-ISO-001: 未配置专用隔离测试实例 (API_TEST_ISOLATED=1 / API_TEST_BASE_URL / API_TEST_CONTAINER)，跳过集成测试并保证零外部调用与零写入")
     sys.exit(0)
 
-ctx = ssl.create_default_context()
-ctx.check_hostname = False
-ctx.verify_mode = ssl.CERT_NONE
+if not API_TEST_BASE_URL.startswith("https://"):
+    print("FATAL: TEST-ISO-001 要求测试目标必须为 https://，拒绝向明文地址发送凭据")
+    sys.exit(2)
+
+API_TEST_CA_FILE = (os.environ.get("API_TEST_CA_FILE") or "").strip()
+ctx = ssl.create_default_context(cafile=API_TEST_CA_FILE) if API_TEST_CA_FILE else ssl.create_default_context()
+ctx.check_hostname = True
+ctx.verify_mode = ssl.CERT_REQUIRED
 
 # 受保护接口测试用账号（口令只从环境变量/.env 读取，绝不入库入仓）
 # TEST-CRED-001：使用标准 dotenv 解析器，四个字段（两个工号 + 两个口令）均支持
@@ -105,13 +110,15 @@ def get_with_status(url, token=None):
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read().decode("utf-8"))
 
-print("=== 1. Direct Health Check (HTTP 8000, 仅宿主机回环绑定) ===")
-with urllib.request.urlopen("http://127.0.0.1:8000/health") as resp:
-    res1 = json.loads(resp.read().decode("utf-8"))
-    print(res1)
-    assert res1["status"] == "ok"
+API_TEST_DIRECT_URL = (os.environ.get("API_TEST_DIRECT_URL") or "").strip().rstrip("/")
+if API_TEST_DIRECT_URL:
+    print("=== 1. Direct Health Check (显式配置测试地址) ===")
+    with urllib.request.urlopen(f"{API_TEST_DIRECT_URL}/health", context=ctx) as resp:
+        res1 = json.loads(resp.read().decode("utf-8"))
+        print(res1)
+        assert res1["status"] == "ok"
 
-print("\n=== 2. Nginx HTTPS Health Check (HTTPS 443) ===")
+print("\n=== 2. HTTPS Health Check (显式测试目标 + CA 校验) ===")
 with urllib.request.urlopen(f"{API_TEST_BASE_URL}/health", context=ctx) as resp:
     res2 = json.loads(resp.read().decode("utf-8"))
     print(res2)

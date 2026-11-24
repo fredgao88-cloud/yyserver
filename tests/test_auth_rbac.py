@@ -14,6 +14,7 @@ import time
 
 # 必须先于 auth.rbac 导入设置测试密钥
 os.environ["AUTH_SECRET"] = "unit-test-only-secret-do-not-use-in-prod"
+os.environ.setdefault("HIS_PASS", "offline-synthetic-his-pass")
 os.environ.setdefault("AUTH_TOKEN_TTL_MINUTES", "720")
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -215,9 +216,12 @@ def run_auth_tests():
     # 11c. 直接传入精确 ID（20）可唯一命中
     res_exact_id = rbac_mod.resolve_authorized_dept_ids("20", his_ks_rows=sample_ks)
     assert res_exact_id == {"20"}, f"直接传 ID 20 应返回 {{'20'}}，实际 {res_exact_id}"
-    # 11d. 空目录与目录故障（None）均严格拒绝返回空集，绝不扩大范围
+    # 11d. 空目录与目录故障（HISReader 抛异常）均严格拒绝返回空集，绝不扩大范围且零真实连接
     assert rbac_mod.resolve_authorized_dept_ids("99", his_ks_rows=[]) == set()
-    assert rbac_mod.resolve_authorized_dept_ids("99", his_ks_rows=None) == set()
+    from unittest.mock import patch
+    import db.his_reader as his_mod
+    with patch.object(his_mod, "HISReader", side_effect=RuntimeError("simulated directory outage")):
+        assert rbac_mod.resolve_authorized_dept_ids("99") == set()
     print("PASS [Auth 11]: AUTH-SCOPE-002 仅用可信科室 ID 裁决、同名歧义拒绝及目录故障拒绝验证通过")
 
     print("\n" + "=" * 70)
@@ -226,4 +230,16 @@ def run_auth_tests():
 
 
 if __name__ == "__main__":
-    run_auth_tests()
+    import socket
+    from unittest.mock import patch
+    import auth.rbac as rbac_mod
+    import db.local_db as local_db_mod
+    import db.his_reader as his_mod
+    conn_calls = []
+    def _forbid_io(*args, **kwargs):
+        conn_calls.append((args, kwargs))
+        raise AssertionError("TEST-OFFLINE-001 违规：离线测试严禁发起数据库或网络连接！")
+    with patch.object(local_db_mod, "get_local_db_connection", side_effect=_forbid_io),          patch.object(rbac_mod, "get_local_db_connection", side_effect=_forbid_io),          patch.object(his_mod.HISReader, "get_connection", side_effect=_forbid_io),          patch.object(socket, "create_connection", side_effect=_forbid_io):
+        run_auth_tests()
+    assert len(conn_calls) == 0, f"期望零连接尝试，实际 {len(conn_calls)}"
+    print("PASS [TEST-OFFLINE-001]: 空环境全量通过，真实 DB 与 Socket 连接尝试次数 = 0")

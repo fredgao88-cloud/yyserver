@@ -15,6 +15,7 @@ from decimal import Decimal
 from unittest.mock import patch
 
 os.environ.setdefault("AUTH_SECRET", "unit-test-only-secret-do-not-use-in-prod")
+os.environ.setdefault("HIS_PASS", "offline-synthetic-his-pass")
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from fastapi import HTTPException
@@ -161,8 +162,8 @@ def test_auth_scope_001_doctor_precedence():
         except HTTPException as e:
             assert e.status_code == 403
 
-        # 6) 保留虚构在院记录，但操作员记录消失 (get_operator 返回 None) -> 一律拒绝 403
-        op_ghost = {"sub": "GHOST_DOC", "role": "DOCTOR", "dept": "中医科"}
+        # 6) 保留虚构在院记录，但操作员记录消失 (get_operator 返回 None) -> 即使登录名等于管床号 DOC_A_HIS 也一律拒绝 403
+        op_ghost = {"sub": "DOC_A_HIS", "role": "DOCTOR", "dept": "中医科"}
         req_ghost_pat = api_main.CheckPatientDipRequest(
             patient_id="PAT_A", disease="M17.9", current_cost=-1.0, age=68, ins_type="职工", operation="保守治疗"
         )
@@ -271,16 +272,21 @@ if __name__ == "__main__":
     print(">>> 开始执行全链路离线鉴权与 HIS 读取器单元测试 <<<")
     print("=" * 70)
     # TEST-OFFLINE-001：全局禁止任何真实数据库连接与外部网络调用，确保连接次数为 0
+    import socket
     import db.local_db as local_db_mod
+    conn_calls = []
     def _forbid_db(*args, **kwargs):
-        raise AssertionError("TEST-OFFLINE-001 违规：离线测试严禁打开真实数据库连接！")
+        conn_calls.append((args, kwargs))
+        raise AssertionError("TEST-OFFLINE-001 违规：离线测试严禁打开真实数据库连接或网络！")
     with patch.object(local_db_mod, "get_local_db_connection", side_effect=_forbid_db), \
          patch.object(rbac_mod, "get_local_db_connection", side_effect=_forbid_db), \
          patch.object(api_main, "get_local_db_connection", side_effect=_forbid_db), \
-         patch.object(HISReader, "get_connection", side_effect=_forbid_db):
+         patch.object(HISReader, "get_connection", side_effect=_forbid_db), \
+         patch.object(socket, "create_connection", side_effect=_forbid_db):
         test_his_fixture_removed()
         test_auth_scope_001_doctor_precedence()
         test_auth_scope_002_and_snap_query_001()
+    assert len(conn_calls) == 0, f"期望零连接尝试，实际 {len(conn_calls)}"
     print("=" * 70)
     print(">>> 全部离线鉴权与 HIS 读取器测试 100% 通过！（真实 DB/网络调用次数 = 0） <<<")
     print("=" * 70)
