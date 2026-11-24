@@ -207,27 +207,42 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
     # 确认分句必须同时覆盖事项话题与前提中出现的结果词，才视为同一前提已被确认；
     # “审批尚在办理”（无结果词）、“审批材料齐全”（事项相关但结果不符）均不得解除待定
     _premise_outcome_words = ('通过', '获批', '批准', '核准', '同意', '符合', '满足', '成功', '完成', '落实', '到位')
-    # 紧邻否定/非最终限定识别（DIP-INS-001 变体五/六/七）：除单字“未/不/无/没”外，
-    # 还须覆盖“没有/未能/并未/不予/是否/有无/仅/仅仅”等较长否定、疑问与部分限定形式
-    # （“审批没有通过”“审批不予通过”“审批是否通过”“审批仅通过初审”均不放行）
-    _negation_pre = re.compile(r'(?:尚未|未有|没有|没能|未能|还没有|还没|并未|并无|不予|是否|有无|仅仅|仅|未|不|无|没)$')
-    # 阶段性结果识别（DIP-INS-001 变体六/七）：确认分句含“仍待/尚待/待终审/待复审/待复核/
-    # 仍需/还需/尚无结论/尚无定论/未有结论”等未最终落实标记时（“通过初审但仍待终审”
-    # “是否通过尚无结论”），前提未最终满足，绝不解除待定
-    _premise_pending_markers = re.compile(r'(?:仍待|尚待|待终审|待复审|待复核|仍需|还需|尚无结论|尚无定论|未有结论|未有定论|无结论)')
-    # 结果词后紧跟阶段词（初审/预审/初核/预核）时仅为阶段性通过，不算最终肯定结果（变体七）
-    _premise_stage_suffix = re.compile(r'(?:初审|预审|初核|预核)')
+    # 1. 全局否决与冲突判定（DIP-INS-001 变体八）：含任何否定终审/审批结果的陈述，绝不放行
+    # （“审批终审未通过但初审通过”“审批未通过”“审批不予通过”“审批结果为不予通过”均不放行）
+    _rejection_pattern = re.compile(
+        r'(?:终审|审批|复审|核准|申请)?(?:未通过|没有通过|未能通过|没能通过|不予通过|未予通过|不予批准|未获批准|未获批|被否决|否决|被驳回|驳回|未予核准|不予核准|未通过终审)'
+    )
+
+    # 2. 全局撤回、辟谣与消息不实判定（DIP-INS-001 变体八）：审批通过的消息被证实有误/辟谣/撤回，绝不放行
+    # （“审批通过的消息有误”“审批通过的消息不实”“审批通过系误传”“审批通过已被撤回”均不放行）
+    _retraction_pattern = re.compile(
+        r'(?:(?:消息|信息|传闻|报道|通报|记录|说法)?(?:有误|不实|不属实|系误传|属误报|系误报|纯属误报|已被撤回|被撤回|已被撤销|被撤销|纯属谣传|属谣传|系谣传|已被辟谣|已辟谣|属误传))|'
+        r'(?:(?:通过|获批|批准).{0,6}(?:消息|信息|传闻|记录|说法)?(?:有误|不实|不属实|系误传|属误报|系误报|撤回|撤销|谣传|辟谣))'
+    )
+
+    # 3. 阶段性/未决/结论未定判定（DIP-INS-001 变体六/七/八）：含未决标记一律拒绝
+    _premise_pending_markers = re.compile(
+        r'(?:仍待|尚待|待终审|待复审|待复核|待批|仍需|还需|尚无结论|尚无定论|未有结论|未有定论|无结论|结论未定|悬而未决|是否通过|有无通过)'
+    )
+
+    # 4. 紧邻否定/疑问/阶段限定前缀（“初审通过”“预审通过”等）
+    _negation_pre = re.compile(
+        r'(?:尚未|未有|没有|没能|未能|还没有|还没|并未|并无|不予|未予|是否|有无|仅仅|仅|只|只是|初审|预审|初核|预核|一审|未|不|无|没)$'
+    )
+
+    # 5. 阶段后缀（“通过初审”“通过预审”等）
+    _premise_stage_suffix = re.compile(r'(?:初审|预审|初核|预核|一审)')
 
     def _premise_core_confirmed(core_text, clause_text):
-        """跨分句前提解除判据（DIP-INS-001 变体三/四/五/六）：
+        """跨分句前提解除判据（DIP-INS-001 变体三/四/五/六/七/八）：
         1) 事项话题重叠：核心内容先剥除结果词再做二字片段比对——
-           “身份核验通过”不含“审批”，不放行（变体五）；
-        2) 结果词肯定同现：前提中的结果词（如“通过”）须在确认分句以肯定形式出现，
-           紧邻“未/不/无/没/尚未/没有/未能”等否定的（“审批未通过”“审批没有通过”）不放行（变体五/六），
-           无结果词的（“尚在办理”“材料齐全”）不放行（变体四）；
-        3) 阶段性结果不放行：确认分句含“仍待/尚待/待终审/待复核/仍需”等未最终落实标记的
-           （“通过初审但仍待终审”），前提未最终满足，不放行（变体六）；
-        4) 前提无明确结果词时从严：要求前提核心整体出现在确认分句中"""
+           “身份核验通过”不含“审批/审/批”，不放行（变体五）；
+        2) 全局否决与冲突判定：整句含“终审未通过”“未予通过”“被否决”等任何否定审批结果的，绝不放行（变体八）；
+        3) 全局撤回与辟谣判定：整句含“消息有误”“消息不实”“已被撤回”等撤销消息的，绝不放行（变体八）；
+        4) 全局阶段性未决判定：含“仍待终审/尚无结论”，或仅有“初审通过/通过初审”而无终审结果的，绝不放行（变体八）；
+        5) 结果词肯定同现：前提中的结果词（如“通过”）须在确认分句以肯定形式出现，
+           且前后无否定词、阶段词、辟谣词修饰；
+        6) 肯定对照放行：“审批通过”“终审通过”“已确认审批通过”等无冲突明确结果正常放行。"""
         if not core_text:
             return False  # 前提核心为空时绝不自动解除，保持澄清
         topic_core = core_text
@@ -237,13 +252,20 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
         if topic_core:
             topic_hit = (topic_core in clause_text) or any(
                 topic_core[i:i + 2] in clause_text for i in range(len(topic_core) - 1)
-            )
+            ) or any(ch in clause_text for ch in topic_core if ch in '审评批核准')
         else:
             topic_hit = core_text in clause_text  # 前提只剩结果词时从严整体匹配
         if not topic_hit:
             return False
+
+        # 全局否决、撤回/消息有误、未决标记一律拒绝（变体八）
+        if _rejection_pattern.search(clause_text):
+            return False
+        if _retraction_pattern.search(clause_text):
+            return False
         if _premise_pending_markers.search(clause_text):
-            return False  # 阶段性结果仍待终审/复核，前提未最终落实（变体六）
+            return False
+
         core_outcomes = [w for w in _premise_outcome_words if w in core_text]
         if not core_outcomes:
             return core_text in clause_text
@@ -253,6 +275,9 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
                     continue  # 紧邻否定/疑问/部分限定（“未通过”“不予通过”“是否通过”“仅通过”）不算肯定
                 if _premise_stage_suffix.match(clause_text[m.end():]):
                     continue  # 结果词后紧跟阶段词（“通过初审/预审”）仅为阶段性通过，不算最终肯定
+                # 必须不是阶段性通过（如果包含初审/预审/初核且不包含终审通过，则不算最终肯定）
+                if any(st in clause_text for st in ('初审', '预审', '初核', '预核')) and not ('终审通过' in clause_text or '已通过终审' in clause_text):
+                    continue
                 return True
         return False
 

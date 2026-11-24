@@ -244,54 +244,85 @@ assert body_neg.get("pending_reason") == "NEGATIVE_FEE_UNRECONCILED"
 assert body_neg.get("evaluation", {}).get("light") == "无"
 print("PASS [P1 负费用拦截 2A-8]: 冲正未闭环负费用成功拦截为 PENDING / NEGATIVE_FEE_UNRECONCILED，杜绝误判绿灯！")
 
-# 2A-9 【AUTH-REV-001 动态在岗状态与凭据版本复核】
-# 使用容器内 local_db 辅助验证：停用账号与版本更新后已签发令牌立即失效
+# 2A-9 【AUTH-REV-001 / TEST-ISO-001 动态在岗状态与凭据版本复核——专有一次性账号隔离】
+# TEST-ISO-001 合规要求：严禁修改已有配置账号 TEST_OPERATOR_ID，使用每轮专有、可丢弃的隔离账号并在结束后彻底清理
 import subprocess
+import uuid
 
-def _exec_db_update(status_val, cv_bump=False, reset_cv=None):
-    if cv_bump:
-        py_code = f"""from db.local_db import get_local_db_connection
-cur, conn = get_local_db_connection()
-cur.execute(\"UPDATE dbo.sys_operator_account SET status = %s, cred_version = cred_version + 1 WHERE operator_id = %s\", ('{status_val}', '{TEST_OPERATOR_ID}'))
-conn.commit()
+SYNTH_ISO_OP = f"SYNTH_ISO_{uuid.uuid4().hex[:8]}"
+SYNTH_ISO_PASS = "TempPass_123!"
+
+# 记录当前 TEST_OPERATOR_ID 的状态以断言零写入
+py_get_baseline = """from db.local_db import get_local_db_connection
+cur, conn = get_local_db_connection(as_dict=True)
+cur.execute('SELECT status, cred_version FROM dbo.sys_operator_account WHERE operator_id = %s', ('""" + TEST_OPERATOR_ID + """',))
+row = cur.fetchone()
+print(f"STATUS={row['status']};CV={row['cred_version']}")
 conn.close()"""
-    elif reset_cv is not None:
-        py_code = f"""from db.local_db import get_local_db_connection
-cur, conn = get_local_db_connection()
-cur.execute(\"UPDATE dbo.sys_operator_account SET status = %s, cred_version = %s WHERE operator_id = %s\", ('{status_val}', {reset_cv}, '{TEST_OPERATOR_ID}'))
-conn.commit()
-conn.close()"""
-    else:
-        py_code = f"""from db.local_db import get_local_db_connection
-cur, conn = get_local_db_connection()
-cur.execute(\"UPDATE dbo.sys_operator_account SET status = %s WHERE operator_id = %s\", ('{status_val}', '{TEST_OPERATOR_ID}'))
-conn.commit()
-conn.close()"""
-    subprocess.run(["docker", "exec", "hospital_agent_api", "python3", "-c", py_code], check=True)
+p_base = subprocess.run(["docker", "exec", "hospital_agent_api", "python3", "-c", py_get_baseline], capture_output=True, text=True, check=True)
+baseline_out = p_base.stdout.strip()
+
+# 创建一次性隔离账号
+py_create_iso = f"""from auth.rbac import create_operator
+create_operator('{SYNTH_ISO_OP}', '隔离测试账号', '{SYNTH_ISO_PASS}', 'DOCTOR', '中医科', doctor_id='D150204006976')
+"""
+subprocess.run(["docker", "exec", "hospital_agent_api", "python3", "-c", py_create_iso], check=True)
 
 try:
-    # a. 临时停用账号
-    _exec_db_update("DISABLED")
-    code_rev1, body_rev1 = post_with_status("https://127.0.0.1/api/tools/check_patient_dip", {
+    # 登录获取一次性令牌
+    code_iso_login, body_iso_login = post_with_status("https://127.0.0.1/api/auth/login", {
+        "operator_id": SYNTH_ISO_OP, "password": SYNTH_ISO_PASS
+    })
+    assert code_iso_login == 200
+    ISO_TOKEN = body_iso_login["access_token"]
+
+    # 正常访问测试 -> 200
+    code_iso_ok, _ = post_with_status("https://127.0.0.1/api/tools/check_patient_dip", {
         "patient_id": "SYNTH_DOC_ATTEND", "disease": "M17.9", "current_cost": 2550.00,
         "age": 68, "ins_type": "职工", "operation": "保守治疗"
-    }, token=TOKEN)
+    }, token=ISO_TOKEN)
+    assert code_iso_ok == 200
+
+    # a. 停用隔离账号 -> 401
+    py_disable_iso = f"""from db.local_db import get_local_db_connection
+cur, conn = get_local_db_connection()
+cur.execute('UPDATE dbo.sys_operator_account SET status = %s WHERE operator_id = %s', ('DISABLED', '{SYNTH_ISO_OP}'))
+conn.commit()
+conn.close()"""
+    subprocess.run(["docker", "exec", "hospital_agent_api", "python3", "-c", py_disable_iso], check=True)
+
+    code_rev1, _ = post_with_status("https://127.0.0.1/api/tools/check_patient_dip", {
+        "patient_id": "SYNTH_DOC_ATTEND", "disease": "M17.9", "current_cost": 2550.00,
+        "age": 68, "ins_type": "职工", "operation": "保守治疗"
+    }, token=ISO_TOKEN)
     assert code_rev1 == 401, f"Expected 401 for disabled account, got {code_rev1}"
 
-    # b. 推进凭据版本 cred_version
-    _exec_db_update("ACTIVE", cv_bump=True)
-    code_rev2, body_rev2 = post_with_status("https://127.0.0.1/api/tools/check_patient_dip", {
+    # b. 恢复并推进凭据版本 cred_version -> 旧令牌 401
+    py_bump_iso = f"""from db.local_db import get_local_db_connection
+cur, conn = get_local_db_connection()
+cur.execute('UPDATE dbo.sys_operator_account SET status = %s, cred_version = cred_version + 1 WHERE operator_id = %s', ('ACTIVE', '{SYNTH_ISO_OP}'))
+conn.commit()
+conn.close()"""
+    subprocess.run(["docker", "exec", "hospital_agent_api", "python3", "-c", py_bump_iso], check=True)
+
+    code_rev2, _ = post_with_status("https://127.0.0.1/api/tools/check_patient_dip", {
         "patient_id": "SYNTH_DOC_ATTEND", "disease": "M17.9", "current_cost": 2550.00,
         "age": 68, "ins_type": "职工", "operation": "保守治疗"
-    }, token=TOKEN)
+    }, token=ISO_TOKEN)
     assert code_rev2 == 401, f"Expected 401 for stale cred_version, got {code_rev2}"
 finally:
-    _exec_db_update("ACTIVE", reset_cv=2)
-# 刷新 TOKEN 供后续继续使用
-code_re, body_re = post_with_status("https://127.0.0.1/api/auth/login", {"operator_id": TEST_OPERATOR_ID, "password": TEST_OPERATOR_PASS})
-assert code_re == 200
-TOKEN = body_re["access_token"]
-print("PASS [AUTH-REV-001]: 账号停用与凭据版本推进即时阻断旧令牌 (401)，复核成功！")
+    # 彻底清理隔离测试账号
+    py_cleanup_iso = f"""from db.local_db import get_local_db_connection
+cur, conn = get_local_db_connection()
+cur.execute('DELETE FROM dbo.sys_operator_account WHERE operator_id = %s', ('{SYNTH_ISO_OP}',))
+conn.commit()
+conn.close()"""
+    subprocess.run(["docker", "exec", "hospital_agent_api", "python3", "-c", py_cleanup_iso], check=True)
+
+# 断言日常配置账号零写入：状态与凭据版本与基线 100% 相同
+p_check = subprocess.run(["docker", "exec", "hospital_agent_api", "python3", "-c", py_get_baseline], capture_output=True, text=True, check=True)
+assert p_check.stdout.strip() == baseline_out, f"TEST-ISO-001 断言失败：日常账号状态被意外修改！基线: {baseline_out}, 实际: {p_check.stdout.strip()}"
+print("PASS [AUTH-REV-001 & TEST-ISO-001]: 专有一次性账号完成撤权复核，日常配置账号断言零写入！")
 
 # 2A-10 【TEST-CRED-001 dotenv 引号剥离与环境优先级单元断言】
 def _test_strip_quotes(v):

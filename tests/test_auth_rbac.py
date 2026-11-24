@@ -173,8 +173,33 @@ def run_auth_tests():
     finally:
         rbac_mod.get_operator = orig_get_operator
 
+    # 10. AUTH-SCOPE-001 医生工号映射持久化与重置语义测试（离线模拟库）：
+    # 验证登录工号与 HIS 医生工号独立映射、读回映射、更新重置
+    mock_db_10 = {
+        "doc_login_01": {
+            "operator_id": "doc_login_01", "display_name": "MappedDoc", "password_hash": "x",
+            "role_type": ROLE_DOCTOR, "dept_scope": "中医科", "doctor_id": "D150204006976",
+            "status": "ACTIVE", "cred_version": 1
+        }
+    }
+    orig_get_op10 = rbac_mod.get_operator
+    rbac_mod.get_operator = lambda oid: mock_db_10.get(oid)
+    try:
+        op_m = rbac_mod.get_operator("doc_login_01")
+        assert op_m is not None
+        assert op_m["operator_id"] == "doc_login_01"
+        assert op_m["doctor_id"] == "D150204006976", "登录工号 doc_login_01 应映射至 HIS 工号 D150204006976"
+
+        # 重置映射后旧映射不再生效
+        mock_db_10["doc_login_01"]["doctor_id"] = "DOC_NEW_888"
+        op_m2 = rbac_mod.get_operator("doc_login_01")
+        assert op_m2["doctor_id"] == "DOC_NEW_888", "重置后医生工号映射应即时更新"
+        print("PASS [Auth 10]: AUTH-SCOPE-001 医生工号独立映射持久化与重置语义验证通过")
+    finally:
+        rbac_mod.get_operator = orig_get_op10
+
     print("\n" + "=" * 70)
-    print(">>> 恭喜！auth/rbac.py 全部 9 组离线单元测试 100% 通过！ <<<")
+    print(">>> 恭喜！auth/rbac.py 全部 10 组离线单元测试 100% 通过！ <<<")
     print("=" * 70)
 
 

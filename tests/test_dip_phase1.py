@@ -645,8 +645,47 @@ def run_phase1_tests():
     assert res_22d_s["benchmark_amount"] == 2604.84
     print("PASS [Case 22d]: “已确认审批通过并更正为居民医保” -> 正对照双路径放行，居民基准 ￥2604.84")
 
+    # ---------------- 用例 23: DIP-INS-001 变体八验收 (终审否决/初审阶段/辟谣撤回，双路径均不解除待定) ----------------
+    print("\n--- [Case 23] DIP-INS-001 变体八验收 (“审批终审未通过但初审通过”“审批初审通过”“审批通过的消息有误”，双路径表驱动) ---")
+    v8_variants = [
+        ("23a", "审批终审未通过但初审通过"),
+        ("23b", "审批初审通过"),
+        ("23c", "审批通过的消息有误"),
+        ("23d", "审批通过的消息不实"),
+    ]
+    for tag, stage_text in v8_variants:
+        q = f"68岁，本次职工医保，如果审批通过，已确认{stage_text}并更正为居民医保，M17.9，保守治疗"
+        # 路径 1：聊天入口
+        res_c = parse_local_intent(q)
+        assert res_c["intent"] == "need_clarification", f"Case {tag} 聊天入口应澄清，实际 {res_c['intent']}"
+        assert res_c["data"]["status"] == "PENDING"
+        assert res_c["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+        assert "2790.90" not in res_c["reply"] and "2604.84" not in res_c["reply"]
+        # 路径 2：结构化入口（同一险种表述原样传入）
+        res_s = match_dip_rule(disease="M17.9", age=68,
+                               ins_type=f"本次职工医保，如果审批通过，已确认{stage_text}并更正为居民医保",
+                               op_keyword="保守")
+        assert res_s["matched"] is False, f"Case {tag} 结构化入口应不命中，实际 {res_s}"
+        assert res_s["status"] == "PENDING"
+        assert res_s["pending_reason"] == "CORRECTION_UNCONFIRMED"
+        assert "benchmark_amount" not in res_s
+        print(f"PASS [Case {tag}]: “已确认{stage_text}并更正为居民医保” -> 双路径均 PENDING / CORRECTION_UNCONFIRMED，零金额输出")
+
+    # 23e. 正对照：同一前提的最终肯定结果（审批通过）正常放行，居民基准 ￥2604.84（双路径）
+    q_23e = "68岁，本次职工医保，如果审批通过，已确认审批通过并更正为居民医保，M17.9，保守治疗"
+    res_23e = parse_local_intent(q_23e)
+    assert res_23e["intent"] == "query_dip_rule"
+    assert res_23e["data"]["matched"] is True
+    assert res_23e["data"]["benchmark_amount"] == 2604.84
+    res_23e_s = match_dip_rule(disease="M17.9", age=68,
+                               ins_type="本次职工医保，如果审批通过，已确认审批通过并更正为居民医保",
+                               op_keyword="保守")
+    assert res_23e_s["matched"] is True
+    assert res_23e_s["benchmark_amount"] == 2604.84
+    print("PASS [Case 23e]: “已确认审批通过并更正为居民医保” -> 正对照双路径放行，居民基准 ￥2604.84")
+
     print("\n" + "=" * 70)
-    print(">>> 恭喜！Phase 1 验收回归测试套件全部 22 大关键测试集 100% 通过！ <<<")
+    print(">>> 恭喜！Phase 1 验收回归测试套件全部 23 大关键测试集 100% 通过！ <<<")
     print("=" * 70)
 
 if __name__ == "__main__":

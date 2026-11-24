@@ -84,6 +84,13 @@ BEGIN
 END
 GO
 
+-- 幂等升级：若已有 inpatient_dip_snapshot 表缺少 dept_id，动态升级该列
+IF OBJECT_ID(N'dbo.inpatient_dip_snapshot', N'U') IS NOT NULL AND COL_LENGTH('dbo.inpatient_dip_snapshot', 'dept_id') IS NULL
+BEGIN
+    ALTER TABLE dbo.inpatient_dip_snapshot ADD dept_id NVARCHAR(30) NULL;
+END
+GO
+
 -- 3. Agent 审计日志表（默认不保存原始对话、患者自由文本与返回明细）
 IF OBJECT_ID(N'dbo.agent_audit_log', N'U') IS NULL
 BEGIN
@@ -132,5 +139,12 @@ BEGIN
         created_at      DATETIME2      NOT NULL DEFAULT SYSDATETIME(),
         updated_at      DATETIME2      NOT NULL DEFAULT SYSDATETIME()
     );
+END
+GO
+
+-- 幂等升级：若已有 sys_operator_account 表缺少 doctor_id，动态补齐
+IF OBJECT_ID(N'dbo.sys_operator_account', N'U') IS NOT NULL AND COL_LENGTH('dbo.sys_operator_account', 'doctor_id') IS NULL
+BEGIN
+    ALTER TABLE dbo.sys_operator_account ADD doctor_id NVARCHAR(64) NULL;
 END
 GO

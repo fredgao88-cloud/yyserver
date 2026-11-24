@@ -266,15 +266,15 @@ def create_operator(operator_id: str, display_name: str, password: str,
         if exists:
             cursor.execute(
                 "UPDATE dbo.sys_operator_account SET display_name=%s, password_hash=%s, role_type=%s, "
-                "dept_scope=%s, dingtalk_userid=%s, can_export_case=%s, status='ACTIVE', "
+                "dept_scope=%s, dingtalk_userid=%s, can_export_case=%s, doctor_id=%s, status='ACTIVE', "
                 "cred_version=cred_version+1, updated_at=SYSDATETIME() WHERE operator_id=%s",
-                (display_name, pwd_hash, role_type, dept_scope or "", dingtalk_userid or None, 1 if can_export_case else 0, operator_id)
+                (display_name, pwd_hash, role_type, dept_scope or "", dingtalk_userid or None, 1 if can_export_case else 0, doctor_id or None, operator_id)
             )
         else:
             cursor.execute(
-                "INSERT INTO dbo.sys_operator_account (operator_id, display_name, password_hash, role_type, dept_scope, dingtalk_userid, can_export_case) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                (operator_id, display_name, pwd_hash, role_type, dept_scope or "", dingtalk_userid or None, 1 if can_export_case else 0)
+                "INSERT INTO dbo.sys_operator_account (operator_id, display_name, password_hash, role_type, dept_scope, dingtalk_userid, can_export_case, doctor_id) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                (operator_id, display_name, pwd_hash, role_type, dept_scope or "", dingtalk_userid or None, 1 if can_export_case else 0, doctor_id or None)
             )
         conn.commit()
     finally:
