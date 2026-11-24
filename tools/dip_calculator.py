@@ -207,16 +207,23 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
     # 确认分句必须同时覆盖事项话题与前提中出现的结果词，才视为同一前提已被确认；
     # “审批尚在办理”（无结果词）、“审批材料齐全”（事项相关但结果不符）均不得解除待定
     _premise_outcome_words = ('通过', '获批', '批准', '核准', '同意', '符合', '满足', '成功', '完成', '落实', '到位')
-    _negation_pre = re.compile(r'(?:尚未|未有|未|不|无|没)$')
+    # 紧邻否定识别（DIP-INS-001 变体五/六）：除单字“未/不/无/没”外，
+    # 还须覆盖“没有/没能/未能/并未/并无/还没有”等较长否定形式（“审批没有通过”不放行）
+    _negation_pre = re.compile(r'(?:尚未|未有|没有|没能|未能|还没有|还没|并未|并无|未|不|无|没)$')
+    # 阶段性结果识别（DIP-INS-001 变体六）：确认分句含“仍待/尚待/待终审/待复审/待复核/
+    # 仍需/还需”等未最终落实标记时（“通过初审但仍待终审”），前提未最终满足，绝不解除待定
+    _premise_pending_markers = re.compile(r'(?:仍待|尚待|待终审|待复审|待复核|仍需|还需)')
 
     def _premise_core_confirmed(core_text, clause_text):
-        """跨分句前提解除判据（DIP-INS-001 变体三/四/五）：
+        """跨分句前提解除判据（DIP-INS-001 变体三/四/五/六）：
         1) 事项话题重叠：核心内容先剥除结果词再做二字片段比对——
            “身份核验通过”不含“审批”，不放行（变体五）；
         2) 结果词肯定同现：前提中的结果词（如“通过”）须在确认分句以肯定形式出现，
-           紧邻“未/不/无/没/尚未”等否定的（“审批未通过”）不放行（变体五），
+           紧邻“未/不/无/没/尚未/没有/未能”等否定的（“审批未通过”“审批没有通过”）不放行（变体五/六），
            无结果词的（“尚在办理”“材料齐全”）不放行（变体四）；
-        3) 前提无明确结果词时从严：要求前提核心整体出现在确认分句中"""
+        3) 阶段性结果不放行：确认分句含“仍待/尚待/待终审/待复核/仍需”等未最终落实标记的
+           （“通过初审但仍待终审”），前提未最终满足，不放行（变体六）；
+        4) 前提无明确结果词时从严：要求前提核心整体出现在确认分句中"""
         if not core_text:
             return False  # 前提核心为空时绝不自动解除，保持澄清
         topic_core = core_text
@@ -231,6 +238,8 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
             topic_hit = core_text in clause_text  # 前提只剩结果词时从严整体匹配
         if not topic_hit:
             return False
+        if _premise_pending_markers.search(clause_text):
+            return False  # 阶段性结果仍待终审/复核，前提未最终落实（变体六）
         core_outcomes = [w for w in _premise_outcome_words if w in core_text]
         if not core_outcomes:
             return core_text in clause_text

@@ -30,6 +30,8 @@ def run_settled_reconciliation_suite():
 
     reader = HISReader()
 
+    skipped_suites = []  # 未执行的套件/轮次必须计入 SKIP，结尾横幅如实报告（RECON-RX-001 验收要求）
+
     # -------------------------------------------------------------
     # Test Suite 1: Query Settled Cases & Key Associations
     # -------------------------------------------------------------
@@ -495,21 +497,24 @@ def run_settled_reconciliation_suite():
     try:
         import pymssql
         import threading
-        import time
         import uuid
     except ImportError:
         print("  [SKIP] Suite 9: pymssql 不可用（离线环境跳过，服务器上必跑）")
+        skipped_suites.append('Suite 9 (pymssql 不可用)')
     else:
         _h = os.environ.get('LOCAL_DB_HOST')
         _port = int(os.environ.get('LOCAL_DB_PORT', '1433'))
         _u = os.environ.get('LOCAL_DB_USER')
         _p = os.environ.get('LOCAL_DB_PASS')
-        _db = os.environ.get('LOCAL_DB_NAME', 'his_agent_db')
-        if not (_h and _u and _p):
-            print("  [SKIP] Suite 9: LOCAL_DB_* 未配置（离线环境跳过，服务器上必跑）")
+        # TEST-ISO-001：写型验收必须显式指定隔离测试实例库（无默认回退，未显式配置即 SKIP），
+        # 且严禁指向共享/生产 HIS 库或系统库；全部校验在首个写操作（CREATE DATABASE）之前完成
+        _db = os.environ.get('LOCAL_DB_NAME')
+        if not (_h and _u and _p and _db):
+            print("  [SKIP] Suite 9: LOCAL_DB_* 未完整显式配置（离线环境跳过，服务器上必跑）")
+            skipped_suites.append('Suite 9 (LOCAL_DB_* 未完整显式配置)')
         else:
-            assert _db.strip().lower() not in ('his', 'hisdb'), \
-                "Suite 9 严禁指向共享/生产 HIS 库，LOCAL_DB_NAME 必须为院内隔离库"
+            assert _db.strip().lower() not in ('his', 'hisdb', 'master', 'model', 'msdb'), \
+                "Suite 9 严禁指向共享/生产 HIS 库或系统库，LOCAL_DB_NAME 必须为院内隔离测试实例库"
             scratch = 'rxt_recon_' + uuid.uuid4().hex[:8]
             admin = pymssql.connect(server=_h, port=_port, user=_u, password=_p, database=_db,
                                     autocommit=True, login_timeout=10, timeout=30)
@@ -580,9 +585,9 @@ def run_settled_reconciliation_suite():
                 class ScratchReader(HISReader):
                     """真实 get_case_fee_detail 代码路径，仅连接目标换为本轮专有库；
                     isolation=None 时经 RECON_ISOLATION 变异点关闭显式隔离保护（仅限本测试）"""
-                    def __init__(self, isolation='SERIALIZABLE', hold_seconds=0.0, master_read_event=None):
-                        self._hold = hold_seconds
+                    def __init__(self, isolation='SERIALIZABLE', master_read_event=None, wait_event=None):
                         self._event = master_read_event
+                        self._wait = wait_event
                         if isolation is None:
                             self.RECON_ISOLATION = None  # 实例级变异，类属性生产默认不受影响
                     def get_connection(self):
@@ -593,18 +598,23 @@ def run_settled_reconciliation_suite():
                             return conn
                         def _hook():
                             self._event.set()      # 写线程就绪同步：主单已读、锁已持有
-                            if self._hold:
-                                time.sleep(self._hold)
+                            if self._wait is not None:
+                                # 事件同步替代固定休眠：等待写线程信号（保护轮=已发起，变异轮=已提交），
+                                # 慢连接下结果仍可重复，杜绝固定休眠造成的假失败（RECON-RX-001 验收要求）
+                                self._wait.wait(timeout=25)
                         return HookConn(conn, _hook)
 
-                def _writer(event, results):
-                    """并发写入：等待读取方主单读就绪信号后，提交主单+药费调整（新账 45 = 33 + 12）"""
+                def _writer(event, results, attempted=None, committed=None):
+                    """并发写入：等待读取方主单读就绪信号后，提交主单+药费调整（新账 45 = 33 + 12）；
+                    attempted 在即将发起写时置位（保护轮同步写尝试），committed 在写线程结束时置位（变异轮同步提交完成）"""
                     try:
                         if not event.wait(timeout=20):
                             results.append('error:no-read-ready-signal')
                             return
                         W = pymssql.connect(server=_h, port=_port, user=_u, password=_p, database=scratch,
                                             autocommit=False, login_timeout=10, timeout=60)
+                        if attempted is not None:
+                            attempted.set()
                         wc = W.cursor()
                         wc.execute("UPDATE dbo.his_zyjz SET yfmoney = 45 WHERE lsh = 'RXTEST01'")
                         wc.execute("INSERT INTO dbo.his_cfmain_fyjl VALUES ('RXTEST01','RX-DISP-0001',8)")
@@ -613,14 +623,18 @@ def run_settled_reconciliation_suite():
                         W.close()
                     except Exception as e:
                         results.append('error:' + type(e).__name__)
+                    finally:
+                        if committed is not None:
+                            committed.set()  # 无论成败均放行读取方，成败由 results 断言
 
                 # —— 9a/9b：SERIALIZABLE 保护下只读完整旧账或完整新账 ——
                 _seed_old_account()
                 ev1 = threading.Event()
+                att1 = threading.Event()
                 w1 = []
-                wt1 = threading.Thread(target=_writer, args=(ev1, w1))
+                wt1 = threading.Thread(target=_writer, args=(ev1, w1), kwargs={'attempted': att1})
                 wt1.start()
-                r1 = ScratchReader(isolation='SERIALIZABLE', hold_seconds=2.0, master_read_event=ev1)
+                r1 = ScratchReader(isolation='SERIALIZABLE', master_read_event=ev1, wait_event=att1)
                 d_old = r1.get_case_fee_detail('RXTEST01')   # 真实方法，含 SERIALIZABLE 显式事务
                 wt1.join(timeout=30)
                 assert w1 == ['committed'], f"写入会话未正常完成: {w1}"
@@ -640,11 +654,12 @@ def run_settled_reconciliation_suite():
                 # —— 9c：变异对照——去除隔离保护（RECON_ISOLATION=None）必须读到不一致 ——
                 _seed_old_account()
                 ev2 = threading.Event()
+                com2 = threading.Event()
                 w2 = []
-                wt2 = threading.Thread(target=_writer, args=(ev2, w2))
+                wt2 = threading.Thread(target=_writer, args=(ev2, w2), kwargs={'committed': com2})
                 wt2.start()
-                r2 = ScratchReader(isolation=None, hold_seconds=3.0, master_read_event=ev2)
-                d_mut = r2.get_case_fee_detail('RXTEST01')   # 默认 READ COMMITTED，主单读旧、药费读新
+                r2 = ScratchReader(isolation=None, master_read_event=ev2, wait_event=com2)
+                d_mut = r2.get_case_fee_detail('RXTEST01')   # 默认 READ COMMITTED；药费读取前等待写提交事件
                 wt2.join(timeout=30)
                 assert w2 == ['committed'], f"变异轮写入会话未正常完成: {w2}"
                 mut_master = Decimal(str(d_mut['zyjz']['yfmoney']))
@@ -662,7 +677,11 @@ def run_settled_reconciliation_suite():
             print("  [PASS] Suite 9 Real-reader Two-session Consistency & Mutation Verified.")
 
     print("\n" + "=" * 70)
-    print("  ALL 9 RECONCILIATION SUITES PASSED (100.0% COMPLIANT WITH v1.2)")
+    if skipped_suites:
+        # 未执行的套件必须计入 SKIP 并如实报告，绝不输出“全套通过”（RECON-RX-001 验收要求）
+        print(f"  EXECUTED SUITES PASSED; SKIPPED {len(skipped_suites)} 项: " + "; ".join(skipped_suites))
+    else:
+        print("  ALL 9 RECONCILIATION SUITES PASSED (100.0% COMPLIANT WITH v1.2)")
     print("=" * 70)
 
 if __name__ == '__main__':

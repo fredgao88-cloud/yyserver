@@ -580,8 +580,33 @@ def run_phase1_tests():
     assert "2604.84" not in res_20b["reply"]
     print("PASS [Case 20b]: “如果审批通过，已确认身份核验通过并更正为居民医保” -> 无关事项确认不解除待定，PENDING / CORRECTION_UNCONFIRMED，零金额输出")
 
+    # ---------------- 用例 21: DIP-INS-001 变体六验收 (较长否定形式与阶段性结果均不解除待定) ----------------
+    print("\n--- [Case 21] DIP-INS-001 变体六验收 (“审批没有通过”较长否定、“通过初审但仍待终审”阶段性结果，绝不解除待定) ---")
+    # 21a. 本次职工医保，如果审批通过，已核实审批没有通过并更正为居民医保 -> “没有通过”是前提的否定结果，
+    #      与“未通过”等义，更正绝不生效，先澄清并省略金额
+    q_21a = "68岁，本次职工医保，如果审批通过，已核实审批没有通过并更正为居民医保，M17.9，保守治疗"
+    res_21a = parse_local_intent(q_21a)
+    assert res_21a["intent"] == "need_clarification"
+    assert res_21a["data"]["status"] == "PENDING"
+    assert res_21a["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+    assert "2790.90" not in res_21a["reply"]
+    assert "2604.84" not in res_21a["reply"]
+    print("PASS [Case 21a]: “如果审批通过，已核实审批没有通过并更正为居民医保” -> 较长否定不解除待定，PENDING / CORRECTION_UNCONFIRMED，零金额输出")
+
+    # 21b. 本次职工医保，如果审批通过，已确认审批材料通过初审但仍待终审并更正为居民医保 -> “通过初审”只是阶段性结果，
+    #      “仍待终审”表明前提未最终满足，更正绝不生效，先澄清并省略金额；
+    #      正对照仍由 Case 18b（“已确认审批通过”放行 ￥2604.84）覆盖
+    q_21b = "68岁，本次职工医保，如果审批通过，已确认审批材料通过初审但仍待终审并更正为居民医保，M17.9，保守治疗"
+    res_21b = parse_local_intent(q_21b)
+    assert res_21b["intent"] == "need_clarification"
+    assert res_21b["data"]["status"] == "PENDING"
+    assert res_21b["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+    assert "2790.90" not in res_21b["reply"]
+    assert "2604.84" not in res_21b["reply"]
+    print("PASS [Case 21b]: “如果审批通过，已确认审批材料通过初审但仍待终审并更正为居民医保” -> 阶段性结果不解除待定，PENDING / CORRECTION_UNCONFIRMED，零金额输出")
+
     print("\n" + "=" * 70)
-    print(">>> 恭喜！Phase 1 验收回归测试套件全部 20 大关键测试集 100% 通过！ <<<")
+    print(">>> 恭喜！Phase 1 验收回归测试套件全部 21 大关键测试集 100% 通过！ <<<")
     print("=" * 70)
 
 if __name__ == "__main__":
