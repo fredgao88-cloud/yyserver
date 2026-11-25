@@ -77,7 +77,8 @@ class InpatientScanner:
         batch_id: Optional[str] = None,
         department: Optional[str] = None,
         limit: int = 50,
-        include_recent_settled: bool = False
+        include_recent_settled: bool = False,
+        notify_dingtalk: bool = False
     ) -> Dict[str, Any]:
         """
         Executes a scan over inpatient cases and saves snapshots into dbo.inpatient_dip_snapshot.
@@ -134,7 +135,8 @@ class InpatientScanner:
             'YELLOW': 0,
             'RED': 0,
             'NOT_APPLICABLE': 0,
-            'PENDING': 0
+            'PENDING': 0,
+            'dept_alert_counts': {}
         }
 
         local_cur, local_conn = get_local_db_connection(as_dict=True)
@@ -319,7 +321,20 @@ class InpatientScanner:
         finally:
             local_conn.close()
 
+        dept_counts = {}
+        for snap in evaluated_snapshots:
+            lvl = snap.get('alert_level')
+            if lvl in ('RED', 'YELLOW'):
+                dname = snap.get('dept_name') or '未知科室'
+                entry = dept_counts.setdefault(dname, {'RED': 0, 'YELLOW': 0})
+                entry[lvl] += 1
+        summary['dept_alert_counts'] = dept_counts
         summary['snapshots'] = evaluated_snapshots
+
+        if notify_dingtalk:
+            from tools.dingtalk_notifier import send_dingtalk_alert
+            summary['dingtalk_notify'] = send_dingtalk_alert(summary)
+
         return summary
 
 def main():
@@ -329,6 +344,7 @@ def main():
     parser.add_argument("--dept", type=str, default=None, help="Filter by department")
     parser.add_argument("--limit", type=int, default=50, help="Scan limit")
     parser.add_argument("--settled", action="store_true", help="Include recently settled patients")
+    parser.add_argument("--notify", action="store_true", help="Send DingTalk alert summary if RED/YELLOW alerts exist")
     args = parser.parse_args()
 
     scanner = InpatientScanner()
@@ -336,7 +352,8 @@ def main():
         batch_id=args.batch_id,
         department=args.dept,
         limit=args.limit,
-        include_recent_settled=args.settled
+        include_recent_settled=args.settled,
+        notify_dingtalk=args.notify
     )
 
     print("\n" + "=" * 60)

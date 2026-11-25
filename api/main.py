@@ -9,6 +9,7 @@
 - 支持渠道分流（钉钉渠道患者级查询自动激活隐私盾牌）。
 """
 from fastapi import FastAPI, HTTPException, Query, Header, Depends
+from fastapi.responses import HTMLResponse
 from contextlib import asynccontextmanager
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
@@ -21,14 +22,19 @@ import re
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from tools.dip_calculator import match_dip_rule, evaluate_traffic_light
+from tools.analytics_reporter import get_doctor_performance_report
+from tools.dip_importer import import_dip_rules_records, parse_csv_bytes
 from agent.llm_router import parse_local_intent
+from agent.tool_dispatcher import extract_tool_call, dispatch_tool_call
+from api.admin_ui import ADMIN_OPERATORS_HTML
 from db.local_db import record_audit_log, get_local_db_connection
 from db.his_reader import HISReader
 from auth.rbac import (
     get_authorized_dept_ids,
     authenticate, issue_token, operator_from_optional_token, require_roles,
     ensure_auth_schema, TOKEN_TTL_MINUTES, PATIENT_QUERY_ROLES, ALERTS_ROLES,
-    ROLE_DOCTOR, ROLE_DEPT_HEAD, get_operator
+    ROLE_DOCTOR, ROLE_DEPT_HEAD, ROLE_INSURANCE, ROLE_ADMIN, ALL_ROLES,
+    get_operator, list_operators, create_operator, set_operator_status
 )
 
 @asynccontextmanager
@@ -79,6 +85,29 @@ class ChatRequest(BaseModel):
 class LoginRequest(BaseModel):
     operator_id: str = Field(..., description="操作员工号")
     password: str = Field(..., description="操作员口令")
+
+class OperatorUpsertRequest(BaseModel):
+    operator_id: str = Field(..., min_length=1, max_length=64, description="操作员工号")
+    display_name: str = Field(..., min_length=1, max_length=64, description="显示姓名")
+    password: str = Field(..., min_length=8, description="口令（至少 8 位）")
+    role_type: str = Field(..., description="角色类型")
+    dept_scope: str = Field("", description="科室范围或科室 ID")
+    doctor_id: str = Field("", description="绑定的 HIS 医生工号")
+    dingtalk_userid: str = Field("", description="钉钉 userid 映射")
+    can_export_case: bool = Field(False, description="是否允许导出病例")
+
+class OperatorStatusRequest(BaseModel):
+    status: str = Field(..., description="ACTIVE 或 DISABLED")
+
+class DipRuleImportRequest(BaseModel):
+    rule_version: str = Field(..., description="目标规则版本号，如 2026_V2")
+    source_doc: str = Field(..., description="来源文件或发文编号")
+    effective_date: Optional[str] = Field(None, description="生效日期 YYYY-MM-DD")
+    approve: bool = Field(False, description="是否直接置为 APPROVED")
+    replace_version: bool = Field(False, description="是否覆盖同版本号旧规则")
+    dry_run: bool = Field(False, description="是否仅预检不入库")
+    csv_text: Optional[str] = Field(None, description="CSV 文本内容（与 records 二选一）")
+    records: Optional[List[Dict[str, Any]]] = Field(None, description="结构化规则行列表")
 
 # ----------------- 启动自检 -----------------
 
@@ -496,6 +525,158 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
     finally:
         conn.close()
 
+
+@app.get("/api/analytics/doctor-performance", summary="医生 DIP 控费绩效分析与历史趋势聚合报表")
+async def get_doctor_performance(
+    days: int = Query(30, ge=1, le=365, description="统计最近天数，默认 30 天"),
+    dept_id: Optional[str] = Query(None, description="科室 ID 筛选（管理员/医保办可用）"),
+    doctor_id: Optional[str] = Query(None, description="医生工号筛选"),
+    operator: Dict[str, Any] = Depends(require_roles(*PATIENT_QUERY_ROLES)),
+):
+    """
+    基于快照历史批次聚合医生绩效指标与控费趋势。
+    严格执行行级权限隔离：
+    - 医生仅可查看本人名下数据；
+    - 科主任仅可查看授权科室 ID 范围内的数据；
+    - 医保办与管理员可查看全院或按参数筛选。
+    """
+    role = operator.get("role")
+    authorized_dept_ids = None
+    enforced_doctor_id = None
+
+    if role == ROLE_DOCTOR:
+        op_rec = get_operator(operator["sub"])
+        if not op_rec or op_rec.get("status") != "ACTIVE":
+            raise HTTPException(status_code=403, detail="越权访问：操作员账号状态异常")
+        mapped_doc_id = (op_rec.get("doctor_id") or "").strip()
+        enforced_doctor_id = mapped_doc_id or (op_rec.get("operator_id") or "").strip()
+        if not enforced_doctor_id:
+            raise HTTPException(status_code=403, detail="越权访问：未配置有效医生工号")
+        if doctor_id and doctor_id.strip() != enforced_doctor_id:
+            raise HTTPException(status_code=403, detail="越权访问：医生仅可查看本人绩效报表")
+    elif role == ROLE_DEPT_HEAD:
+        user_dept = operator.get("dept") or ""
+        authorized_dept_ids = get_authorized_dept_ids(user_dept)
+        if not authorized_dept_ids:
+            raise HTTPException(status_code=403, detail="科室主任账号未配置有效科室 ID 或存在同名歧义，无法访问报表")
+        if dept_id and dept_id.strip() not in authorized_dept_ids:
+            raise HTTPException(status_code=403, detail="越权访问：无权查询非本科室绩效数据")
+
+    report = get_doctor_performance_report(
+        days=days,
+        dept_id=dept_id,
+        doctor_id=doctor_id,
+        authorized_dept_ids=authorized_dept_ids,
+        enforced_doctor_id=enforced_doctor_id,
+    )
+    record_audit_log(
+        operator_id=operator["sub"],
+        role_type=role or "UNKNOWN",
+        channel="API",
+        action_type="DOCTOR_PERFORMANCE_REPORT",
+        target_ref=f"DAYS:{days}",
+        auth_result="PERMITTED",
+    )
+    return report
+
+
+
+@app.get("/admin/operators", response_class=HTMLResponse, summary="操作员权限管理 Web 控制台")
+async def admin_operators_page():
+    """纯本地静态管理控制台，所有业务数据通过 Bearer Token 调用受保护 API 获取。"""
+    return HTMLResponse(content=ADMIN_OPERATORS_HTML)
+
+@app.get("/api/admin/operators", summary="列出全部操作员（脱敏）")
+async def api_list_operators(operator: Dict[str, Any] = Depends(require_roles(ROLE_ADMIN))):
+    items = list_operators()
+    record_audit_log(
+        operator_id=operator["sub"], role_type=operator["role"], channel="API",
+        action_type="ADMIN_LIST_OPERATORS", target_ref=f"COUNT:{len(items)}", auth_result="PERMITTED"
+    )
+    return {"total": len(items), "items": items}
+
+@app.post("/api/admin/operators", summary="创建或重置操作员账号")
+async def api_upsert_operator(
+    req: OperatorUpsertRequest,
+    operator: Dict[str, Any] = Depends(require_roles(ROLE_ADMIN)),
+):
+    if req.role_type not in ALL_ROLES:
+        raise HTTPException(status_code=400, detail=f"非法角色类型: {req.role_type}")
+    try:
+        create_operator(
+            operator_id=req.operator_id.strip(),
+            display_name=req.display_name.strip(),
+            password=req.password,
+            role_type=req.role_type,
+            dept_scope=req.dept_scope.strip(),
+            dingtalk_userid=req.dingtalk_userid.strip(),
+            can_export_case=req.can_export_case,
+            doctor_id=req.doctor_id.strip(),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    record_audit_log(
+        operator_id=operator["sub"], role_type=operator["role"], channel="API",
+        action_type="ADMIN_UPSERT_OPERATOR", target_ref=f"OP:{req.operator_id.strip()[:32]}", auth_result="PERMITTED"
+    )
+    return {"success": True, "operator_id": req.operator_id.strip(), "role_type": req.role_type}
+
+@app.patch("/api/admin/operators/{operator_id}/status", summary="启用或停用操作员账号")
+async def api_set_operator_status(
+    operator_id: str,
+    req: OperatorStatusRequest,
+    operator: Dict[str, Any] = Depends(require_roles(ROLE_ADMIN)),
+):
+    target_status = req.status.strip().upper()
+    if target_status not in ("ACTIVE", "DISABLED"):
+        raise HTTPException(status_code=400, detail="status 仅支持 ACTIVE 或 DISABLED")
+    if operator_id.strip() == operator["sub"] and target_status == "DISABLED":
+        raise HTTPException(status_code=400, detail="禁止停用当前正在使用的管理员账号")
+    ok = set_operator_status(operator_id.strip(), target_status)
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"操作员不存在: {operator_id}")
+    record_audit_log(
+        operator_id=operator["sub"], role_type=operator["role"], channel="API",
+        action_type="ADMIN_SET_OPERATOR_STATUS", target_ref=f"OP:{operator_id.strip()[:32]}->{target_status}", auth_result="PERMITTED"
+    )
+    return {"success": True, "operator_id": operator_id.strip(), "status": target_status}
+
+@app.post("/api/admin/dip-rules/import", summary="DIP 新版规则目录批量导入接口")
+async def import_dip_rules_api(
+    req: DipRuleImportRequest,
+    operator: Dict[str, Any] = Depends(require_roles(ROLE_INSURANCE, ROLE_ADMIN)),
+):
+    """仅限医保办或管理员批量校验并导入新版 DIP 规则目录（支持 dry-run 预检与单事务覆盖）。"""
+    rows = req.records
+    if rows is None and req.csv_text:
+        rows = parse_csv_bytes(req.csv_text.encode("utf-8"))
+    if not rows:
+        raise HTTPException(status_code=400, detail="请提供非空的 records 或 csv_text")
+
+    res = import_dip_rules_records(
+        rows,
+        rule_version=req.rule_version,
+        source_doc=req.source_doc,
+        effective_date=req.effective_date,
+        review_status="APPROVED" if req.approve else "PENDING",
+        replace_version=req.replace_version,
+        dry_run=req.dry_run,
+    )
+    if res.get("success") and not req.dry_run and req.approve:
+        from tools.dip_calculator import get_loaded_rules
+        get_loaded_rules(rule_version=req.rule_version, force_reload=True)
+
+    record_audit_log(
+        operator_id=operator["sub"],
+        role_type=operator["role"],
+        channel="API",
+        action_type="DIP_RULE_IMPORT",
+        target_ref=f"VER:{req.rule_version[:30]}",
+        auth_result="PERMITTED" if res.get("success") else "DENIED",
+        rule_version=req.rule_version,
+    )
+    return res
+
 @app.post("/api/chat", summary="院内本地自然语言意图分类与规则问答接口")
 async def chat_interaction(req: ChatRequest, authorization: Optional[str] = Header(None)):
     """
@@ -503,8 +684,15 @@ async def chat_interaction(req: ChatRequest, authorization: Optional[str] = Head
     科室级问答保持开放；身份仅取自有效令牌，绝不信任自报工号请求头。
     """
     op = operator_from_optional_token(authorization)
-    result = parse_local_intent(req.text, channel=req.channel or "web")
-    
+    channel = req.channel or "web"
+    result = parse_local_intent(req.text, channel=channel)
+
+    # Function Calling 闭环：仅在未触发钉钉隐私盾牌与报销/参保追问拦截时，尝试调度本地业务工具
+    if result.get("intent") not in ("privacy_shielded", "need_reimbursement_clarification"):
+        tc = extract_tool_call(req.text, channel=channel)
+        if tc is not None:
+            result = dispatch_tool_call(tc, op)
+
     # 严格合规审计日志：严禁截取或写入原始用户文本，只记录结构化意图代码
     intent_code = result.get("intent", "UNKNOWN")
     record_audit_log(
