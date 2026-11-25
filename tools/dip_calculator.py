@@ -341,8 +341,21 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
                     last_appr = max(seg_subject.rfind('审批'), seg_subject.rfind('终审'))
                     obj_part = re.sub(_confirm_words, '', seg_subject[:last_appr])
                     obj_part = obj_part.replace('审批', '').replace('终审', '').strip(' 的了')
-                    if obj_part and not re.fullmatch(r'(?:本次|该|此|其|上述)?(?:险种|医保|参保)?(?:更正)?(?:的)?', obj_part):
+                    # 本地归一化（DIP-INS-001 变体十八）：医保险种/参保险种/参保类型/参保身份/
+                    # 医保类型/险种类型等完整名称均指同一险种更正事项，与“险种更正”同等放行
+                    for _alias in ('医保险种', '参保险种', '参保类型', '参保身份', '医保类型', '险种类型'):
+                        obj_part = obj_part.replace(_alias, '险种')
+                    obj_part = obj_part.replace('医保', '险种').replace('参保', '险种')
+                    if obj_part and not re.fullmatch(r'(?:本次|该|此|其|上述)?(?:险种)?(?:更正|变更|调整)?(?:的)?', obj_part):
                         continue  # “手术审批/采购审批”等其他业务对象的审批结果，不算险种更正前提的肯定结论
+                    # “审批”与结果词之间不得夹带其他子事项（DIP-INS-001 变体十八）：
+                    # “审批材料的身份核验通过”“审批材料的形式审查通过”中“通过”属于
+                    # 材料核验/形式审查而非审批本身；仅允许时间副词与“结果已确认”类承接
+                    gap_part = re.sub(_confirm_words, '', seg_subject[last_appr + 2:])
+                    gap_part = re.sub(r'于(?:上周|本周|昨天|昨日|今天|今日|上午|下午|[一二三四五六七八九十\d]+个?(?:天|日|周|月|小时)(?:以)?前)', '', gap_part)
+                    gap_part = gap_part.strip(' 的了，,')
+                    if gap_part and not re.fullmatch(r'(?:该|其|本|此)?(?:审批|审核)?(?:结果|结论)', gap_part):
+                        continue
                 else:
                     subj = re.sub(_confirm_words, '', seg_subject).strip(' 的了')
                     if subj and not re.fullmatch(r'(?:该|其|本|此)?(?:审批|审核)?(?:结果|结论)', subj):
