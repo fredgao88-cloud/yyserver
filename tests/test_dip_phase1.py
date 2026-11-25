@@ -1027,6 +1027,8 @@ def run_phase1_tests():
         ("34a", "本次险种更正审批于昨日通过"),
         ("34b", "本次险种更正审批昨日通过"),
         ("34c", "本次险种更正审批于昨天下午通过"),
+        ("34d", "本次险种更正审批于上午通过"),   # 变体二十回归：独立时段“于上午”上一版本可放行
+        ("34e", "本次险种更正审批于下午通过"),   # 变体二十回归：独立时段“于下午”上一版本可放行
     ]
     v19_rule_ids = []
     for tag, ok_text in v19_ok:
@@ -1043,8 +1045,8 @@ def run_phase1_tests():
         assert res_ok_s["rule_id"] == res_ok_c["data"]["rule_id"]  # 双入口命中同一规则
         v19_rule_ids.append(res_ok_s["rule_id"])
         print(f"PASS [Case {tag}]: “已确认{ok_text}并更正为居民医保” -> 双路径放行，规则 #{res_ok_s['rule_id']}，居民基准 ￥2604.84")
-    assert len(set(v19_rule_ids)) == 1  # 三种时间措辞命中同一居民规则且金额相等
-    print(f"PASS [Case 34]: 三种过去时间短语均命中同一居民规则 #{v19_rule_ids[0]}，金额一致 ￥2604.84")
+    assert len(set(v19_rule_ids)) == 1  # 五种时间措辞命中同一居民规则且金额相等
+    print(f"PASS [Case 34]: 五种过去时间/时段短语均命中同一居民规则 #{v19_rule_ids[0]}，金额一致 ￥2604.84")
 
     print("\n" + "=" * 70)
     print(">>> 恭喜！Phase 1 验收回归测试套件全部 34 大关键测试集 100% 通过！ <<<")
