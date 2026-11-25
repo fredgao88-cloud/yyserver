@@ -1019,8 +1019,35 @@ def run_phase1_tests():
         assert res_ok_s["matched"] is True and res_ok_s["benchmark_amount"] == 2604.84
         print(f"PASS [Case {tag}]: “已确认{ok_text}并更正为居民医保” -> 对照双路径放行，居民基准 ￥2604.84")
 
+    # ---------------- 用例 34: DIP-INS-001 变体十九验收 (审批与结果词间的完整过去时间短语放行，子事项检查保留) ----------------
+    print("\n--- [Case 34] DIP-INS-001 变体十九验收 (“审批于昨日通过”“审批昨日通过”“审批于昨天下午通过”均放行且同额，双路径表驱动) ---")
+    # 修复点：审批与结果词之间识别完整、明确的过去时间短语（“于”可选、日期+上午/下午一次匹配），
+    # 残余字符不得触发拒绝；两条材料子事项用例仍由 Case 33 保障 PENDING
+    v19_ok = [
+        ("34a", "本次险种更正审批于昨日通过"),
+        ("34b", "本次险种更正审批昨日通过"),
+        ("34c", "本次险种更正审批于昨天下午通过"),
+    ]
+    v19_rule_ids = []
+    for tag, ok_text in v19_ok:
+        q_ok = f"68岁，本次职工医保，如果审批通过，已确认{ok_text}并更正为居民医保，M17.9，保守治疗"
+        res_ok_c = parse_local_intent(q_ok)
+        assert res_ok_c["intent"] == "query_dip_rule", f"Case {tag} 聊天入口应命中，实际 {res_ok_c['intent']}"
+        assert res_ok_c["data"]["matched"] is True
+        assert res_ok_c["data"]["benchmark_amount"] == 2604.84
+        res_ok_s = match_dip_rule(disease="M17.9", age=68,
+                                  ins_type=f"本次职工医保，如果审批通过，已确认{ok_text}并更正为居民医保",
+                                  op_keyword="保守")
+        assert res_ok_s["matched"] is True
+        assert res_ok_s["benchmark_amount"] == 2604.84
+        assert res_ok_s["rule_id"] == res_ok_c["data"]["rule_id"]  # 双入口命中同一规则
+        v19_rule_ids.append(res_ok_s["rule_id"])
+        print(f"PASS [Case {tag}]: “已确认{ok_text}并更正为居民医保” -> 双路径放行，规则 #{res_ok_s['rule_id']}，居民基准 ￥2604.84")
+    assert len(set(v19_rule_ids)) == 1  # 三种时间措辞命中同一居民规则且金额相等
+    print(f"PASS [Case 34]: 三种过去时间短语均命中同一居民规则 #{v19_rule_ids[0]}，金额一致 ￥2604.84")
+
     print("\n" + "=" * 70)
-    print(">>> 恭喜！Phase 1 验收回归测试套件全部 33 大关键测试集 100% 通过！ <<<")
+    print(">>> 恭喜！Phase 1 验收回归测试套件全部 34 大关键测试集 100% 通过！ <<<")
     print("=" * 70)
 
 if __name__ == "__main__":
