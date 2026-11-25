@@ -263,7 +263,8 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
         4) 全局阶段性未决判定：含“仍待终审/尚无结论”，或仅有“初审通过/通过初审”而无终审结果的，绝不放行；
         5) 结果词肯定同现：前提中的结果词（如“通过”）须在确认分句剥除时间字段未知修饰后的
            同一份文本上以肯定形式出现，且前后无否定词、阶段词、辟谣词修饰，
-           且结果词归属于审批事项本身（“但/且/而”引入的新主语事项结果不予采纳）；
+           且结果词归属于审批事项本身（“但/且/而”引入的新主语事项结果不予采纳；
+           “手术审批/采购审批”等其他业务对象的审批结果同样不予采纳）；
         6) 肯定对照放行：“审批通过”“终审通过”“已确认审批通过”等无冲突明确结果正常放行。"""
         if not core_text:
             return False  # 前提核心为空时绝不自动解除，保持澄清
@@ -325,14 +326,25 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
                 # 必须不是阶段性通过（如果包含初审/预审/初核且不包含终审通过，则不算最终肯定）
                 if any(st in norm_clause for st in ('初审', '预审', '初核', '预核')) and not ('终审通过' in norm_clause or '已通过终审' in norm_clause):
                     continue
-                # 事项-结果配对（DIP-INS-001 变体十六）：结果词必须归属于审批事项本身；
-                # “但/且/而”等边界引入明确新主语（如“身份核验”“材料形式审查”）时，
-                # 其后结果词归新主语所有，不得用于解除审批前提；
+                # 事项-结果配对（DIP-INS-001 变体十六/十七）：结果词必须归属于审批事项本身；
+                # “但/且/而”等边界引入明确新主语时，其后结果词归新主语所有，不得用于解除审批前提：
+                # 1) 子段不含“审批/终审”：剥除确认副词后须为空或“结果/结论”类承接词，
+                #    否则为新主语事项（身份核验/材料形式审查），其结果不予采纳；
+                # 2) 子段含“审批/终审”：仍须解析其前业务对象——“手术审批”“采购审批”等其他
+                #    业务对象的审批结果同样不得解除险种更正前提；
+                #    仅“审批”本身或“本次险种更正审批”等明确指向本次更正事项的表述放行；
                 # 无新主语时“结果已确认通过”等承接表述仍视为审批结果，正常放行
                 seg_start = max([norm_clause.rfind(b, 0, m.start()) for b in ('但', '且', '而', '，', ',', '；', ';', '。')] + [-1]) + 1
                 seg_subject = norm_clause[seg_start:m.start()]
-                if '审批' not in seg_subject and '终审' not in seg_subject:
-                    subj = re.sub(r'(?:现已确认|已确认|确认无误|确认|已核实|经核实|核实无误|核实|已核准|核准|已获批|明确|现已|已经|已|正式|顺利|无误)', '', seg_subject).strip(' 的了')
+                _confirm_words = r'(?:现已确认|已确认|确认无误|确认|已核实|经核实|核实无误|核实|已核准|核准|已获批|明确|现已|已经|已|正式|顺利|无误)'
+                if '审批' in seg_subject or '终审' in seg_subject:
+                    last_appr = max(seg_subject.rfind('审批'), seg_subject.rfind('终审'))
+                    obj_part = re.sub(_confirm_words, '', seg_subject[:last_appr])
+                    obj_part = obj_part.replace('审批', '').replace('终审', '').strip(' 的了')
+                    if obj_part and not re.fullmatch(r'(?:本次|该|此|其|上述)?(?:险种|医保|参保)?(?:更正)?(?:的)?', obj_part):
+                        continue  # “手术审批/采购审批”等其他业务对象的审批结果，不算险种更正前提的肯定结论
+                else:
+                    subj = re.sub(_confirm_words, '', seg_subject).strip(' 的了')
                     if subj and not re.fullmatch(r'(?:该|其|本|此)?(?:审批|审核)?(?:结果|结论)', subj):
                         continue  # 新主语事项的结果（身份核验通过/材料审查通过等），不算审批前提的肯定结论
                 return True

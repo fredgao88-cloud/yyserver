@@ -951,8 +951,41 @@ def run_phase1_tests():
     assert res_31c_s["matched"] is True and res_31c_s["benchmark_amount"] == 2604.84
     print("PASS [Case 31c]: “已确认审批通过时间未知但结果已确认通过并更正为居民医保” -> 承接对照双路径放行，居民基准 ￥2604.84")
 
+    # ---------------- 用例 32: DIP-INS-001 变体十七验收 (两项业务同为“审批”：须解析业务对象，其他对象审批不得解除前提) ----------------
+    print("\n--- [Case 32] DIP-INS-001 变体十七验收 (“手术审批通过”“采购审批通过”拦截 + “本次险种更正审批通过”放行，双路径表驱动) ---")
+    # 修复点：解析“审批”前的业务对象，仅审批事项本身或明确指向本次险种更正的审批结果允许切换
+    v17_pending = [
+        ("32a", "审批通过时间未知但手术审批通过"),
+        ("32b", "审批通过时间未知但采购审批通过"),
+    ]
+    for tag, stage_text in v17_pending:
+        q = f"68岁，本次职工医保，如果审批通过，已确认{stage_text}并更正为居民医保，M17.9，保守治疗"
+        res_c = parse_local_intent(q)
+        assert res_c["intent"] == "need_clarification", f"Case {tag} 聊天入口应澄清，实际 {res_c['intent']}"
+        assert res_c["data"]["status"] == "PENDING"
+        assert res_c["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+        assert "2790.90" not in res_c["reply"] and "2604.84" not in res_c["reply"]
+        res_s = match_dip_rule(disease="M17.9", age=68,
+                               ins_type=f"本次职工医保，如果审批通过，已确认{stage_text}并更正为居民医保",
+                               op_keyword="保守")
+        assert res_s["matched"] is False, f"Case {tag} 结构化入口应不命中，实际 {res_s}"
+        assert res_s["status"] == "PENDING"
+        assert res_s["pending_reason"] == "CORRECTION_UNCONFIRMED"
+        assert "benchmark_amount" not in res_s
+        print(f"PASS [Case {tag}]: “已确认{stage_text}并更正为居民医保” -> 双路径均 PENDING / CORRECTION_UNCONFIRMED，零金额输出")
+
+    # 32c. 同组对照：明确指向本次险种更正事项的审批结果，正常放行（双路径）
+    q_32c = "68岁，本次职工医保，如果审批通过，已确认审批通过时间未知但本次险种更正审批通过并更正为居民医保，M17.9，保守治疗"
+    res_32c = parse_local_intent(q_32c)
+    assert res_32c["intent"] == "query_dip_rule" and res_32c["data"]["benchmark_amount"] == 2604.84
+    res_32c_s = match_dip_rule(disease="M17.9", age=68,
+                               ins_type="本次职工医保，如果审批通过，已确认审批通过时间未知但本次险种更正审批通过并更正为居民医保",
+                               op_keyword="保守")
+    assert res_32c_s["matched"] is True and res_32c_s["benchmark_amount"] == 2604.84
+    print("PASS [Case 32c]: “已确认审批通过时间未知但本次险种更正审批通过并更正为居民医保” -> 对照双路径放行，居民基准 ￥2604.84")
+
     print("\n" + "=" * 70)
-    print(">>> 恭喜！Phase 1 验收回归测试套件全部 31 大关键测试集 100% 通过！ <<<")
+    print(">>> 恭喜！Phase 1 验收回归测试套件全部 32 大关键测试集 100% 通过！ <<<")
     print("=" * 70)
 
 if __name__ == "__main__":
