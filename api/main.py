@@ -9,6 +9,7 @@
 - 支持渠道分流（钉钉渠道患者级查询自动激活隐私盾牌）。
 """
 from fastapi import FastAPI, HTTPException, Query, Header, Depends
+from contextlib import asynccontextmanager
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 from decimal import Decimal
@@ -30,11 +31,21 @@ from auth.rbac import (
     ROLE_DOCTOR, ROLE_DEPT_HEAD, get_operator
 )
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """FIX-10: 使用 lifespan 替代已废弃的 @app.on_event('startup')"""
+    try:
+        ensure_auth_schema()
+    except Exception as e:
+        print(f"[WARN] 鉴权账号表自检失败: {e}")
+    yield
+
 app = FastAPI(
     title="私立医院智能业务管理 Agent 系统 (FastAPI 规则引擎)",
     version="1.2.0",
     docs_url="/docs",
-    redoc_url="/redoc"
+    redoc_url="/redoc",
+    lifespan=lifespan
 )
 
 # ----------------- 数据模型定义 -----------------
@@ -66,14 +77,6 @@ class LoginRequest(BaseModel):
     password: str = Field(..., description="操作员口令")
 
 # ----------------- 启动自检 -----------------
-
-@app.on_event("startup")
-async def _startup_auth_schema():
-    """启动时确保鉴权账号表就绪（数据库暂不可用时仅告警，不阻断服务）"""
-    try:
-        ensure_auth_schema()
-    except Exception as e:
-        print(f"[WARN] 鉴权账号表自检失败: {e}")
 
 # ----------------- 路由定义 -----------------
 
@@ -406,12 +409,14 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
         cutoff_time = latest_batch["data_cutoff_time"]
         synced_at = latest_batch["synced_at"]
 
+        # FIX-01: 确保 naive/aware datetime 一致性，pymssql 返回 naive datetime，统一去除 tzinfo
         now_dt = datetime.now()
+        synced_at_naive = synced_at.replace(tzinfo=None) if synced_at and getattr(synced_at, 'tzinfo', None) else synced_at
         is_stale = False
         stale_warning = None
-        if synced_at and (now_dt - synced_at) > timedelta(hours=24):
+        if synced_at_naive and (now_dt - synced_at_naive) > timedelta(hours=24):
             is_stale = True
-            stale_warning = f"快照数据生成于 {synced_at.strftime('%Y-%m-%d %H:%M:%S')}，已超过 24 小时未更新，请及时运行定时巡检任务"
+            stale_warning = f"快照数据生成于 {synced_at_naive.strftime('%Y-%m-%d %H:%M:%S')}，已超过 24 小时未更新，请及时运行定时巡检任务"
 
         sql = """
         SELECT visit_id, ward_name, bed_no, dept_id, dept_name, doctor_id, age,
@@ -431,6 +436,8 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
             sql += f" AND dept_id IN ({placeholders})"
             params.extend(dept_list)
         elif dept:
+            # FIX-07: 优先按 dept_id 过滤；若传入的是名称，同时匹配 dept_name 作为兼容；
+            # 管理员路径不受科室 ID 授权约束，但仍建议前端传 dept_id 而非名称
             sql += " AND (dept_id = %s OR dept_name = %s)"
             params.extend([dept, dept])
         sql += " ORDER BY alert_level ASC, current_fee DESC"

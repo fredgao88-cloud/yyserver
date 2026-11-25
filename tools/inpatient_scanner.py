@@ -308,6 +308,14 @@ class InpatientScanner:
 
             local_conn.commit()
             print(f"[{batch_id}] Successfully persisted {len(evaluated_snapshots)} snapshot records to local_db.")
+        except Exception as scan_err:
+            # FIX-08: 任意患者写入异常时回滚整个批次，确保快照原子性
+            try:
+                local_conn.rollback()
+            except Exception:
+                pass
+            print(f"[{batch_id}] ERROR: 批次写入异常，已回滚所有未提交快照记录: {scan_err}")
+            raise
         finally:
             local_conn.close()
 

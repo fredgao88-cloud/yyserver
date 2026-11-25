@@ -20,6 +20,10 @@ import time
 import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+# FIX-13: his_ks 目录 TTL 缓存，避免每次鉴权都查一次 HIS 数据库
+_his_ks_cache: Dict[str, Any] = {"rows": None, "ts": 0.0}
+_HIS_KS_CACHE_TTL = 300  # 5 分钟
+
 # 确保能加载项目内部模块
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -314,9 +318,13 @@ def authenticate(operator_id: str, password: str) -> Tuple[Optional[Dict[str, An
     op = get_operator(operator_id)
     if op is None or op.get("status") != "ACTIVE" or not verify_password(password or "", op.get("password_hash", "")):
         fail_count += 1
-        locked_until = now + LOCKOUT_SECONDS if fail_count >= MAX_LOGIN_FAILS else 0.0
+        should_lock = (fail_count >= MAX_LOGIN_FAILS)
+        locked_until = now + LOCKOUT_SECONDS if should_lock else 0.0
         _login_failures[operator_id] = (fail_count, locked_until)
-        return None, "工号或口令错误" if locked_until <= now else f"连续失败 {MAX_LOGIN_FAILS} 次，账号已锁定 {LOCKOUT_SECONDS // 60} 分钟"
+        # FIX-03: 显式分支，避免三元优先级歧义
+        if should_lock:
+            return None, f"连续失败 {MAX_LOGIN_FAILS} 次，账号已锁定 {LOCKOUT_SECONDS // 60} 分钟"
+        return None, "工号或口令错误"
 
     _login_failures.pop(operator_id, None)
     return op, ""
@@ -339,18 +347,25 @@ def resolve_authorized_dept_ids(dept_scope: str, his_ks_rows: Optional[List[Dict
 
     rows = his_ks_rows
     if rows is None:
-        try:
-            from db.his_reader import HISReader
-            r = HISReader()
-            conn = r.get_connection()
-            cur = conn.cursor(as_dict=True)
+        # FIX-13: 使用 TTL 缓存，5 分钟内复用同一份 his_ks 目录，减少 HIS 数据库往返
+        cached = _his_ks_cache
+        if cached["rows"] is not None and (time.time() - cached["ts"]) < _HIS_KS_CACHE_TTL:
+            rows = cached["rows"]
+        else:
             try:
-                cur.execute("SELECT ksid, ksname FROM dbo.his_ks WHERE ksid IS NOT NULL")
-                rows = cur.fetchall()
-            finally:
-                conn.close()
-        except Exception:
-            rows = None
+                from db.his_reader import HISReader
+                r = HISReader()
+                conn = r.get_connection()
+                cur = conn.cursor(as_dict=True)
+                try:
+                    cur.execute("SELECT ksid, ksname FROM dbo.his_ks WHERE ksid IS NOT NULL")
+                    rows = cur.fetchall()
+                    _his_ks_cache["rows"] = rows
+                    _his_ks_cache["ts"] = time.time()
+                finally:
+                    conn.close()
+            except Exception:
+                rows = None
 
     if rows is None:
         # AUTH-SCOPE-002：科室目录不可用时一律拒绝，绝不扩大或猜测授权范围
