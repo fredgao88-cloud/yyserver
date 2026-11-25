@@ -4,6 +4,7 @@
 严格按照《开发设计文档 v1.2》架构规范实现，从 .env 读取连接参数，统一管理连接与事务
 支持容器内与宿主机环境无缝切换，提供规则库检索、在院快照保存与合规审计日志记录
 """
+import logging
 import os
 try:
     import pymssql
@@ -24,6 +25,9 @@ LOCAL_DB_PORT = int(os.getenv("LOCAL_DB_PORT", "1433"))
 LOCAL_DB_USER = os.getenv("LOCAL_DB_USER", "sa")
 LOCAL_DB_PASS = os.getenv("LOCAL_DB_PASS", "")
 LOCAL_DB_NAME = os.getenv("LOCAL_DB_NAME", "his_agent_db")
+DB_NO_FALLBACK = os.getenv("DB_NO_FALLBACK", "").strip().lower() in ("1", "true", "yes")
+
+logger = logging.getLogger("hospital_agent.local_db")
 
 def get_local_db_connection(as_dict: bool = True) -> Tuple[Any, Any]:
     """
@@ -35,12 +39,14 @@ def get_local_db_connection(as_dict: bool = True) -> Tuple[Any, Any]:
     if not LOCAL_DB_PASS:
         raise ValueError("LOCAL_DB_PASS environment variable must be explicitly configured and non-empty.")
     candidates = [LOCAL_DB_HOST]
-    for fallback in ["127.0.0.1", "localhost", "sqlserver"]:
-        if fallback not in candidates:
-            candidates.append(fallback)
-            
+    # FIX-04: 支持通过 DB_NO_FALLBACK=1 禁用连接回退，避免在已知单点环境中浪费超时重试
+    if not DB_NO_FALLBACK:
+        for fallback in ["127.0.0.1", "localhost", "sqlserver"]:
+            if fallback not in candidates:
+                candidates.append(fallback)
+
     last_err = None
-    for h in candidates:
+    for idx, h in enumerate(candidates):
         try:
             conn = pymssql.connect(
                 server=h,
@@ -55,6 +61,8 @@ def get_local_db_connection(as_dict: bool = True) -> Tuple[Any, Any]:
             return conn.cursor(as_dict=as_dict), conn
         except Exception as e:
             last_err = e
+            if idx + 1 < len(candidates):
+                logger.warning("本地数据库连接失败 (host=%s): %s，尝试回退地址 %s", h, e, candidates[idx + 1])
             continue
             
     raise ConnectionError(f"无法连接到本地数据库 his_agent_db (尝试地址: {candidates}): {last_err}")
@@ -127,6 +135,7 @@ def record_audit_log(
         ))
         conn.commit()
     except Exception as e:
-        print(f"[WARN] 记录审计日志失败: {e}")
+        # FIX-11: 使用结构化日志记录审计写入异常，避免仅 print 导致高并发下日志丢失
+        logger.error("记录审计日志失败: action=%s operator=%s role=%s err=%s", action_type, operator_id, role_type, e, exc_info=True)
     finally:
         conn.close()

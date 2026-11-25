@@ -16,6 +16,7 @@ import json
 import os
 import secrets
 import sys
+import threading
 import time
 import re
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -51,8 +52,10 @@ ALERTS_ROLES = (ROLE_DEPT_HEAD, ROLE_INSURANCE, ROLE_ADMIN)                     
 
 TOKEN_TTL_MINUTES = int(os.getenv("AUTH_TOKEN_TTL_MINUTES", "720"))  # 令牌有效期，默认 12 小时
 
-# 登录失败内存限流（单进程内有效）：operator_id -> (连续失败次数, 锁定截止 epoch)
+# FIX-06: 登录失败内存限流（单进程内有效，由 _login_lock 保证线程安全）：operator_id -> (连续失败次数, 锁定截止 epoch)
+# 注：当前生产环境为 uvicorn 单 worker 部署，单进程内存限流可控；若未来启用多 worker，需迁移至数据库或 Redis 共享限流
 _login_failures: Dict[str, Tuple[int, float]] = {}
+_login_lock = threading.Lock()
 MAX_LOGIN_FAILS = 5
 LOCKOUT_SECONDS = 600
 
@@ -311,22 +314,26 @@ def authenticate(operator_id: str, password: str) -> Tuple[Optional[Dict[str, An
     operator_id = (operator_id or "").strip()[:64]
     now = time.time()
 
-    fail_count, locked_until = _login_failures.get(operator_id, (0, 0.0))
-    if locked_until > now:
-        return None, f"账号已锁定，请 {int(locked_until - now)} 秒后再试"
+    with _login_lock:
+        fail_count, locked_until = _login_failures.get(operator_id, (0, 0.0))
+        if locked_until > now:
+            return None, f"账号已锁定，请 {int(locked_until - now)} 秒后再试"
 
     op = get_operator(operator_id)
     if op is None or op.get("status") != "ACTIVE" or not verify_password(password or "", op.get("password_hash", "")):
-        fail_count += 1
-        should_lock = (fail_count >= MAX_LOGIN_FAILS)
-        locked_until = now + LOCKOUT_SECONDS if should_lock else 0.0
-        _login_failures[operator_id] = (fail_count, locked_until)
+        with _login_lock:
+            fail_count, _ = _login_failures.get(operator_id, (0, 0.0))
+            fail_count += 1
+            should_lock = (fail_count >= MAX_LOGIN_FAILS)
+            locked_until = now + LOCKOUT_SECONDS if should_lock else 0.0
+            _login_failures[operator_id] = (fail_count, locked_until)
         # FIX-03: 显式分支，避免三元优先级歧义
         if should_lock:
             return None, f"连续失败 {MAX_LOGIN_FAILS} 次，账号已锁定 {LOCKOUT_SECONDS // 60} 分钟"
         return None, "工号或口令错误"
 
-    _login_failures.pop(operator_id, None)
+    with _login_lock:
+        _login_failures.pop(operator_id, None)
     return op, ""
 
 

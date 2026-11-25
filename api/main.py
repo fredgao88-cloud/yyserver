@@ -40,11 +40,15 @@ async def lifespan(app: FastAPI):
         print(f"[WARN] 鉴权账号表自检失败: {e}")
     yield
 
+# FIX-09: 生产环境默认关闭 /docs 与 /redoc，仅在显式设置 ENABLE_API_DOCS=1/true 时开放
+_ENABLE_API_DOCS = os.getenv("ENABLE_API_DOCS", "false").strip().lower() in ("1", "true", "yes")
+
 app = FastAPI(
     title="私立医院智能业务管理 Agent 系统 (FastAPI 规则引擎)",
     version="1.2.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
+    docs_url="/docs" if _ENABLE_API_DOCS else None,
+    redoc_url="/redoc" if _ENABLE_API_DOCS else None,
+    openapi_url="/openapi.json" if _ENABLE_API_DOCS else None,
     lifespan=lifespan
 )
 
@@ -455,7 +459,10 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
                 "RED": "费用超标（>110%）",
                 "PENDING": f"待定核查（{r.get('pending_reason') or '信息待补充'}）"
             }
-            ratio = float(r["fee_ratio"] * Decimal("100")) if r["fee_ratio"] is not None else None
+            # FIX-12: 先用 Decimal quantize 消除浮点舍入误差；保留原数值字段兼容旧调用方，同时提供高精度字符串字段
+            fee_dec = Decimal(str(r["current_fee"])).quantize(Decimal("0.01"))
+            bm_dec = Decimal(str(r["target_base"])).quantize(Decimal("0.01")) if r["target_base"] is not None else None
+            ratio_dec = (r["fee_ratio"] * Decimal("100")).quantize(Decimal("0.01")) if r["fee_ratio"] is not None else None
             items.append({
                 "zyh": r["visit_id"],
                 "dept_id": r.get("dept_id"),
@@ -466,13 +473,15 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
                 "doctor_id": r["doctor_id"],
                 "disease": r["primary_icd"] or "未明确",
                 "ins_type": r["ins_type"],
-                "current_cost": float(r["current_fee"]),
-                "benchmark": float(r["target_base"]) if r["target_base"] is not None else None,
+                "current_cost": float(fee_dec),
+                "current_cost_str": f"{fee_dec:.2f}",
+                "benchmark": float(bm_dec) if bm_dec is not None else None,
+                "benchmark_str": f"{bm_dec:.2f}" if bm_dec is not None else None,
                 "light": light_map.get(level, level),
                 "alert_level": level,
                 "status": status_desc_map.get(level, level),
                 "pending_reason": r.get("pending_reason"),
-                "ratio_percent": round(ratio, 2) if ratio is not None else None
+                "ratio_percent": float(ratio_dec) if ratio_dec is not None else None
             })
 
         return {
