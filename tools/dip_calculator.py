@@ -261,8 +261,8 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
         2) 全局否决与冲突判定：整句含“终审未通过”“未予通过”“被否决”等任何否定审批结果的，绝不放行；
         3) 全局撤回与辟谣判定：整句含“消息有误”“消息不实”“已被撤回”等撤销消息的，绝不放行；
         4) 全局阶段性未决判定：含“仍待终审/尚无结论”，或仅有“初审通过/通过初审”而无终审结果的，绝不放行；
-        5) 结果词肯定同现：前提中的结果词（如“通过”）须在确认分句以肯定形式出现，
-           且前后无否定词、阶段词、辟谣词修饰；
+        5) 结果词肯定同现：前提中的结果词（如“通过”）须在确认分句剥除时间字段未知修饰后的
+           同一份文本上以肯定形式出现，且前后无否定词、阶段词、辟谣词修饰；
         6) 肯定对照放行：“审批通过”“终审通过”“已确认审批通过”等无冲突明确结果正常放行。"""
         if not core_text:
             return False  # 前提核心为空时绝不自动解除，保持澄清
@@ -308,17 +308,21 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
         if _premise_pending_markers.search(norm_clause):
             return False
 
+        # 结果词肯定判定必须与未决标记检查共用同一份剥除了过去时间约数与时间字段未知修饰的
+        # 文本（norm_clause）：否则已从时间字段中剔除的“通过”（如“审批通过时间未知”
+        # “审批通过日期待定”）会在原始 clause_text 中重新参与肯定结果判定，
+        # 把“时间字段未知/待定”误判为“同一前提已有明确肯定结果”（DIP-INS-001 变体十五）
         core_outcomes = [w for w in _premise_outcome_words if w in core_text]
         if not core_outcomes:
-            return core_text in clause_text
+            return core_text in norm_clause
         for w in core_outcomes:
-            for m in re.finditer(re.escape(w), clause_text):
-                if _negation_pre.search(clause_text[:m.start()]):
+            for m in re.finditer(re.escape(w), norm_clause):
+                if _negation_pre.search(norm_clause[:m.start()]):
                     continue  # 紧邻否定/疑问/部分限定（“未通过”“不予通过”“是否通过”“仅通过”）不算肯定
-                if _premise_stage_suffix.match(clause_text[m.end():]):
+                if _premise_stage_suffix.match(norm_clause[m.end():]):
                     continue  # 结果词后紧跟阶段词（“通过初审/预审”）仅为阶段性通过，不算最终肯定
                 # 必须不是阶段性通过（如果包含初审/预审/初核且不包含终审通过，则不算最终肯定）
-                if any(st in clause_text for st in ('初审', '预审', '初核', '预核')) and not ('终审通过' in clause_text or '已通过终审' in clause_text):
+                if any(st in norm_clause for st in ('初审', '预审', '初核', '预核')) and not ('终审通过' in norm_clause or '已通过终审' in norm_clause):
                     continue
                 return True
         return False
