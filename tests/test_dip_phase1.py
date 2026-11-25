@@ -850,8 +850,41 @@ def run_phase1_tests():
         assert res_ok_s["matched"] is True and res_ok_s["benchmark_amount"] == 2604.84
         print(f"PASS [Case {tag}]: “已确认{ok_text}并更正为居民医保” -> 正对照双路径放行，居民基准 ￥2604.84")
 
+    # ---------------- 用例 29: DIP-INS-001 变体十四验收 (等待/跨词尚未拦截 + 时间字段未知剥离) ----------------
+    print("\n--- [Case 29] DIP-INS-001 变体十四验收 (等待/跨词尚未 vs 时间字段未知，双路径表驱动) ---")
+    v14_pending = [
+        ("29a", "审批仍在等待通过"),
+        ("29b", "审批系统尚未显示通过"),
+        ("29c", "审批尚未被确认通过"),
+    ]
+    for tag, stage_text in v14_pending:
+        q = f"68岁，本次职工医保，如果审批通过，已确认{stage_text}并更正为居民医保，M17.9，保守治疗"
+        res_c = parse_local_intent(q)
+        assert res_c["intent"] == "need_clarification", f"Case {tag} 聊天入口应澄清，实际 {res_c['intent']}"
+        assert res_c["data"]["status"] == "PENDING"
+        assert res_c["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+        assert "2790.90" not in res_c["reply"] and "2604.84" not in res_c["reply"]
+        res_s = match_dip_rule(disease="M17.9", age=68,
+                               ins_type=f"本次职工医保，如果审批通过，已确认{stage_text}并更正为居民医保",
+                               op_keyword="保守")
+        assert res_s["matched"] is False
+        assert res_s["status"] == "PENDING"
+        assert res_s["pending_reason"] == "CORRECTION_UNCONFIRMED"
+        assert "benchmark_amount" not in res_s
+        print(f"PASS [Case {tag}]: “已确认{stage_text}并更正为居民医保” -> 双路径均 PENDING / CORRECTION_UNCONFIRMED，零金额输出")
+
+    for tag, ok_text in [("29d", "审批通过时间未知但结果已确认通过"), ("29e", "审批已于上周通过")]:
+        q_ok = f"68岁，本次职工医保，如果审批通过，已确认{ok_text}并更正为居民医保，M17.9，保守治疗"
+        res_ok_c = parse_local_intent(q_ok)
+        assert res_ok_c["intent"] == "query_dip_rule" and res_ok_c["data"]["benchmark_amount"] == 2604.84
+        res_ok_s = match_dip_rule(disease="M17.9", age=68,
+                                  ins_type=f"本次职工医保，如果审批通过，已确认{ok_text}并更正为居民医保",
+                                  op_keyword="保守")
+        assert res_ok_s["matched"] is True and res_ok_s["benchmark_amount"] == 2604.84
+        print(f"PASS [Case {tag}]: “已确认{ok_text}并更正为居民医保” -> 正对照双路径放行，居民基准 ￥2604.84")
+
     print("\n" + "=" * 70)
-    print(">>> 恭喜！Phase 1 验收回归测试套件全部 28 大关键测试集 100% 通过！ <<<")
+    print(">>> 恭喜！Phase 1 验收回归测试套件全部 29 大关键测试集 100% 通过！ <<<")
     print("=" * 70)
 
 if __name__ == "__main__":
