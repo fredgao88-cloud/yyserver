@@ -47,7 +47,7 @@ def test_build_alert_markdown_privacy_safe():
     }
     title, text = build_alert_markdown(summary)
     assert "红灯 2 例" in title
-    assert "NOTIFY-" in text
+    assert "汇总统计" in text
     assert "BATCH_20261126_080000" not in text
     assert "中医科(红2/黄1)" in text
     assert "骨伤科(红0/黄2)" in text

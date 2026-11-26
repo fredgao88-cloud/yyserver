@@ -75,8 +75,16 @@ def extract_operation_keyword(text_clean: str):
             else:
                 op_states.setdefault(matched_kw, "UNKNOWN")
         elif last_op is not None:
-            # 若无术式分句包含明确的非手术行政/临床事务名词（如“入院手续”“出院”），严禁将其时态继承给上一手术操作
-            if any(n in clause for n in non_op_nouns):
+            # DIP-OP-001：仅当分句包含明确指代词或剥除时间副词与时态动词后无剩余独立宾语时，才继承更新上一操作
+            has_pronoun = bool(re.search(r"(?:该操作|该手术|该检查|此操作|此手术|此检查|该项|上述操作|上述手术|上述检查|前项)", clause))
+            residual = re.sub(
+                r"(?:现已|已经|已|暂|目前|随后|后来|最终|确定|决定|还是|改为|变成|"
+                r"取消|未做|未行|放弃|暂不做|拟行|拟做|计划|准备行|拟实施|准备做|打算做|"
+                r"已完成|已行|已做|做完|术后|已实施|原定|原本|了|的|呢|\s)+",
+                "",
+                clause,
+            ).strip()
+            if not has_pronoun and residual:
                 continue
             if any(k in clause for k in cancel_kws):
                 _set_op_state(last_op, "CANCELED")

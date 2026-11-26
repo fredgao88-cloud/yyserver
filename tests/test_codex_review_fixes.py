@@ -47,7 +47,7 @@ def test_notify_data_001_blocks_arbitrary_text_in_outbound_payload():
     assert "中医科(红1/黄0)" in text
     assert "其他已核验科室(红1/黄1)" in text
 
-    # 已批准登记版本可以正常出站；自定义批次 B314159 既不得原样出站，也不得出现其公开 SHA-256 摘要，且重发复用同一随机 ID
+    # 已批准登记版本可以正常出站；自定义批次 B314159 既不得原样出站，也不得出现其公开 SHA-256 摘要，且跨进程重发载荷完全一致
     import hashlib
     b_sha = hashlib.sha256(b"B314159").hexdigest()[:8].upper()
     summary_ok = dict(summary, batch_id="B314159", rule_version="2026_SAMPLE_V1")
@@ -56,7 +56,6 @@ def test_notify_data_001_blocks_arbitrary_text_in_outbound_payload():
     assert "2026_SAMPLE_V1" in text_ok_1
     assert "B314159" not in text_ok_1
     assert b_sha not in text_ok_1
-    assert "NOTIFY-" in text_ok_1
     assert text_ok_1 == text_ok_2
 
 
@@ -168,6 +167,19 @@ def test_dip_op_001_canceled_operation_falls_back_to_conservative():
     tc_dis = extract_tool_call("住院号 zy2025042901，诊断 K63.5，已完成胃镜，取消出院，当前费用 2500 元，职工医保")
     assert tc_dis["arguments"]["operation"] == "胃镜"
     assert tc_dis["arguments"]["operation_status"] == "COMPLETED"
+
+    # “拟行胃镜，已完成抽血”与“已完成胃镜，取消输液”不得跨独立事项污染前序操作
+    kw3, st3, _ = extract_operation_keyword("拟行胃镜，已完成抽血")
+    assert kw3 == "保守" and st3 == "PLANNED"
+    tc_draw = extract_tool_call("住院号 zy2025042901，诊断 K63.5，拟行胃镜，已完成抽血，当前费用 2500 元，职工医保")
+    assert tc_draw["arguments"]["operation"] == "保守"
+    assert tc_draw["arguments"]["operation_status"] == "PLANNED"
+
+    kw4, st4, _ = extract_operation_keyword("已完成胃镜，取消输液")
+    assert kw4 == "胃镜" and st4 == "COMPLETED"
+    tc_inf = extract_tool_call("住院号 zy2025042901，诊断 K63.5，已完成胃镜，取消输液，当前费用 2500 元，职工医保")
+    assert tc_inf["arguments"]["operation"] == "胃镜"
+    assert tc_inf["arguments"]["operation_status"] == "COMPLETED"
 
 
 def test_chat_audit_001_denied_vs_permitted():

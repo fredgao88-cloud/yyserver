@@ -16,8 +16,6 @@ import json
 import logging
 import os
 import re
-import secrets
-import threading
 import time
 import urllib.error
 import urllib.parse
@@ -30,22 +28,6 @@ DEFAULT_WORKBENCH_URL = "https://hospital-internal.local/inpatient"
 
 # 受控已批准规则版本白名单（仅受控映射值可进入出站载荷）
 DEFAULT_ALLOWED_VERSIONS: Set[str] = {"2026_SAMPLE_V1"}
-
-# NOTIFY-DATA-001：院内随机对外通知编号映射表（与内部批次号无任何可公开复算关系，重发复用）
-_OUTBOUND_NOTIFY_LOCK = threading.Lock()
-_OUTBOUND_NOTIFY_MAP: Dict[str, str] = {}
-
-
-def _get_or_create_outbound_notify_id(raw_batch: str) -> str:
-    if not raw_batch:
-        return f"NOTIFY-{secrets.token_hex(4).upper()}"
-    with _OUTBOUND_NOTIFY_LOCK:
-        existing = _OUTBOUND_NOTIFY_MAP.get(raw_batch)
-        if existing is not None:
-            return existing
-        new_id = f"NOTIFY-{secrets.token_hex(4).upper()}"
-        _OUTBOUND_NOTIFY_MAP[raw_batch] = new_id
-        return new_id
 # 内置标准受控科室白名单（也可由调用方传入 his_ks 目录核验集合）
 DEFAULT_ALLOWED_DEPTS: Set[str] = {
     "中医科", "骨伤科", "内科", "外科", "妇科", "儿科",
@@ -71,12 +53,9 @@ def _sanitize_outbound_summary(
     allowed_versions: Optional[Set[str]] = None,
 ) -> Dict[str, Any]:
     """
-    NOTIFY-DATA-001：独立构建受控出站对象，清洗并拦截任何非受控或未登记版本/自由文本标记；
-    对内部批次号使用院内随机映射的独立通知 ID，绝不包含原值或其任何可公开复算摘要。
+    NOTIFY-DATA-001 / NOTIFY-ID-001：独立构建受控出站对象，清洗并拦截任何非受控或未登记版本/自由文本标记；
+    群通知仅包含汇总统计，完全省略内部批次号与随机编号，保证跨进程重发载荷完全一致且零内部标识泄露。
     """
-    raw_batch = str(summary.get("batch_id") or "").strip()
-    safe_batch = _get_or_create_outbound_notify_id(raw_batch)
-
     env_versions = {
         v.strip()
         for v in os.getenv("DINGTALK_ALLOWED_VERSIONS", "").split(",")
@@ -107,7 +86,6 @@ def _sanitize_outbound_summary(
             bucket["YELLOW"] += y_c
 
     return {
-        "batch_id": safe_batch,
         "data_cutoff_time": safe_cutoff,
         "rule_version": safe_ver,
         "total_scanned": max(0, int(summary.get("total_scanned") or 0)),
@@ -128,8 +106,7 @@ def build_alert_markdown(
     """
     基于受控净化后的出站对象构建钉钉 Markdown 消息 (title, text)。
     """
-    safe = _sanitize_outbound_summary(summary, allowed_depts=allowed_depts)
-    batch_id = safe["batch_id"]
+    safe = _sanitize_outbound_summary(summary, allowed_depts=allowed_depts, allowed_versions=None)
     cutoff = safe["data_cutoff_time"]
     rule_ver = safe["rule_version"]
     total = safe["total_scanned"]
@@ -150,7 +127,6 @@ def build_alert_markdown(
 
     lines = [
         f"### {title}",
-        f"- **扫描批次**：`{batch_id}`",
         f"- **截止时间**：{cutoff}",
         f"- **规则版本**：`{rule_ver}`",
         f"- **汇总统计**：共 {total} 例（红灯 **{red_cnt}** | 黄灯 **{yellow_cnt}** | 绿灯 {green_cnt} | 待定 {pending_cnt} | 自费 {na_cnt}）",
