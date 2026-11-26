@@ -51,9 +51,10 @@ _COMMON_STYLE = """
 def _nav_html(active: str) -> str:
     items = [
         ("/inpatient", "在院预警看板", "inpatient"),
+        ("/calculator", "DIP 试算问答", "calculator"),
         ("/analytics", "医生绩效趋势", "analytics"),
         ("/reconciliation", "决算对账", "reconciliation"),
-        ("/admin/dip-rules", "DIP 规则导入", "dip-rules"),
+        ("/admin/dip-rules", "DIP 规则管理", "dip-rules"),
         ("/admin/audit-logs", "审计日志", "audit-logs"),
         ("/admin/operators", "操作员管理", "operators"),
     ]
@@ -110,6 +111,7 @@ INPATIENT_ALERTS_HTML = f"""<!DOCTYPE html>
           </div>
           <button onclick="loadAlerts()">查询预警</button>
           <button class="secondary" onclick="exportInpatientCsv()">导出 CSV</button>
+          <button class="ok" onclick="triggerManualScan()">立即扫描刷新</button>
         </div>
         <button class="danger" onclick="doLogout()">退出登录</button>
       </div>
@@ -277,6 +279,26 @@ function exportInpatientCsv() {{
     it.ratio_percent, it.alert_level, it.status
   ]);
   downloadCsv("inpatient_alerts.csv", headers, rows);
+}}
+async function triggerManualScan() {{
+  showMsg("正在触发在院扫描，请稍候...", false);
+  const r = await fetch("/api/admin/trigger-scan", {{
+    method: "POST",
+    headers: {{ "Content-Type": "application/json", ...authHeaders() }},
+    body: JSON.stringify({{ limit: 50, notify_dingtalk: false }})
+  }});
+  const data = await r.json();
+  if (r.status === 401) {{
+    clearProtectedInpatientData(); sessionStorage.removeItem(TOKEN_KEY);
+    document.getElementById("mainArea").classList.add("hidden"); document.getElementById("loginCard").classList.remove("hidden");
+    showMsg(data.detail || "登录已失效", true); return;
+  }}
+  if (r.status === 403 || !r.ok) {{
+    if (r.status === 403) clearProtectedInpatientData();
+    showMsg(data.detail || "扫描触发失败（仅医保办/管理员可操作）", true); return;
+  }}
+  showMsg("扫描完成：共 " + data.total_scanned + " 例（红灯 " + data.RED + " / 黄灯 " + data.YELLOW + "）", false);
+  loadAlerts();
 }}
 if (getToken()) {{
   document.getElementById("loginCard").classList.add("hidden");
@@ -553,6 +575,31 @@ DIP_RULES_ADMIN_HTML = f"""<!DOCTYPE html>
     </div>
 
     <div class="card">
+      <h2>规则目录审核与启用（PENDING → APPROVED / ARCHIVED）</h2>
+      <div class="row">
+        <div class="field" style="max-width:180px;"><label>版本号筛选</label><input id="qVer" placeholder="如 2026_SAMPLE_V1"></div>
+        <div class="field" style="max-width:160px;">
+          <label>审核状态</label>
+          <select id="qStatus">
+            <option value="">全部</option>
+            <option value="PENDING">PENDING (待审核)</option>
+            <option value="APPROVED">APPROVED (已生效)</option>
+            <option value="ARCHIVED">ARCHIVED (已归档)</option>
+          </select>
+        </div>
+        <button onclick="loadDipRules()">查询规则</button>
+        <button class="ok" onclick="reviewDipRules('APPROVED')">整批审批启用 (APPROVED)</button>
+        <button class="secondary" onclick="reviewDipRules('ARCHIVED')">整批归档 (ARCHIVED)</button>
+      </div>
+      <table>
+        <thead>
+          <tr><th>ID</th><th>版本</th><th>科室</th><th>ICD</th><th>病种分组</th><th>分值</th><th>职工基准</th><th>居民基准</th><th>状态</th></tr>
+        </thead>
+        <tbody id="rulesTbody"></tbody>
+      </table>
+    </div>
+
+    <div class="card">
       <h2>执行结果</h2>
       <pre id="resultBox" style="background:#f8fafc;padding:12px;border-radius:6px;font-size:12px;overflow:auto;">尚未执行</pre>
     </div>
@@ -561,7 +608,6 @@ DIP_RULES_ADMIN_HTML = f"""<!DOCTYPE html>
 
 <script>
 const TOKEN_KEY = "hospital_admin_token";
-let cachedDoctors = [];
 function showMsg(text, isErr) {{
   const el = document.getElementById("msg");
   el.textContent = text;
@@ -569,6 +615,9 @@ function showMsg(text, isErr) {{
 }}
 function getToken() {{ return sessionStorage.getItem(TOKEN_KEY) || ""; }}
 function authHeaders() {{ return {{ "Content-Type": "application/json", "Authorization": "Bearer " + getToken() }}; }}
+function clearProtectedRulesData() {{
+  document.getElementById("rulesTbody").innerHTML = "";
+}}
 async function doLogin() {{
   const operator_id = document.getElementById("loginId").value.trim();
   const password = document.getElementById("loginPwd").value;
@@ -582,6 +631,7 @@ async function doLogin() {{
   document.getElementById("loginCard").classList.add("hidden");
   document.getElementById("mainArea").classList.remove("hidden");
   showMsg("登录成功", false);
+  loadDipRules();
 }}
 function doLogout() {{ sessionStorage.removeItem(TOKEN_KEY); location.reload(); }}
 function loadCsvFile() {{
@@ -605,16 +655,75 @@ async function submitImport() {{
     method: "POST", headers: authHeaders(), body: JSON.stringify(payload)
   }});
   const data = await r.json();
+  if (r.status === 401) {{
+    clearProtectedRulesData(); sessionStorage.removeItem(TOKEN_KEY);
+    document.getElementById("mainArea").classList.add("hidden"); document.getElementById("loginCard").classList.remove("hidden");
+    showMsg(data.detail || "登录已失效", true); return;
+  }}
   document.getElementById("resultBox").textContent = JSON.stringify(data, null, 2);
   if (!r.ok || !data.success) {{
     showMsg(data.detail || "校验/导入存在错误，请查看下方结果", true);
   }} else {{
     showMsg((payload.dry_run ? "预检通过" : "导入成功") + "：有效行数 " + data.valid_rows, false);
+    if (!payload.dry_run) loadDipRules();
   }}
+}}
+async function loadDipRules() {{
+  const ver = document.getElementById("qVer").value.trim();
+  const st = document.getElementById("qStatus").value;
+  let url = "/api/admin/dip-rules?limit=100";
+  if (ver) url += "&rule_version=" + encodeURIComponent(ver);
+  if (st) url += "&review_status=" + encodeURIComponent(st);
+  const r = await fetch(url, {{ headers: authHeaders() }});
+  const data = await r.json();
+  if (r.status === 401) {{
+    clearProtectedRulesData(); sessionStorage.removeItem(TOKEN_KEY);
+    document.getElementById("mainArea").classList.add("hidden"); document.getElementById("loginCard").classList.remove("hidden");
+    showMsg(data.detail || "登录已失效", true); return;
+  }}
+  if (r.status === 403 || !r.ok) {{
+    clearProtectedRulesData(); showMsg(data.detail || "无权查看规则列表", true); return;
+  }}
+  const tbody = document.getElementById("rulesTbody");
+  tbody.innerHTML = "";
+  for (const row of (data.items || [])) {{
+    const tr = document.createElement("tr");
+    const vals = [
+      String(row.rule_id), row.rule_version, row.department, row.icd_code,
+      row.dip_group_name, String(row.dip_score), String(row.employee_base), String(row.resident_base)
+    ];
+    for (const v of vals) {{
+      const td = document.createElement("td"); td.textContent = v || "-"; tr.appendChild(td);
+    }}
+    const tdSt = document.createElement("td");
+    const badge = document.createElement("span");
+    badge.className = "badge " + (row.review_status === "APPROVED" ? "badge-GREEN" : (row.review_status === "PENDING" ? "badge-YELLOW" : "badge-PENDING"));
+    badge.textContent = row.review_status || "-";
+    tdSt.appendChild(badge); tr.appendChild(tdSt);
+    tbody.appendChild(tr);
+  }}
+}}
+async function reviewDipRules(targetStatus) {{
+  const ver = document.getElementById("qVer").value.trim();
+  if (!ver) {{ showMsg("请先输入要审批/归档的规则版本号", true); return; }}
+  const r = await fetch("/api/admin/dip-rules/review", {{
+    method: "POST", headers: authHeaders(),
+    body: JSON.stringify({{ rule_version: ver, target_status: targetStatus }})
+  }});
+  const data = await r.json();
+  if (r.status === 401) {{
+    clearProtectedRulesData(); sessionStorage.removeItem(TOKEN_KEY);
+    document.getElementById("mainArea").classList.add("hidden"); document.getElementById("loginCard").classList.remove("hidden");
+    showMsg(data.detail || "登录已失效", true); return;
+  }}
+  if (!r.ok) {{ showMsg(data.detail || "审核操作失败", true); return; }}
+  showMsg("已将版本 " + ver + " 共 " + data.updated_rows + " 条规则更新为 " + targetStatus, false);
+  loadDipRules();
 }}
 if (getToken()) {{
   document.getElementById("loginCard").classList.add("hidden");
   document.getElementById("mainArea").classList.remove("hidden");
+  loadDipRules();
 }}
 </script>
 </body>
@@ -981,6 +1090,159 @@ if (getToken()) {{
   document.getElementById("loginCard").classList.add("hidden");
   document.getElementById("mainArea").classList.remove("hidden");
   loadRecon();
+}}
+</script>
+</body>
+</html>
+"""
+
+
+CALCULATOR_HTML = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>医生 DIP 规则试算与智能问答台</title>
+<style>{_COMMON_STYLE}</style>
+</head>
+<body>
+<header>
+  <h1>🩺 院内 DIP 控费工作台 · 医生试算与智能问答</h1>
+  <nav>{_nav_html("calculator")}</nav>
+</header>
+<div class="wrap">
+  <div id="msg"></div>
+  <div class="card" id="loginCard">
+    <h2>医生 / 业务人员认证（可选：仅规则查询免登，患者判灯与受保护问答需登录）</h2>
+    <div class="row">
+      <div class="field"><label>工号</label><input id="loginId" placeholder="请输入工号"></div>
+      <div class="field"><label>口令</label><input id="loginPwd" type="password" placeholder="请输入口令"></div>
+      <button onclick="doLogin()">登录</button>
+    </div>
+  </div>
+
+  <div class="row" style="align-items:stretch;">
+    <div class="card" style="flex:1;min-width:320px;">
+      <h2>DIP 规则试算 / 在院患者判灯</h2>
+      <div class="row">
+        <div class="field"><label>诊断编码/名称 *</label><input id="cDis" placeholder="如 M17.9 或 膝关节病"></div>
+        <div class="field"><label>参保类型</label>
+          <select id="cIns">
+            <option value="">-- 未明确 (测试拦截) --</option>
+            <option value="职工" selected>职工医保</option>
+            <option value="居民">居民医保</option>
+            <option value="自费">自费</option>
+          </select>
+        </div>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <div class="field"><label>手术/操作</label><input id="cOp" placeholder="如 保守治疗 / 胃镜检查"></div>
+        <div class="field"><label>年龄(岁)</label><input id="cAge" type="number" placeholder="如 68"></div>
+        <div class="field"><label>在院床日</label><input id="cDays" type="number" placeholder="按床日病种填"></div>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <div class="field"><label>住院号 (填费用判灯时选填)</label><input id="cPid" placeholder="如 zy2025042901"></div>
+        <div class="field"><label>当前累计费用(元，填则判灯)</label><input id="cCost" type="number" step="0.01" placeholder="如 2550.00"></div>
+      </div>
+      <div class="row" style="margin-top:12px;">
+        <button onclick="runCalc()">立即测算 / 判灯</button>
+      </div>
+      <pre id="calcOut" style="background:#f8fafc;padding:10px;border-radius:6px;font-size:12px;margin-top:10px;overflow:auto;max-height:240px;">等待测算</pre>
+    </div>
+
+    <div class="card" style="flex:1;min-width:320px;">
+      <h2>本地自然语言智能问答（零云端）</h2>
+      <div class="field">
+        <label>自然语言提问（支持规则查询、患者判灯、预警/绩效查询）</label>
+        <textarea id="chatText" rows="4" placeholder="例如：68岁，职工医保，诊断编码 M17.9，保守治疗。请查询医院 DIP 预估支付额。"></textarea>
+      </div>
+      <div class="row" style="margin-top:10px;justify-content:space-between;">
+        <button onclick="sendChat()">发送提问</button>
+        <button class="danger" onclick="doLogout()">退出登录</button>
+      </div>
+      <pre id="chatOut" style="background:#f8fafc;padding:10px;border-radius:6px;font-size:12px;margin-top:10px;overflow:auto;max-height:240px;white-space:pre-wrap;">等待提问</pre>
+    </div>
+  </div>
+</div>
+
+<script>
+const TOKEN_KEY = "hospital_admin_token";
+function showMsg(text, isErr) {{
+  const el = document.getElementById("msg");
+  el.textContent = text;
+  el.className = isErr ? "err" : "ok";
+}}
+function getToken() {{ return sessionStorage.getItem(TOKEN_KEY) || ""; }}
+function authHeaders() {{
+  const h = {{ "Content-Type": "application/json" }};
+  const t = getToken();
+  if (t) h["Authorization"] = "Bearer " + t;
+  return h;
+}}
+function clearProtectedCalcData() {{
+  document.getElementById("calcOut").textContent = "";
+  document.getElementById("chatOut").textContent = "";
+}}
+async function doLogin() {{
+  const operator_id = document.getElementById("loginId").value.trim();
+  const password = document.getElementById("loginPwd").value;
+  const r = await fetch("/api/auth/login", {{
+    method: "POST", headers: {{ "Content-Type": "application/json" }},
+    body: JSON.stringify({{ operator_id, password }})
+  }});
+  const data = await r.json();
+  if (!r.ok) {{ showMsg(data.detail || "登录失败", true); return; }}
+  sessionStorage.setItem(TOKEN_KEY, data.access_token);
+  document.getElementById("loginCard").classList.add("hidden");
+  showMsg("已登录 (" + data.role_type + ")", false);
+}}
+function doLogout() {{ sessionStorage.removeItem(TOKEN_KEY); clearProtectedCalcData(); location.reload(); }}
+async function runCalc() {{
+  const costRaw = document.getElementById("cCost").value.trim();
+  const isCheck = (costRaw !== "");
+  const payload = {{
+    disease: document.getElementById("cDis").value.trim(),
+    ins_type: document.getElementById("cIns").value || null,
+    operation: document.getElementById("cOp").value.trim() || null,
+    age: document.getElementById("cAge").value ? parseInt(document.getElementById("cAge").value, 10) : null,
+    bed_days: document.getElementById("cDays").value ? parseInt(document.getElementById("cDays").value, 10) : null
+  }};
+  let url = "/api/tools/query_dip_rule";
+  if (isCheck) {{
+    url = "/api/tools/check_patient_dip";
+    payload.current_cost = parseFloat(costRaw);
+    payload.patient_id = document.getElementById("cPid").value.trim() || null;
+  }}
+  const r = await fetch(url, {{ method: "POST", headers: authHeaders(), body: JSON.stringify(payload) }});
+  const data = await r.json();
+  if (r.status === 401) {{
+    clearProtectedCalcData(); sessionStorage.removeItem(TOKEN_KEY);
+    document.getElementById("loginCard").classList.remove("hidden");
+    showMsg(data.detail || "患者判灯需要登录或令牌已失效", true); return;
+  }}
+  if (r.status === 403 || !r.ok) {{
+    clearProtectedCalcData(); showMsg(data.detail || "无权访问或测算失败", true); return;
+  }}
+  document.getElementById("calcOut").textContent = JSON.stringify(data, null, 2);
+  showMsg("测算完成", false);
+}}
+async function sendChat() {{
+  const text = document.getElementById("chatText").value.trim();
+  if (!text) {{ showMsg("请输入提问内容", true); return; }}
+  const r = await fetch("/api/chat", {{
+    method: "POST", headers: authHeaders(),
+    body: JSON.stringify({{ text, channel: "web" }})
+  }});
+  const data = await r.json();
+  if (r.status === 401) {{
+    clearProtectedCalcData(); sessionStorage.removeItem(TOKEN_KEY);
+    document.getElementById("loginCard").classList.remove("hidden");
+    showMsg(data.detail || "登录已失效", true); return;
+  }}
+  document.getElementById("chatOut").textContent = (data.reply || "") + (data.data ? "\n\n" + JSON.stringify(data.data, null, 2) : "");
+}}
+if (getToken()) {{
+  document.getElementById("loginCard").classList.add("hidden");
 }}
 </script>
 </body>

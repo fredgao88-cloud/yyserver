@@ -16,7 +16,9 @@ from typing import Optional, List, Dict, Any
 from decimal import Decimal
 import sys
 import os
+import logging
 import re
+import threading
 
 # 确保能加载项目内部模块
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -28,7 +30,7 @@ from agent.llm_router import parse_local_intent
 from agent.tool_dispatcher import extract_tool_call, dispatch_tool_call
 from api.admin_ui import ADMIN_OPERATORS_HTML
 from api.workbench_ui import (
-    INPATIENT_ALERTS_HTML, ANALYTICS_HTML, DIP_RULES_ADMIN_HTML, AUDIT_LOGS_ADMIN_HTML, RECONCILIATION_HTML
+    INPATIENT_ALERTS_HTML, ANALYTICS_HTML, DIP_RULES_ADMIN_HTML, AUDIT_LOGS_ADMIN_HTML, RECONCILIATION_HTML, CALCULATOR_HTML
 )
 from tools.reconciliation_reporter import run_settled_reconciliation_report
 from db.local_db import record_audit_log, get_local_db_connection
@@ -102,6 +104,17 @@ class OperatorUpsertRequest(BaseModel):
 
 class OperatorStatusRequest(BaseModel):
     status: str = Field(..., description="ACTIVE 或 DISABLED")
+
+_manual_scan_lock = threading.Lock()
+_scan_logger = logging.getLogger("hospital_agent.manual_scan")
+
+class DipRuleReviewRequest(BaseModel):
+    rule_version: str = Field(..., description="目标规则版本号")
+    target_status: str = Field(..., description="APPROVED 或 ARCHIVED")
+
+class ManualScanRequest(BaseModel):
+    limit: int = Field(50, ge=1, le=500, description="扫描在院患者上限")
+    notify_dingtalk: bool = Field(False, description="是否同步推送钉钉脱敏汇总")
 
 class DipRuleImportRequest(BaseModel):
     rule_version: str = Field(..., description="目标规则版本号，如 2026_V2")
@@ -588,6 +601,147 @@ async def get_doctor_performance(
     return report
 
 
+
+@app.get("/calculator", response_class=HTMLResponse, summary="医生 DIP 规则试算与本地智能问答台")
+async def calculator_workbench_page():
+    return HTMLResponse(content=CALCULATOR_HTML)
+
+@app.get("/api/admin/dip-rules", summary="按版本与状态查询 DIP 规则目录（医保办/管理员）")
+async def api_list_dip_rules(
+    rule_version: Optional[str] = Query(None, description="规则版本号"),
+    review_status: Optional[str] = Query(None, description="PENDING / APPROVED / ARCHIVED"),
+    limit: int = Query(100, ge=1, le=500),
+    operator: Dict[str, Any] = Depends(require_roles(ROLE_INSURANCE, ROLE_ADMIN)),
+):
+    if review_status and review_status.strip().upper() not in ("PENDING", "APPROVED", "ARCHIVED"):
+        raise HTTPException(status_code=400, detail="review_status 仅支持 PENDING / APPROVED / ARCHIVED")
+    cursor, conn = get_local_db_connection(as_dict=True)
+    try:
+        sql = """
+        SELECT TOP (%s)
+            rule_id, rule_version, review_status, department, dip_group_name,
+            icd_code, billing_unit, dip_score, employee_base, resident_base
+        FROM dbo.dip_rules
+        WHERE 1=1
+        """
+        params: List[Any] = [limit]
+        if rule_version and rule_version.strip():
+            sql += " AND rule_version = %s"
+            params.append(rule_version.strip()[:50])
+        if review_status and review_status.strip():
+            sql += " AND review_status = %s"
+            params.append(review_status.strip().upper())
+        sql += " ORDER BY rule_id ASC"
+        cursor.execute(sql, tuple(params))
+        rows = cursor.fetchall()
+    finally:
+        conn.close()
+
+    items = []
+    for r in rows:
+        items.append({
+            "rule_id": r["rule_id"],
+            "rule_version": r["rule_version"],
+            "review_status": r["review_status"],
+            "department": r["department"],
+            "dip_group_name": r["dip_group_name"],
+            "icd_code": r["icd_code"],
+            "billing_unit": r["billing_unit"],
+            "dip_score": float(r["dip_score"]),
+            "employee_base": float(r["employee_base"]),
+            "resident_base": float(r["resident_base"]),
+        })
+    return {"total": len(items), "items": items}
+
+@app.post("/api/admin/dip-rules/review", summary="整批审批或归档 DIP 规则版本（医保办/管理员）")
+async def api_review_dip_rules(
+    req: DipRuleReviewRequest,
+    operator: Dict[str, Any] = Depends(require_roles(ROLE_INSURANCE, ROLE_ADMIN)),
+):
+    target = req.target_status.strip().upper()
+    if target not in ("APPROVED", "ARCHIVED"):
+        raise HTTPException(status_code=400, detail="target_status 仅支持 APPROVED 或 ARCHIVED")
+    ver = req.rule_version.strip()
+    if not ver:
+        raise HTTPException(status_code=400, detail="rule_version 不能为空")
+
+    cursor, conn = get_local_db_connection(as_dict=False)
+    try:
+        cursor.execute(
+            "UPDATE dbo.dip_rules SET review_status = %s, updated_at = SYSDATETIME() WHERE rule_version = %s",
+            (target, ver),
+        )
+        updated_rows = cursor.rowcount
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+
+    from tools.dip_calculator import get_loaded_rules
+    get_loaded_rules(rule_version=ver, force_reload=True)
+
+    record_audit_log(
+        operator_id=operator["sub"],
+        role_type=operator["role"],
+        channel="API",
+        action_type="DIP_RULE_REVIEW",
+        target_ref=f"VER:{ver[:30]}->{target}",
+        auth_result="PERMITTED",
+        rule_version=ver,
+    )
+    return {"success": True, "rule_version": ver, "target_status": target, "updated_rows": updated_rows}
+
+@app.post("/api/admin/trigger-scan", summary="手动触发一次在院 DIP 巡检扫描（医保办/管理员）")
+async def api_trigger_manual_scan(
+    req: ManualScanRequest,
+    operator: Dict[str, Any] = Depends(require_roles(ROLE_INSURANCE, ROLE_ADMIN)),
+):
+    if not _manual_scan_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="在院巡检任务正在执行中，请勿重复并发触发")
+    try:
+        from tools.inpatient_scanner import InpatientScanner
+        scanner = InpatientScanner()
+        res = scanner.scan_and_snapshot(limit=req.limit, notify_dingtalk=req.notify_dingtalk)
+    except Exception as exc:
+        _scan_logger.error("EVENT=MANUAL_SCAN_FAILED err_type=%s", type(exc).__name__)
+        record_audit_log(
+            operator_id=operator["sub"],
+            role_type=operator["role"],
+            channel="API",
+            action_type="MANUAL_INPATIENT_SCAN",
+            target_ref="SCAN:FAILED",
+            auth_result="DENIED",
+        )
+        raise HTTPException(status_code=500, detail=f"在院扫描执行失败（事件码: EVENT=MANUAL_SCAN_FAILED）")
+    finally:
+        _manual_scan_lock.release()
+
+    record_audit_log(
+        operator_id=operator["sub"],
+        role_type=operator["role"],
+        channel="API",
+        action_type="MANUAL_INPATIENT_SCAN",
+        target_ref=f"TOTAL:{res.get('total_scanned', 0)}",
+        auth_result="PERMITTED",
+        batch_id=res.get("batch_id"),
+    )
+    return {
+        "success": True,
+        "batch_id": res.get("batch_id"),
+        "rule_version": res.get("rule_version"),
+        "data_cutoff_time": res.get("data_cutoff_time"),
+        "total_scanned": res.get("total_scanned", 0),
+        "GREEN": res.get("GREEN", 0),
+        "YELLOW": res.get("YELLOW", 0),
+        "RED": res.get("RED", 0),
+        "PENDING": res.get("PENDING", 0),
+        "NOT_APPLICABLE": res.get("NOT_APPLICABLE", 0),
+    }
 
 @app.get("/inpatient", response_class=HTMLResponse, summary="在院患者 DIP 控费预警看板 Web 工作台")
 async def inpatient_workbench_page():
