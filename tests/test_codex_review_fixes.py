@@ -47,11 +47,12 @@ def test_notify_data_001_blocks_arbitrary_text_in_outbound_payload():
     assert "中医科(红1/黄0)" in text
     assert "其他已核验科室(红1/黄1)" in text
 
-    # 已批准登记版本可以正常出站
-    summary_ok = dict(summary, batch_id="BATCH_20261126_080000", rule_version="2026_SAMPLE_V1")
+    # 已批准登记版本可以正常出站，且传入符合格式的自定义批次 B314159 也不得原样出现在请求体中
+    summary_ok = dict(summary, batch_id="B314159", rule_version="2026_SAMPLE_V1")
     _, text_ok = build_alert_markdown(summary_ok)
     assert "2026_SAMPLE_V1" in text_ok
-    assert "BATCH_20261126_080000" in text_ok
+    assert "B314159" not in text_ok
+    assert "ALERT-" in text_ok
 
 
 def test_notify_ack_001_disabled_and_strict_json_ack(monkeypatch):
@@ -129,6 +130,24 @@ def test_dip_op_001_canceled_operation_falls_back_to_conservative():
     assert tc_done is not None
     assert tc_done["arguments"]["operation"] == "胃镜"
     assert tc_done["arguments"]["operation_status"] == "COMPLETED"
+
+    # “拟行胃镜，随后已完成胃镜”以最新完成状态为准
+    tc_prog = extract_tool_call("住院号 zy2025042901，诊断 K63.5，拟行胃镜，随后已完成胃镜，当前费用 2500 元，职工医保")
+    assert tc_prog is not None
+    assert tc_prog["arguments"]["operation"] == "胃镜"
+    assert tc_prog["arguments"]["operation_status"] == "COMPLETED"
+
+    # “已完成胃镜，拟行活检”不得抹去已完成的胃镜
+    tc_multi = extract_tool_call("住院号 zy2025042901，诊断 K63.5，已完成胃镜，拟行活检，当前费用 2500 元，职工医保")
+    assert tc_multi is not None
+    assert tc_multi["arguments"]["operation"] == "胃镜"
+    assert tc_multi["arguments"]["operation_status"] == "COMPLETED"
+
+    # “胃镜检查，现已取消”后句省略操作名，需绑定取消到前一个操作
+    tc_omit = extract_tool_call("住院号 zy2025042901，诊断 K63.5，胃镜检查，现已取消，当前费用 2500 元，职工医保")
+    assert tc_omit is not None
+    assert tc_omit["arguments"]["operation"] == "保守"
+    assert tc_omit["arguments"]["operation_status"] == "CANCELED"
 
 
 def test_chat_audit_001_denied_vs_permitted():

@@ -55,10 +55,15 @@ def _sanitize_outbound_summary(
     allowed_versions: Optional[Set[str]] = None,
 ) -> Dict[str, Any]:
     """
-    NOTIFY-DATA-001：独立构建受控出站对象，清洗并拦截任何非受控或未登记版本/自由文本标记。
+    NOTIFY-DATA-001：独立构建受控出站对象，清洗并拦截任何非受控或未登记版本/自由文本标记；
+    对内部批次号做单向摘要映射，绝不将调用方传入的原始批次号带入出站载荷。
     """
     raw_batch = str(summary.get("batch_id") or "").strip()
-    safe_batch = raw_batch if _CONTROLLED_BATCH_RE.match(raw_batch) else "CONTROLLED_BATCH"
+    safe_batch = (
+        "ALERT-" + hashlib.sha256(raw_batch.encode("utf-8")).hexdigest()[:8].upper()
+        if raw_batch
+        else "ALERT-00000000"
+    )
 
     env_versions = {
         v.strip()

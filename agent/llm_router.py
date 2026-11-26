@@ -15,9 +15,12 @@ from tools.dip_calculator import match_dip_rule, evaluate_traffic_light, normali
 
 def extract_operation_keyword(text_clean: str):
     """
-    DIP-OP-001：按分句将手术/操作关键词与其修饰时态绑定，
-    避免其他无关分句（如“计划出院”）污染已明确完成的操作（如“已完成胃镜”）；
-    同时若后续分句明确取消了操作（如“原定胃镜检查，现已取消胃镜”），以取消为准回退保守。
+    DIP-OP-001：按分句顺序建立操作状态机追踪每个具体操作词的最新状态：
+    - 同一操作（含“胃镜检查”/“胃镜”等子串关联操作）后句状态覆盖前句；
+    - 同一操作先拟行后完成（“拟行胃镜，随后已完成胃镜”）-> 取 COMPLETED；
+    - 不同操作互不抹去（“已完成胃镜，拟行活检”）-> 保留已完成的胃镜；
+    - 后句省略操作名直接取消（“胃镜检查，现已取消”）-> 将取消绑定到前序最近操作并回退保守；
+    - 非手术事项计划（“已完成胃镜，计划出院”）-> 不影响手术状态。
     """
     candidate_ops = [
         ("切除术+胃镜", "胃镜检查"),
@@ -37,36 +40,63 @@ def extract_operation_keyword(text_clean: str):
         ("操作", "综合-治疗性操作"),
     ]
     cancel_kws = ("取消", "未做", "未行", "放弃", "暂不做")
-    planned_kws = ("拟行", "拟做", "计划", "准备行", "拟实施", "准备做", "打算做")
+    planned_kws = ("拟行", "拟做", "计划", "准备行", "拟实施", "准备做", "打算做", "原定")
     completed_kws = ("已完成", "已行", "已做", "做完", "术后", "已实施")
+    non_op_planned_nouns = ("出院", "入院", "转科", "复查", "随访", "回家", "办手续")
 
     clauses = [c.strip() for c in re.split(r"[，,；;。！？!?]+", text_clean or "") if c.strip()]
     if not clauses:
         clauses = [text_clean or ""]
 
-    op_clauses = []
+    op_states = {}
+    last_op = None
+
+    def _set_op_state(target_op: str, new_state: str):
+        for existing_op in list(op_states.keys()):
+            if existing_op == target_op or existing_op in target_op or target_op in existing_op:
+                op_states[existing_op] = new_state
+        op_states[target_op] = new_state
+
     for clause in clauses:
         matched_kw = None
         for pattern, op_kw in candidate_ops:
             if pattern in clause:
                 matched_kw = op_kw
                 break
+
         if matched_kw is not None:
-            op_clauses.append((clause, matched_kw))
-
-    if op_clauses:
-        # 优先检查所有含操作词的分句中是否有取消或拟行
-        for clause, _ in op_clauses:
+            last_op = matched_kw
             if any(k in clause for k in cancel_kws):
-                return "保守", "CANCELED", "（检测到手术/操作已取消，按保守治疗基础分组测算）"
-        for clause, _ in op_clauses:
-            if any(k in clause for k in planned_kws):
-                return "保守", "PLANNED", "（检测到操作为拟行/尚未执行状态，依规暂不计入手术操作组，按保守治疗分组测算；待实际执行后按新组结算）"
-        first_clause, first_kw = op_clauses[0]
-        status = "COMPLETED" if any(k in first_clause for k in completed_kws) else "UNKNOWN"
-        return first_kw, status, ""
+                _set_op_state(matched_kw, "CANCELED")
+            elif any(k in clause for k in planned_kws):
+                _set_op_state(matched_kw, "PLANNED")
+            elif any(k in clause for k in completed_kws):
+                _set_op_state(matched_kw, "COMPLETED")
+            else:
+                op_states.setdefault(matched_kw, "UNKNOWN")
+        elif last_op is not None:
+            if any(k in clause for k in cancel_kws):
+                _set_op_state(last_op, "CANCELED")
+            elif any(k in clause for k in completed_kws):
+                _set_op_state(last_op, "COMPLETED")
+            elif any(k in clause for k in planned_kws) and not any(n in clause for n in non_op_planned_nouns):
+                if op_states.get(last_op) == "UNKNOWN":
+                    _set_op_state(last_op, "PLANNED")
 
-    # 兜底：整句未命中具体术式名，但明确提到手术已取消/拟行时回退保守
+    if op_states:
+        for op_kw, st in op_states.items():
+            if st == "COMPLETED":
+                return op_kw, "COMPLETED", ""
+        for op_kw, st in op_states.items():
+            if st == "UNKNOWN":
+                return op_kw, "UNKNOWN", ""
+        for op_kw, st in op_states.items():
+            if st == "CANCELED":
+                return "保守", "CANCELED", "（检测到手术/操作已取消，按保守治疗基础分组测算）"
+        for op_kw, st in op_states.items():
+            if st == "PLANNED":
+                return "保守", "PLANNED", "（检测到操作为拟行/尚未执行状态，依规暂不计入手术操作组，按保守治疗分组测算；待实际执行后按新组结算）"
+
     if any(k in text_clean for k in cancel_kws):
         return "保守", "CANCELED", "（检测到手术/操作已取消，按保守治疗基础分组测算）"
     if any(k in text_clean for k in planned_kws):
