@@ -57,6 +57,7 @@ def extract_operation_keyword(text_clean: str):
                 op_states[existing_op] = new_state
         op_states[target_op] = new_state
 
+    _temporal_ref_re = re.compile(r"(?:该|此|上述)(?:操作|手术|检查)(?:之前|之后|前|后|时|中)")
     _pronoun_re = re.compile(r"(?:该操作|该手术|该检查|此操作|此手术|此检查|该项|上述操作|上述手术|上述检查|前项)")
     _tense_strip_re = re.compile(
         r"(?:现已|已经|已完成|已行|已做|做完|术后|已实施|暂不做|准备行|拟实施|准备做|打算做|"
@@ -65,26 +66,31 @@ def extract_operation_keyword(text_clean: str):
     )
 
     for clause in clauses:
-        has_pronoun = bool(_pronoun_re.search(clause))
+        # 先剥除时间状语参照（如“该检查前”），避免时间参照触发指代继承
+        clause_no_temporal = _temporal_ref_re.sub("", clause)
+        has_pronoun = bool(_pronoun_re.search(clause_no_temporal))
+
         matched_kw = None
         matched_pat = None
         for pattern, op_kw in candidate_ops:
-            if pattern in clause:
+            if pattern in clause_no_temporal:
                 matched_kw = op_kw
                 matched_pat = pattern
                 break
 
-        # 仅当无具体术式名（或仅被泛词“操作”匹配且句中带明确指代词如“该操作”）时才继承更新上一操作；
-        # 若句中有明确具体操作（如“该检查前已完成活检”中的“活检”），优先绑定到该具体操作
+        # 仅当无具体术式名（或仅被泛词“操作”匹配且句中带明确指代词如“该操作”）
+        # 且剥除指代词与时态词后无其他独立事项（如“抽血”）时，才继承更新上一操作
         is_pure_pronoun_ref = has_pronoun and (matched_kw is None or matched_pat == "操作")
         if is_pure_pronoun_ref and last_op is not None:
-            if any(k in clause for k in cancel_kws):
-                _set_op_state(last_op, "CANCELED")
-            elif any(k in clause for k in completed_kws):
-                _set_op_state(last_op, "COMPLETED")
-            elif any(k in clause for k in planned_kws):
-                if op_states.get(last_op) == "UNKNOWN":
-                    _set_op_state(last_op, "PLANNED")
+            residual_after_pronoun = _tense_strip_re.sub("", _pronoun_re.sub("", clause_no_temporal)).strip()
+            if not residual_after_pronoun:
+                if any(k in clause for k in cancel_kws):
+                    _set_op_state(last_op, "CANCELED")
+                elif any(k in clause for k in completed_kws):
+                    _set_op_state(last_op, "COMPLETED")
+                elif any(k in clause for k in planned_kws):
+                    if op_states.get(last_op) == "UNKNOWN":
+                        _set_op_state(last_op, "PLANNED")
             continue
 
         if matched_kw is not None:

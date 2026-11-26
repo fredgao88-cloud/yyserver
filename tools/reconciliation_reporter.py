@@ -3,10 +3,7 @@
 tools/reconciliation_reporter.py — 出院决算账实自动对账引擎
 
 复用 HISReader.get_settled_cases 与 HISReader.get_case_fee_detail（SERIALIZABLE 事务隔离级），
-执行高精度 Decimal 核对：
-1. 类目汇总 (his_zycjz) vs 主单总额 (his_zyjz.amoney)；
-2. 临床医嘱明细 (his_zycz) vs 主单临床+医技 (czmoney + yjmoney)；
-3. 药房已发药 (his_cfmain_fyjl) + 已计费未发药 (his_cfmain) vs 主单药费 (yfmoney)。
+执行高精度 Decimal 核对，并明确区分抽样数、成功核对数与未核对数（RECON-COVER-001）。
 输出严格脱敏（不含患者姓名等明文身份信息）。
 """
 from decimal import Decimal, ROUND_HALF_UP
@@ -87,32 +84,42 @@ def run_settled_reconciliation_report(
     department: Optional[str] = None,
     reader: Optional[HISReader] = None,
 ) -> Dict[str, Any]:
-    """批量对近期已结算病例执行对账并汇总差异统计（脱敏，不含患者姓名）。"""
+    """批量对近期已结算病例执行对账并汇总差异统计（含未核对覆盖率统计）。"""
     his = reader or HISReader()
     limit_clamped = max(1, min(int(limit), 100))
     cases = his.get_settled_cases(limit=limit_clamped, department=department)
 
     seen_lsh = set()
     items: List[Dict[str, Any]] = []
+    unreconciled_reasons: List[Dict[str, str]] = []
     counts = {"MATCHED": 0, "UNDISPENSED_ONLY": 0, "MISMATCH": 0, "ERROR": 0}
+    sampled_count = 0
 
     for c in cases:
         lsh = str(c.get("lsh") or "").strip()
         if not lsh or lsh in seen_lsh:
             continue
         seen_lsh.add(lsh)
+        sampled_count += 1
         try:
             detail = his.get_case_fee_detail(lsh, settlement_id=str(c.get("settlement_id") or ""))
             if not detail:
+                unreconciled_reasons.append({"visit_id": lsh, "reason": "EMPTY_DETAIL"})
                 continue
             row = evaluate_case_reconciliation(detail, case_meta=c)
             items.append(row)
             counts[row["recon_status"]] += 1
         except Exception as exc:
+            err_code = f"READ_ERROR:{type(exc).__name__}"
             logger.warning("EVENT=RECON_CASE_READ_FAILED err_type=%s", type(exc).__name__)
             counts["ERROR"] += 1
+            unreconciled_reasons.append({"visit_id": lsh, "reason": err_code})
 
     return {
+        "sampled_count": sampled_count,
+        "reconciled_count": len(items),
+        "unreconciled_count": len(unreconciled_reasons),
+        "unreconciled_reasons": unreconciled_reasons,
         "total": len(items),
         "matched_count": counts["MATCHED"],
         "undispensed_only_count": counts["UNDISPENSED_ONLY"],

@@ -9,7 +9,7 @@
 - 支持渠道分流（钉钉渠道患者级查询自动激活隐私盾牌）。
 """
 from fastapi import FastAPI, HTTPException, Query, Header, Depends
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from contextlib import asynccontextmanager
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
@@ -757,6 +757,99 @@ async def analytics_workbench_page():
 async def dip_rules_admin_page():
     """纯本地静态工作台页面，通过 Bearer Token 调用 /api/admin/dip-rules/import 执行预检与导入。"""
     return HTMLResponse(content=DIP_RULES_ADMIN_HTML)
+
+
+def _csv_escape_cell(v: Any) -> str:
+    s = "" if v is None else str(v)
+    if re.match(r"^[=+\-@\t\r]", s) and not re.match(r"^-?\d+(?:\.\d+)?%?$", s):
+        s = "'" + s
+    return '"' + s.replace('"', '""') + '"'
+
+def _build_csv_response(filename: str, headers: List[str], rows: List[List[Any]]) -> Response:
+    lines = [",".join(_csv_escape_cell(h) for h in headers)]
+    for row in rows:
+        lines.append(",".join(_csv_escape_cell(cell) for cell in row))
+    content = "\ufeff" + "\r\n".join(lines)
+    return Response(
+        content=content.encode("utf-8"),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+@app.get("/api/inpatient/alerts/export", summary="导出在院控费预警 CSV（需开通 can_export_case 权限）")
+async def export_inpatient_alerts_csv(
+    dept: Optional[str] = Query(None),
+    level: Optional[str] = Query(None),
+    operator: Dict[str, Any] = Depends(require_roles(*ALERTS_ROLES)),
+):
+    op_rec = get_operator(operator["sub"])
+    if not op_rec or not op_rec.get("can_export_case"):
+        record_audit_log(
+            operator_id=operator["sub"], role_type=operator["role"], channel="API",
+            action_type="EXPORT_INPATIENT_ALERTS", target_ref="EXPORT:DENIED_NO_PERM", auth_result="DENIED"
+        )
+        raise HTTPException(status_code=403, detail="权限不足：当前账号未开通病例明细导出权限 (can_export_case=0)")
+
+    alerts_data = await get_inpatient_alerts(dept=dept, operator=operator)
+    items = alerts_data.get("items") or []
+    if level:
+        lvl_u = level.strip().upper()
+        items = [x for x in items if x.get("alert_level") == lvl_u]
+
+    headers = ["住院号", "科室", "床号", "医生工号", "主诊断", "参保类型", "当前费用(元)", "DIP基准(元)", "占比(%)", "灯号", "状态"]
+    rows = [
+        [
+            it.get("zyh"), it.get("dept_name"), it.get("bed"), it.get("doctor_id"),
+            it.get("disease"), it.get("ins_type"),
+            it.get("current_cost_str") or it.get("current_cost"),
+            it.get("benchmark_str") or it.get("benchmark"),
+            it.get("ratio_percent"), it.get("alert_level"), it.get("status"),
+        ]
+        for it in items
+    ]
+    record_audit_log(
+        operator_id=operator["sub"], role_type=operator["role"], channel="API",
+        action_type="EXPORT_INPATIENT_ALERTS", target_ref=f"ROWS:{len(rows)}", auth_result="PERMITTED",
+        batch_id=alerts_data.get("batch_id"),
+    )
+    return _build_csv_response("inpatient_alerts.csv", headers, rows)
+
+@app.get("/api/reconciliation/settled/export", summary="导出出院决算对账 CSV（需开通 can_export_case 权限）")
+async def export_settled_reconciliation_csv(
+    limit: int = Query(50, ge=1, le=100),
+    dept: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    operator: Dict[str, Any] = Depends(require_roles(ROLE_INSURANCE, ROLE_ADMIN)),
+):
+    op_rec = get_operator(operator["sub"])
+    if not op_rec or not op_rec.get("can_export_case"):
+        record_audit_log(
+            operator_id=operator["sub"], role_type=operator["role"], channel="API",
+            action_type="EXPORT_SETTLED_RECON", target_ref="EXPORT:DENIED_NO_PERM", auth_result="DENIED"
+        )
+        raise HTTPException(status_code=403, detail="权限不足：当前账号未开通病例明细导出权限 (can_export_case=0)")
+
+    report = run_settled_reconciliation_report(limit=limit, department=dept.strip() if dept else None)
+    items = report.get("items") or []
+    if status:
+        st_u = status.strip().upper()
+        items = [x for x in items if x.get("recon_status") == st_u]
+
+    headers = ["住院流水号", "科室", "结算时间", "对账口径", "主单总额", "类目差异", "临床差异", "药房差异", "未发药笔数", "未发药金额", "状态"]
+    rows = [
+        [
+            r.get("visit_id"), r.get("dept_name"), r.get("settlement_time"), r.get("reconciliation_scope"),
+            r.get("total_amount_str"), r.get("category_diff_str"), r.get("clinical_diff_str"),
+            r.get("pharmacy_diff_str"), r.get("undispensed_count"), r.get("undispensed_amount_str"),
+            r.get("recon_status"),
+        ]
+        for r in items
+    ]
+    record_audit_log(
+        operator_id=operator["sub"], role_type=operator["role"], channel="API",
+        action_type="EXPORT_SETTLED_RECON", target_ref=f"ROWS:{len(rows)}", auth_result="PERMITTED",
+    )
+    return _build_csv_response("settled_reconciliation.csv", headers, rows)
 
 @app.get("/reconciliation", response_class=HTMLResponse, summary="出院决算账实对账看板 Web 工作台")
 async def reconciliation_workbench_page():

@@ -65,18 +65,18 @@ def _nav_html(active: str) -> str:
     return "".join(links)
 
 
-INPATIENT_ALERTS_HTML = f"""<!DOCTYPE html>
+INPATIENT_ALERTS_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>在院患者 DIP 控费预警看板</title>
-<style>{_COMMON_STYLE}</style>
+<style>__STYLE__</style>
 </head>
 <body>
 <header>
   <h1>🏥 院内 DIP 控费工作台 · 在院预警看板</h1>
-  <nav>{_nav_html("inpatient")}</nav>
+  <nav>__NAV__</nav>
 </header>
 <div class="wrap">
   <div id="msg"></div>
@@ -145,31 +145,31 @@ const TOKEN_KEY = "hospital_admin_token";
 let cachedItems = [];
 let inpReqSeq = 0;
 let inpAuthEpoch = 0;
-async function safeJson(r) {{ try {{ return await r.json(); }} catch (_) {{ return {{}}; }} }}
-function showMsg(text, isErr) {{
+async function safeJson(r) { try { return await r.json(); } catch (_) { return {}; } }
+function showMsg(text, isErr) {
   const el = document.getElementById("msg");
   el.textContent = text;
   el.className = isErr ? "err" : "ok";
-}}
-function getToken() {{ return sessionStorage.getItem(TOKEN_KEY) || ""; }}
-function authHeaders() {{ return {{ "Authorization": "Bearer " + getToken() }}; }}
-async function doLogin() {{
+}
+function getToken() { return sessionStorage.getItem(TOKEN_KEY) || ""; }
+function authHeaders() { return { "Authorization": "Bearer " + getToken() }; }
+async function doLogin() {
   const operator_id = document.getElementById("loginId").value.trim();
   const password = document.getElementById("loginPwd").value;
-  const r = await fetch("/api/auth/login", {{
-    method: "POST", headers: {{ "Content-Type": "application/json" }},
-    body: JSON.stringify({{ operator_id, password }})
-  }});
+  const r = await fetch("/api/auth/login", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ operator_id, password })
+  });
   const data = await r.json();
-  if (!r.ok) {{ showMsg(data.detail || "登录失败", true); return; }}
+  if (!r.ok) { showMsg(data.detail || "登录失败", true); return; }
   sessionStorage.setItem(TOKEN_KEY, data.access_token);
   document.getElementById("loginCard").classList.add("hidden");
   document.getElementById("mainArea").classList.remove("hidden");
   showMsg("登录成功 (" + data.role_type + ")", false);
   loadAlerts();
-}}
-function doLogout() {{ sessionStorage.removeItem(TOKEN_KEY); location.reload(); }}
-function clearProtectedInpatientData() {{
+}
+function doLogout() { sessionStorage.removeItem(TOKEN_KEY); location.reload(); }
+function clearProtectedInpatientData() {
   cachedItems = [];
   document.getElementById("tbody").innerHTML = "";
   document.getElementById("batchMeta").textContent = "";
@@ -182,14 +182,14 @@ function clearProtectedInpatientData() {{
   document.getElementById("sGreen").textContent = "0";
   document.getElementById("sPending").textContent = "0";
   document.getElementById("sNA").textContent = "0";
-}}
-async function loadAlerts() {{
+}
+async function loadAlerts() {
   const mySeq = ++inpReqSeq;
   const myEpoch = inpAuthEpoch;
   const dept = document.getElementById("filterDept").value.trim();
   const url = dept ? "/api/inpatient/alerts?dept=" + encodeURIComponent(dept) : "/api/inpatient/alerts";
-  const r = await fetch(url, {{ headers: authHeaders() }});
-  if (r.status === 401) {{
+  const r = await fetch(url, { headers: authHeaders() });
+  if (r.status === 401) {
     inpAuthEpoch++;
     clearProtectedInpatientData();
     sessionStorage.removeItem(TOKEN_KEY);
@@ -198,51 +198,51 @@ async function loadAlerts() {{
     const data = await safeJson(r);
     showMsg(data.detail || "登录已失效，请重新登录", true);
     return;
-  }}
-  if (r.status === 403 || !r.ok) {{
+  }
+  if (r.status === 403 || !r.ok) {
     inpAuthEpoch++;
     clearProtectedInpatientData();
     const data = await safeJson(r);
     showMsg(data.detail || "无权访问或加载预警失败", true);
     return;
-  }}
+  }
   if (mySeq !== inpReqSeq || myEpoch !== inpAuthEpoch) return;
   const data = await safeJson(r);
   if (mySeq !== inpReqSeq || myEpoch !== inpAuthEpoch) return;
   cachedItems = data.items || [];
   const banner = document.getElementById("staleBanner");
-  if (data.is_stale && data.stale_warning) {{
+  if (data.is_stale && data.stale_warning) {
     banner.textContent = "⚠️ " + data.stale_warning;
     banner.style.display = "block";
-  }} else {{
+  } else {
     banner.style.display = "none";
-  }}
+  }
   document.getElementById("batchMeta").textContent = "批次: " + (data.batch_id || "-") + " | 截止: " + (data.batch_time || "-");
   updateStats();
   renderRows();
-}}
-function updateStats() {{
+}
+function updateStats() {
   let r = 0, y = 0, g = 0, p = 0, na = 0;
-  for (const it of cachedItems) {{
+  for (const it of cachedItems) {
     if (it.alert_level === "RED") r++;
     else if (it.alert_level === "YELLOW") y++;
     else if (it.alert_level === "GREEN") g++;
     else if (it.alert_level === "NOT_APPLICABLE") na++;
     else if (it.alert_level === "PENDING") p++;
-  }}
+  }
   document.getElementById("sTotal").textContent = String(cachedItems.length);
   document.getElementById("sRed").textContent = String(r);
   document.getElementById("sYellow").textContent = String(y);
   document.getElementById("sGreen").textContent = String(g);
   document.getElementById("sPending").textContent = String(p);
   document.getElementById("sNA").textContent = String(na);
-}}
-function renderRows() {{
+}
+function renderRows() {
   const level = document.getElementById("filterLevel").value;
   const tbody = document.getElementById("tbody");
   tbody.innerHTML = "";
   const list = level ? cachedItems.filter(x => x.alert_level === level) : cachedItems;
-  for (const it of list) {{
+  for (const it of list) {
     const tr = document.createElement("tr");
     const vals = [
       it.zyh || "-", it.dept_name || "-", it.bed || "-", it.doctor_id || "-",
@@ -251,11 +251,11 @@ function renderRows() {{
       it.benchmark_str || (it.benchmark != null ? String(it.benchmark) : "-"),
       it.ratio_percent != null ? it.ratio_percent + "%" : "-"
     ];
-    for (const v of vals) {{
+    for (const v of vals) {
       const td = document.createElement("td");
       td.textContent = v;
       tr.appendChild(td);
-    }}
+    }
     const tdSt = document.createElement("td");
     const badge = document.createElement("span");
     badge.className = "badge badge-" + (it.alert_level || "PENDING");
@@ -263,77 +263,96 @@ function renderRows() {{
     tdSt.appendChild(badge);
     tr.appendChild(tdSt);
     tbody.appendChild(tr);
-  }}
-}}
-function downloadCsv(filename, headers, rows) {{
-  if (!rows.length) {{ showMsg("暂无可导出数据", true); return; }}
-  const esc = (v) => {{
-    let s = String(v == null ? "" : v);
-    if (/^[=+\-@\t\r]/.test(s) && !/^-?\d+(?:\.\d+)?%?$/.test(s)) s = "'" + s;
-    return '"' + s.replace(/"/g, '""') + '"';
-  }};
-  const lines = [headers.map(esc).join(",")].concat(rows.map(r => r.map(esc).join(",")));
-  const blob = new Blob(["\uFEFF" + lines.join("\r\n")], {{ type: "text/csv;charset=utf-8;" }});
+  }
+}
+async function exportInpatientCsv() {
+  const level = document.getElementById("filterLevel").value;
+  const dept = document.getElementById("filterDept").value.trim();
+  const qs = [];
+  if (dept) qs.push("dept=" + encodeURIComponent(dept));
+  if (level) qs.push("level=" + encodeURIComponent(level));
+  const url = "/api/inpatient/alerts/export" + (qs.length ? "?" + qs.join("&") : "");
+  const r = await fetch(url, { headers: authHeaders() });
+  if (r.status === 401) {
+    inpAuthEpoch++;
+    clearProtectedInpatientData();
+    sessionStorage.removeItem(TOKEN_KEY);
+    document.getElementById("mainArea").classList.add("hidden");
+    document.getElementById("loginCard").classList.remove("hidden");
+    const err = await safeJson(r);
+    showMsg(err.detail || "登录已失效，请重新登录", true);
+    return;
+  }
+  if (r.status === 403 || !r.ok) {
+    const err = await safeJson(r);
+    showMsg(err.detail || "无权导出病例明细（需开通 can_export_case 权限）", true);
+    return;
+  }
+  const blob = await r.blob();
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
-  a.download = filename;
+  a.download = "inpatient_alerts.csv";
   a.click();
   URL.revokeObjectURL(a.href);
-}}
-function exportInpatientCsv() {{
-  const level = document.getElementById("filterLevel").value;
-  const list = level ? cachedItems.filter(x => x.alert_level === level) : cachedItems;
-  const headers = ["住院号", "科室", "床号", "医生工号", "主诊断", "参保类型", "当前费用(元)", "DIP基准(元)", "占比(%)", "灯号", "状态"];
-  const rows = list.map(it => [
-    it.zyh, it.dept_name, it.bed, it.doctor_id, it.disease, it.ins_type,
-    it.current_cost_str || it.current_cost, it.benchmark_str || it.benchmark,
-    it.ratio_percent, it.alert_level, it.status
-  ]);
-  downloadCsv("inpatient_alerts.csv", headers, rows);
-}}
-async function triggerManualScan() {{
+  showMsg("已通过服务端鉴权导出预警 CSV", false);
+}
+async function triggerManualScan() {
+  const myEpoch = inpAuthEpoch;
   showMsg("正在触发在院扫描，请稍候...", false);
-  const r = await fetch("/api/admin/trigger-scan", {{
+  const r = await fetch("/api/admin/trigger-scan", {
     method: "POST",
-    headers: {{ "Content-Type": "application/json", ...authHeaders() }},
-    body: JSON.stringify({{ limit: 50, notify_dingtalk: false }})
-  }});
-  const data = await r.json();
-  if (r.status === 401) {{
-    clearProtectedInpatientData(); sessionStorage.removeItem(TOKEN_KEY);
-    document.getElementById("mainArea").classList.add("hidden"); document.getElementById("loginCard").classList.remove("hidden");
-    showMsg(data.detail || "登录已失效", true); return;
-  }}
-  if (r.status === 403 || !r.ok) {{
-    if (r.status === 403) clearProtectedInpatientData();
-    showMsg(data.detail || "扫描触发失败（仅医保办/管理员可操作）", true); return;
-  }}
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify({ limit: 50, notify_dingtalk: false })
+  });
+  if (r.status === 401) {
+    inpAuthEpoch++;
+    clearProtectedInpatientData();
+    sessionStorage.removeItem(TOKEN_KEY);
+    document.getElementById("mainArea").classList.add("hidden");
+    document.getElementById("loginCard").classList.remove("hidden");
+    const err = await safeJson(r);
+    showMsg(err.detail || "登录已失效，请重新登录", true);
+    return;
+  }
+  if (r.status === 403) {
+    const err = await safeJson(r);
+    showMsg(err.detail || "无权触发全局扫描（仅限医保办/管理员，本科室预警查看不受影响）", true);
+    return;
+  }
+  if (!r.ok) {
+    const err = await safeJson(r);
+    showMsg(err.detail || "扫描触发失败", true);
+    return;
+  }
+  if (myEpoch !== inpAuthEpoch) return;
+  const data = await safeJson(r);
+  if (myEpoch !== inpAuthEpoch) return;
   showMsg("扫描完成：共 " + data.total_scanned + " 例（红灯 " + data.RED + " / 黄灯 " + data.YELLOW + "）", false);
   loadAlerts();
-}}
-if (getToken()) {{
+}
+if (getToken()) {
   document.getElementById("loginCard").classList.add("hidden");
   document.getElementById("mainArea").classList.remove("hidden");
   loadAlerts();
-}}
+}
 </script>
 </body>
 </html>
-"""
+""".replace("__STYLE__", _COMMON_STYLE).replace("__NAV__", _nav_html("inpatient"))
 
 
-ANALYTICS_HTML = f"""<!DOCTYPE html>
+ANALYTICS_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>医生 DIP 控费绩效与历史趋势看板</title>
-<style>{_COMMON_STYLE}</style>
+<style>__STYLE__</style>
 </head>
 <body>
 <header>
   <h1>📊 院内 DIP 控费工作台 · 医生绩效与历史趋势</h1>
-  <nav>{_nav_html("analytics")}</nav>
+  <nav>__NAV__</nav>
 </header>
 <div class="wrap">
   <div id="msg"></div>
@@ -394,45 +413,45 @@ const TOKEN_KEY = "hospital_admin_token";
 let cachedDoctors = [];
 let anaReqSeq = 0;
 let anaAuthEpoch = 0;
-async function safeJson(r) {{ try {{ return await r.json(); }} catch (_) {{ return {{}}; }} }}
-function showMsg(text, isErr) {{
+async function safeJson(r) { try { return await r.json(); } catch (_) { return {}; } }
+function showMsg(text, isErr) {
   const el = document.getElementById("msg");
   el.textContent = text;
   el.className = isErr ? "err" : "ok";
-}}
-function getToken() {{ return sessionStorage.getItem(TOKEN_KEY) || ""; }}
-function authHeaders() {{ return {{ "Authorization": "Bearer " + getToken() }}; }}
-async function doLogin() {{
+}
+function getToken() { return sessionStorage.getItem(TOKEN_KEY) || ""; }
+function authHeaders() { return { "Authorization": "Bearer " + getToken() }; }
+async function doLogin() {
   const operator_id = document.getElementById("loginId").value.trim();
   const password = document.getElementById("loginPwd").value;
-  const r = await fetch("/api/auth/login", {{
-    method: "POST", headers: {{ "Content-Type": "application/json" }},
-    body: JSON.stringify({{ operator_id, password }})
-  }});
+  const r = await fetch("/api/auth/login", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ operator_id, password })
+  });
   const data = await r.json();
-  if (!r.ok) {{ showMsg(data.detail || "登录失败", true); return; }}
+  if (!r.ok) { showMsg(data.detail || "登录失败", true); return; }
   sessionStorage.setItem(TOKEN_KEY, data.access_token);
   document.getElementById("loginCard").classList.add("hidden");
   document.getElementById("mainArea").classList.remove("hidden");
   loadReport();
-}}
-function doLogout() {{ sessionStorage.removeItem(TOKEN_KEY); location.reload(); }}
-function clearProtectedAnalyticsData() {{
+}
+function doLogout() { sessionStorage.removeItem(TOKEN_KEY); location.reload(); }
+function clearProtectedAnalyticsData() {
   cachedDoctors = [];
   document.getElementById("docTbody").innerHTML = "";
   document.getElementById("trendSummary").textContent = "";
   const svg = document.getElementById("trendSvg");
   while (svg.firstChild) svg.removeChild(svg.firstChild);
-}}
-async function loadReport() {{
+}
+async function loadReport() {
   const mySeq = ++anaReqSeq;
   const myEpoch = anaAuthEpoch;
   const days = document.getElementById("daysSel").value;
   const dept = document.getElementById("deptId").value.trim();
   let url = "/api/analytics/doctor-performance?days=" + encodeURIComponent(days);
   if (dept) url += "&dept_id=" + encodeURIComponent(dept);
-  const r = await fetch(url, {{ headers: authHeaders() }});
-  if (r.status === 401) {{
+  const r = await fetch(url, { headers: authHeaders() });
+  if (r.status === 401) {
     anaAuthEpoch++;
     clearProtectedAnalyticsData();
     sessionStorage.removeItem(TOKEN_KEY);
@@ -441,14 +460,14 @@ async function loadReport() {{
     const data = await safeJson(r);
     showMsg(data.detail || "登录已失效，请重新登录", true);
     return;
-  }}
-  if (r.status === 403 || !r.ok) {{
+  }
+  if (r.status === 403 || !r.ok) {
     anaAuthEpoch++;
     clearProtectedAnalyticsData();
     const data = await safeJson(r);
     showMsg(data.detail || "无权访问或加载报表失败", true);
     return;
-  }}
+  }
   if (mySeq !== anaReqSeq || myEpoch !== anaAuthEpoch) return;
   const data = await safeJson(r);
   if (mySeq !== anaReqSeq || myEpoch !== anaAuthEpoch) return;
@@ -456,11 +475,11 @@ async function loadReport() {{
   renderDoctors(cachedDoctors);
   renderTrends(data.trends || []);
   showMsg("已加载近 " + data.days + " 天共 " + data.total_snapshots + " 条快照记录", false);
-}}
-function renderDoctors(docs) {{
+}
+function renderDoctors(docs) {
   const tbody = document.getElementById("docTbody");
   tbody.innerHTML = "";
-  for (const d of docs) {{
+  for (const d of docs) {
     const tr = document.createElement("tr");
     const vals = [
       d.doctor_id, d.dept_name || "-", String(d.total_cases),
@@ -470,15 +489,15 @@ function renderDoctors(docs) {{
       d.total_fee_str || String(d.total_fee),
       d.total_benchmark_str || String(d.total_benchmark)
     ];
-    for (const v of vals) {{
+    for (const v of vals) {
       const td = document.createElement("td");
       td.textContent = v;
       tr.appendChild(td);
-    }}
+    }
     tbody.appendChild(tr);
-  }}
-}}
-function renderTrends(trends) {{
+  }
+}
+function renderTrends(trends) {
   const svg = document.getElementById("trendSvg");
   while (svg.firstChild) svg.removeChild(svg.firstChild);
   document.getElementById("trendSummary").textContent = "共 " + trends.length + " 个历史扫描批次";
@@ -490,12 +509,12 @@ function renderTrends(trends) {{
   const svgW = Math.max(800, 60 + trends.length * (barW + gap));
   svg.setAttribute("viewBox", "0 0 " + svgW + " 200");
   svg.style.minWidth = svgW + "px";
-  trends.forEach((t, i) => {{
+  trends.forEach((t, i) => {
     const x = 30 + i * (barW + gap);
     const gH = Math.round(((t.green_count || 0) / maxTotal) * 140);
     const yH = Math.round(((t.yellow_count || 0) / maxTotal) * 140);
     const rH = Math.round(((t.red_count || 0) / maxTotal) * 140);
-    const addRect = (y, h, fill) => {{
+    const addRect = (y, h, fill) => {
       if (h <= 0) return;
       const rect = document.createElementNS(ns, "rect");
       rect.setAttribute("x", String(x));
@@ -504,7 +523,7 @@ function renderTrends(trends) {{
       rect.setAttribute("height", String(h));
       rect.setAttribute("fill", fill);
       svg.appendChild(rect);
-    }};
+    };
     addRect(165 - gH, gH, "#2e7d32");
     addRect(165 - gH - yH, yH, "#d97706");
     addRect(165 - gH - yH - rH, rH, "#c62828");
@@ -515,51 +534,51 @@ function renderTrends(trends) {{
     txt.setAttribute("fill", "#475569");
     txt.textContent = (t.cutoff_time || t.batch_id || "").slice(5, 16);
     svg.appendChild(txt);
-  }});
-}}
-function exportAnalyticsCsv() {{
-  if (!cachedDoctors.length) {{ showMsg("暂无可导出数据", true); return; }}
-  const esc = (v) => {{
+  });
+}
+function exportAnalyticsCsv() {
+  if (!cachedDoctors.length) { showMsg("暂无可导出数据", true); return; }
+  const esc = (v) => {
     let s = String(v == null ? "" : v);
     if (/^[=+\-@\t\r]/.test(s) && !/^-?\d+(?:\.\d+)?%?$/.test(s)) s = "'" + s;
     return '"' + s.replace(/"/g, '""') + '"';
-  }};
+  };
   const headers = ["医生工号", "科室", "病例数", "红灯", "黄灯", "绿灯", "绿灯达标率(%)", "平均费用比(%)", "总费用(元)", "总基准(元)"];
   const rows = cachedDoctors.map(d => [
     d.doctor_id, d.dept_name, d.total_cases, d.red_count, d.yellow_count, d.green_count,
     d.green_rate_percent, d.avg_fee_ratio_percent, d.total_fee_str || d.total_fee, d.total_benchmark_str || d.total_benchmark
   ]);
   const lines = [headers.map(esc).join(",")].concat(rows.map(r => r.map(esc).join(",")));
-  const blob = new Blob(["\uFEFF" + lines.join("\r\n")], {{ type: "text/csv;charset=utf-8;" }});
+  const blob = new Blob(["\uFEFF" + lines.join("\r\n")], { type: "text/csv;charset=utf-8;" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = "doctor_performance.csv";
   a.click();
   URL.revokeObjectURL(a.href);
-}}
-if (getToken()) {{
+}
+if (getToken()) {
   document.getElementById("loginCard").classList.add("hidden");
   document.getElementById("mainArea").classList.remove("hidden");
   loadReport();
-}}
+}
 </script>
 </body>
 </html>
-"""
+""".replace("__STYLE__", _COMMON_STYLE).replace("__NAV__", _nav_html("analytics"))
 
 
-DIP_RULES_ADMIN_HTML = f"""<!DOCTYPE html>
+DIP_RULES_ADMIN_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>DIP 新版规则目录批量导入控制台</title>
-<style>{_COMMON_STYLE}</style>
+<style>__STYLE__</style>
 </head>
 <body>
 <header>
   <h1>📥 院内 DIP 控费工作台 · 规则批量导入</h1>
-  <nav>{_nav_html("dip-rules")}</nav>
+  <nav>__NAV__</nav>
 </header>
 <div class="wrap">
   <div id="msg"></div>
@@ -630,41 +649,41 @@ DIP_RULES_ADMIN_HTML = f"""<!DOCTYPE html>
 
 <script>
 const TOKEN_KEY = "hospital_admin_token";
-function showMsg(text, isErr) {{
+function showMsg(text, isErr) {
   const el = document.getElementById("msg");
   el.textContent = text;
   el.className = isErr ? "err" : "ok";
-}}
-function getToken() {{ return sessionStorage.getItem(TOKEN_KEY) || ""; }}
-function authHeaders() {{ return {{ "Content-Type": "application/json", "Authorization": "Bearer " + getToken() }}; }}
-function clearProtectedRulesData() {{
+}
+function getToken() { return sessionStorage.getItem(TOKEN_KEY) || ""; }
+function authHeaders() { return { "Content-Type": "application/json", "Authorization": "Bearer " + getToken() }; }
+function clearProtectedRulesData() {
   document.getElementById("rulesTbody").innerHTML = "";
-}}
-async function doLogin() {{
+}
+async function doLogin() {
   const operator_id = document.getElementById("loginId").value.trim();
   const password = document.getElementById("loginPwd").value;
-  const r = await fetch("/api/auth/login", {{
-    method: "POST", headers: {{ "Content-Type": "application/json" }},
-    body: JSON.stringify({{ operator_id, password }})
-  }});
+  const r = await fetch("/api/auth/login", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ operator_id, password })
+  });
   const data = await r.json();
-  if (!r.ok) {{ showMsg(data.detail || "登录失败", true); return; }}
+  if (!r.ok) { showMsg(data.detail || "登录失败", true); return; }
   sessionStorage.setItem(TOKEN_KEY, data.access_token);
   document.getElementById("loginCard").classList.add("hidden");
   document.getElementById("mainArea").classList.remove("hidden");
   showMsg("登录成功", false);
   loadDipRules();
-}}
-function doLogout() {{ sessionStorage.removeItem(TOKEN_KEY); location.reload(); }}
-function loadCsvFile() {{
+}
+function doLogout() { sessionStorage.removeItem(TOKEN_KEY); location.reload(); }
+function loadCsvFile() {
   const file = document.getElementById("csvFile").files[0];
   if (!file) return;
   const reader = new FileReader();
-  reader.onload = (e) => {{ document.getElementById("csvText").value = e.target.result || ""; }};
+  reader.onload = (e) => { document.getElementById("csvText").value = e.target.result || ""; };
   reader.readAsText(file, "UTF-8");
-}}
-async function submitImport() {{
-  const payload = {{
+}
+async function submitImport() {
+  const payload = {
     rule_version: document.getElementById("rVer").value.trim(),
     source_doc: document.getElementById("rDoc").value.trim(),
     effective_date: document.getElementById("rDate").value || null,
@@ -672,99 +691,99 @@ async function submitImport() {{
     approve: document.getElementById("chkApprove").checked,
     replace_version: document.getElementById("chkReplace").checked,
     csv_text: document.getElementById("csvText").value
-  }};
-  const r = await fetch("/api/admin/dip-rules/import", {{
+  };
+  const r = await fetch("/api/admin/dip-rules/import", {
     method: "POST", headers: authHeaders(), body: JSON.stringify(payload)
-  }});
+  });
   const data = await r.json();
-  if (r.status === 401) {{
+  if (r.status === 401) {
     clearProtectedRulesData(); sessionStorage.removeItem(TOKEN_KEY);
     document.getElementById("mainArea").classList.add("hidden"); document.getElementById("loginCard").classList.remove("hidden");
     showMsg(data.detail || "登录已失效", true); return;
-  }}
+  }
   document.getElementById("resultBox").textContent = JSON.stringify(data, null, 2);
-  if (!r.ok || !data.success) {{
+  if (!r.ok || !data.success) {
     showMsg(data.detail || "校验/导入存在错误，请查看下方结果", true);
-  }} else {{
+  } else {
     showMsg((payload.dry_run ? "预检通过" : "导入成功") + "：有效行数 " + data.valid_rows, false);
     if (!payload.dry_run) loadDipRules();
-  }}
-}}
-async function loadDipRules() {{
+  }
+}
+async function loadDipRules() {
   const ver = document.getElementById("qVer").value.trim();
   const st = document.getElementById("qStatus").value;
   let url = "/api/admin/dip-rules?limit=100";
   if (ver) url += "&rule_version=" + encodeURIComponent(ver);
   if (st) url += "&review_status=" + encodeURIComponent(st);
-  const r = await fetch(url, {{ headers: authHeaders() }});
+  const r = await fetch(url, { headers: authHeaders() });
   const data = await r.json();
-  if (r.status === 401) {{
+  if (r.status === 401) {
     clearProtectedRulesData(); sessionStorage.removeItem(TOKEN_KEY);
     document.getElementById("mainArea").classList.add("hidden"); document.getElementById("loginCard").classList.remove("hidden");
     showMsg(data.detail || "登录已失效", true); return;
-  }}
-  if (r.status === 403 || !r.ok) {{
+  }
+  if (r.status === 403 || !r.ok) {
     clearProtectedRulesData(); showMsg(data.detail || "无权查看规则列表", true); return;
-  }}
+  }
   const tbody = document.getElementById("rulesTbody");
   tbody.innerHTML = "";
-  for (const row of (data.items || [])) {{
+  for (const row of (data.items || [])) {
     const tr = document.createElement("tr");
     const vals = [
       String(row.rule_id), row.rule_version, row.department, row.icd_code,
       row.dip_group_name, String(row.dip_score), String(row.employee_base), String(row.resident_base)
     ];
-    for (const v of vals) {{
+    for (const v of vals) {
       const td = document.createElement("td"); td.textContent = v || "-"; tr.appendChild(td);
-    }}
+    }
     const tdSt = document.createElement("td");
     const badge = document.createElement("span");
     badge.className = "badge " + (row.review_status === "APPROVED" ? "badge-GREEN" : (row.review_status === "PENDING" ? "badge-YELLOW" : "badge-PENDING"));
     badge.textContent = row.review_status || "-";
     tdSt.appendChild(badge); tr.appendChild(tdSt);
     tbody.appendChild(tr);
-  }}
-}}
-async function reviewDipRules(targetStatus) {{
+  }
+}
+async function reviewDipRules(targetStatus) {
   const ver = document.getElementById("qVer").value.trim();
-  if (!ver) {{ showMsg("请先输入要审批/归档的规则版本号", true); return; }}
-  const r = await fetch("/api/admin/dip-rules/review", {{
+  if (!ver) { showMsg("请先输入要审批/归档的规则版本号", true); return; }
+  const r = await fetch("/api/admin/dip-rules/review", {
     method: "POST", headers: authHeaders(),
-    body: JSON.stringify({{ rule_version: ver, target_status: targetStatus }})
-  }});
+    body: JSON.stringify({ rule_version: ver, target_status: targetStatus })
+  });
   const data = await r.json();
-  if (r.status === 401) {{
+  if (r.status === 401) {
     clearProtectedRulesData(); sessionStorage.removeItem(TOKEN_KEY);
     document.getElementById("mainArea").classList.add("hidden"); document.getElementById("loginCard").classList.remove("hidden");
     showMsg(data.detail || "登录已失效", true); return;
-  }}
-  if (!r.ok) {{ showMsg(data.detail || "审核操作失败", true); return; }}
+  }
+  if (!r.ok) { showMsg(data.detail || "审核操作失败", true); return; }
   showMsg("已将版本 " + ver + " 共 " + data.updated_rows + " 条规则更新为 " + targetStatus, false);
   loadDipRules();
-}}
-if (getToken()) {{
+}
+if (getToken()) {
   document.getElementById("loginCard").classList.add("hidden");
   document.getElementById("mainArea").classList.remove("hidden");
   loadDipRules();
-}}
+}
 </script>
 </body>
 </html>
-"""
+""".replace("__STYLE__", _COMMON_STYLE).replace("__NAV__", _nav_html("dip-rules"))
 
 
-AUDIT_LOGS_ADMIN_HTML = f"""<!DOCTYPE html>
+AUDIT_LOGS_ADMIN_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>合规审计日志监控台</title>
-<style>{_COMMON_STYLE}</style>
+<style>__STYLE__</style>
 </head>
 <body>
 <header>
   <h1>🛡️ 院内 DIP 控费工作台 · 合规审计日志</h1>
-  <nav>{_nav_html("audit-logs")}</nav>
+  <nav>__NAV__</nav>
 </header>
 <div class="wrap">
   <div id="msg"></div>
@@ -825,59 +844,62 @@ AUDIT_LOGS_ADMIN_HTML = f"""<!DOCTYPE html>
 <script>
 const TOKEN_KEY = "hospital_admin_token";
 let cachedDoctors = [];
-function showMsg(text, isErr) {{
+let anaReqSeq = 0;
+let anaAuthEpoch = 0;
+async function safeJson(r) { try { return await r.json(); } catch (_) { return {}; } }
+function showMsg(text, isErr) {
   const el = document.getElementById("msg");
   el.textContent = text;
   el.className = isErr ? "err" : "ok";
-}}
-function getToken() {{ return sessionStorage.getItem(TOKEN_KEY) || ""; }}
-function authHeaders() {{ return {{ "Authorization": "Bearer " + getToken() }}; }}
-function clearProtectedAuditData() {{
+}
+function getToken() { return sessionStorage.getItem(TOKEN_KEY) || ""; }
+function authHeaders() { return { "Authorization": "Bearer " + getToken() }; }
+function clearProtectedAuditData() {
   document.getElementById("logTbody").innerHTML = "";
   document.getElementById("logCount").textContent = "";
-}}
-async function doLogin() {{
+}
+async function doLogin() {
   const operator_id = document.getElementById("loginId").value.trim();
   const password = document.getElementById("loginPwd").value;
-  const r = await fetch("/api/auth/login", {{
-    method: "POST", headers: {{ "Content-Type": "application/json" }},
-    body: JSON.stringify({{ operator_id, password }})
-  }});
+  const r = await fetch("/api/auth/login", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ operator_id, password })
+  });
   const data = await r.json();
-  if (!r.ok) {{ showMsg(data.detail || "登录失败", true); return; }}
+  if (!r.ok) { showMsg(data.detail || "登录失败", true); return; }
   sessionStorage.setItem(TOKEN_KEY, data.access_token);
   document.getElementById("loginCard").classList.add("hidden");
   document.getElementById("mainArea").classList.remove("hidden");
   loadLogs();
-}}
-function doLogout() {{ sessionStorage.removeItem(TOKEN_KEY); location.reload(); }}
-async function loadLogs() {{
+}
+function doLogout() { sessionStorage.removeItem(TOKEN_KEY); location.reload(); }
+async function loadLogs() {
   const days = document.getElementById("daysSel").value;
   const authRes = document.getElementById("authResSel").value;
   const action = document.getElementById("actionFilter").value.trim();
   let url = "/api/admin/audit-logs?days=" + encodeURIComponent(days);
   if (authRes) url += "&auth_result=" + encodeURIComponent(authRes);
   if (action) url += "&action_type=" + encodeURIComponent(action);
-  const r = await fetch(url, {{ headers: authHeaders() }});
+  const r = await fetch(url, { headers: authHeaders() });
   const data = await r.json();
-  if (r.status === 401) {{
+  if (r.status === 401) {
     clearProtectedAuditData();
     sessionStorage.removeItem(TOKEN_KEY);
     document.getElementById("mainArea").classList.add("hidden");
     document.getElementById("loginCard").classList.remove("hidden");
     showMsg(data.detail || "登录已失效，请重新登录", true);
     return;
-  }}
-  if (r.status === 403 || !r.ok) {{
+  }
+  if (r.status === 403 || !r.ok) {
     clearProtectedAuditData();
     showMsg(data.detail || "无权查看审计日志（仅限管理员）", true);
     return;
-  }}
+  }
   const items = data.items || [];
   document.getElementById("logCount").textContent = "共返回 " + items.length + " 条";
   const tbody = document.getElementById("logTbody");
   tbody.innerHTML = "";
-  for (const row of items) {{
+  for (const row of items) {
     const tr = document.createElement("tr");
     const vals = [
       String(row.log_id || "-"),
@@ -888,11 +910,11 @@ async function loadLogs() {{
       row.action_type || "-",
       row.target_ref || "-",
     ];
-    for (const v of vals) {{
+    for (const v of vals) {
       const td = document.createElement("td");
       td.textContent = v;
       tr.appendChild(td);
-    }}
+    }
     const tdRes = document.createElement("td");
     const badge = document.createElement("span");
     badge.className = "badge " + (row.auth_result === "DENIED" ? "badge-RED" : "badge-GREEN");
@@ -904,32 +926,32 @@ async function loadLogs() {{
     tdVer.textContent = row.rule_version || "-";
     tr.appendChild(tdVer);
     tbody.appendChild(tr);
-  }}
+  }
   showMsg("审计日志已刷新", false);
-}}
-if (getToken()) {{
+}
+if (getToken()) {
   document.getElementById("loginCard").classList.add("hidden");
   document.getElementById("mainArea").classList.remove("hidden");
   loadLogs();
-}}
+}
 </script>
 </body>
 </html>
-"""
+""".replace("__STYLE__", _COMMON_STYLE).replace("__NAV__", _nav_html("audit-logs"))
 
 
-RECONCILIATION_HTML = f"""<!DOCTYPE html>
+RECONCILIATION_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>出院决算账实对账看板</title>
-<style>{_COMMON_STYLE}</style>
+<style>__STYLE__</style>
 </head>
 <body>
 <header>
   <h1>🧾 院内 DIP 控费工作台 · 出院决算账实对账</h1>
-  <nav>{_nav_html("reconciliation")}</nav>
+  <nav>__NAV__</nav>
 </header>
 <div class="wrap">
   <div id="msg"></div>
@@ -995,56 +1017,56 @@ RECONCILIATION_HTML = f"""<!DOCTYPE html>
 <script>
 const TOKEN_KEY = "hospital_admin_token";
 let cachedRecon = [];
-function showMsg(text, isErr) {{
+function showMsg(text, isErr) {
   const el = document.getElementById("msg");
   el.textContent = text;
   el.className = isErr ? "err" : "ok";
-}}
-function getToken() {{ return sessionStorage.getItem(TOKEN_KEY) || ""; }}
-function authHeaders() {{ return {{ "Authorization": "Bearer " + getToken() }}; }}
-function clearProtectedReconData() {{
+}
+function getToken() { return sessionStorage.getItem(TOKEN_KEY) || ""; }
+function authHeaders() { return { "Authorization": "Bearer " + getToken() }; }
+function clearProtectedReconData() {
   cachedRecon = [];
   document.getElementById("reconTbody").innerHTML = "";
   document.getElementById("rTotal").textContent = "0";
   document.getElementById("rMatch").textContent = "0";
   document.getElementById("rUnfy").textContent = "0";
   document.getElementById("rMis").textContent = "0";
-}}
-async function doLogin() {{
+}
+async function doLogin() {
   const operator_id = document.getElementById("loginId").value.trim();
   const password = document.getElementById("loginPwd").value;
-  const r = await fetch("/api/auth/login", {{
-    method: "POST", headers: {{ "Content-Type": "application/json" }},
-    body: JSON.stringify({{ operator_id, password }})
-  }});
+  const r = await fetch("/api/auth/login", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ operator_id, password })
+  });
   const data = await r.json();
-  if (!r.ok) {{ showMsg(data.detail || "登录失败", true); return; }}
+  if (!r.ok) { showMsg(data.detail || "登录失败", true); return; }
   sessionStorage.setItem(TOKEN_KEY, data.access_token);
   document.getElementById("loginCard").classList.add("hidden");
   document.getElementById("mainArea").classList.remove("hidden");
   loadRecon();
-}}
-function doLogout() {{ sessionStorage.removeItem(TOKEN_KEY); location.reload(); }}
-async function loadRecon() {{
+}
+function doLogout() { sessionStorage.removeItem(TOKEN_KEY); location.reload(); }
+async function loadRecon() {
   const limit = document.getElementById("limitSel").value;
   const dept = document.getElementById("deptFilter").value.trim();
   let url = "/api/reconciliation/settled?limit=" + encodeURIComponent(limit);
   if (dept) url += "&dept=" + encodeURIComponent(dept);
-  const r = await fetch(url, {{ headers: authHeaders() }});
+  const r = await fetch(url, { headers: authHeaders() });
   const data = await r.json();
-  if (r.status === 401) {{
+  if (r.status === 401) {
     clearProtectedReconData();
     sessionStorage.removeItem(TOKEN_KEY);
     document.getElementById("mainArea").classList.add("hidden");
     document.getElementById("loginCard").classList.remove("hidden");
     showMsg(data.detail || "登录已失效，请重新登录", true);
     return;
-  }}
-  if (r.status === 403 || !r.ok) {{
+  }
+  if (r.status === 403 || !r.ok) {
     clearProtectedReconData();
     showMsg(data.detail || "无权访问出院对账（仅限医保办/管理员）", true);
     return;
-  }}
+  }
   cachedRecon = data.items || [];
   document.getElementById("rTotal").textContent = String(data.total || 0);
   document.getElementById("rMatch").textContent = String(data.matched_count || 0);
@@ -1052,13 +1074,13 @@ async function loadRecon() {{
   document.getElementById("rMis").textContent = String(data.mismatch_count || 0);
   renderReconRows();
   showMsg("已完成 SERIALIZABLE 事务隔离级出院账实核对", false);
-}}
-function renderReconRows() {{
+}
+function renderReconRows() {
   const st = document.getElementById("statusFilter").value;
   const tbody = document.getElementById("reconTbody");
   tbody.innerHTML = "";
   const list = st ? cachedRecon.filter(x => x.recon_status === st) : cachedRecon;
-  for (const row of list) {{
+  for (const row of list) {
     const tr = document.createElement("tr");
     const vals = [
       row.visit_id || "-",
@@ -1071,11 +1093,11 @@ function renderReconRows() {{
       row.pharmacy_diff_str || "0.00",
       String(row.undispensed_count || 0) + " / " + (row.undispensed_amount_str || "0.00")
     ];
-    for (const v of vals) {{
+    for (const v of vals) {
       const td = document.createElement("td");
       td.textContent = v;
       tr.appendChild(td);
-    }}
+    }
     const tdSt = document.createElement("td");
     const badge = document.createElement("span");
     const cls = row.recon_status === "MISMATCH" ? "badge-RED" : (row.recon_status === "UNDISPENSED_ONLY" ? "badge-YELLOW" : "badge-GREEN");
@@ -1084,53 +1106,62 @@ function renderReconRows() {{
     tdSt.appendChild(badge);
     tr.appendChild(tdSt);
     tbody.appendChild(tr);
-  }}
-}}
-function exportReconCsv() {{
+  }
+}
+async function safeReconJson(r) { try { return await r.json(); } catch (_) { return {}; } }
+async function exportReconCsv() {
+  const limit = document.getElementById("limitSel").value;
+  const dept = document.getElementById("deptFilter").value.trim();
   const st = document.getElementById("statusFilter").value;
-  const list = st ? cachedRecon.filter(x => x.recon_status === st) : cachedRecon;
-  if (!list.length) {{ showMsg("暂无可导出数据", true); return; }}
-  const esc = (v) => {{
-    let s = String(v == null ? "" : v);
-    if (/^[=+\-@\t\r]/.test(s) && !/^-?\d+(?:\.\d+)?%?$/.test(s)) s = "'" + s;
-    return '"' + s.replace(/"/g, '""') + '"';
-  }};
-  const headers = ["住院流水号", "科室", "结算时间", "对账口径", "主单总额", "类目差异", "临床差异", "药房差异", "未发药笔数", "未发药金额", "状态"];
-  const rows = list.map(r => [
-    r.visit_id, r.dept_name, r.settlement_time, r.reconciliation_scope, r.total_amount_str,
-    r.category_diff_str, r.clinical_diff_str, r.pharmacy_diff_str, r.undispensed_count, r.undispensed_amount_str, r.recon_status
-  ]);
-  const lines = [headers.map(esc).join(",")].concat(rows.map(r => r.map(esc).join(",")));
-  const blob = new Blob(["\uFEFF" + lines.join("\r\n")], {{ type: "text/csv;charset=utf-8;" }});
+  const qs = ["limit=" + encodeURIComponent(limit)];
+  if (dept) qs.push("dept=" + encodeURIComponent(dept));
+  if (st) qs.push("status=" + encodeURIComponent(st));
+  const r = await fetch("/api/reconciliation/settled/export?" + qs.join("&"), { headers: authHeaders() });
+  if (r.status === 401) {
+    clearProtectedReconData();
+    sessionStorage.removeItem(TOKEN_KEY);
+    document.getElementById("mainArea").classList.add("hidden");
+    document.getElementById("loginCard").classList.remove("hidden");
+    const err = await safeReconJson(r);
+    showMsg(err.detail || "登录已失效，请重新登录", true);
+    return;
+  }
+  if (r.status === 403 || !r.ok) {
+    const err = await safeReconJson(r);
+    showMsg(err.detail || "无权导出对账明细（需开通 can_export_case 权限）", true);
+    return;
+  }
+  const blob = await r.blob();
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = "settled_reconciliation.csv";
   a.click();
   URL.revokeObjectURL(a.href);
-}}
-if (getToken()) {{
+  showMsg("已通过服务端鉴权导出对账 CSV", false);
+}
+if (getToken()) {
   document.getElementById("loginCard").classList.add("hidden");
   document.getElementById("mainArea").classList.remove("hidden");
   loadRecon();
-}}
+}
 </script>
 </body>
 </html>
-"""
+""".replace("__STYLE__", _COMMON_STYLE).replace("__NAV__", _nav_html("reconciliation"))
 
 
-CALCULATOR_HTML = f"""<!DOCTYPE html>
+CALCULATOR_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>医生 DIP 规则试算与智能问答台</title>
-<style>{_COMMON_STYLE}</style>
+<style>__STYLE__</style>
 </head>
 <body>
 <header>
   <h1>🩺 院内 DIP 控费工作台 · 医生试算与智能问答</h1>
-  <nav>{_nav_html("calculator")}</nav>
+  <nav>__NAV__</nav>
 </header>
 <div class="wrap">
   <div id="msg"></div>
@@ -1189,84 +1220,84 @@ CALCULATOR_HTML = f"""<!DOCTYPE html>
 
 <script>
 const TOKEN_KEY = "hospital_admin_token";
-function showMsg(text, isErr) {{
+function showMsg(text, isErr) {
   const el = document.getElementById("msg");
   el.textContent = text;
   el.className = isErr ? "err" : "ok";
-}}
-function getToken() {{ return sessionStorage.getItem(TOKEN_KEY) || ""; }}
-function authHeaders() {{
-  const h = {{ "Content-Type": "application/json" }};
+}
+function getToken() { return sessionStorage.getItem(TOKEN_KEY) || ""; }
+function authHeaders() {
+  const h = { "Content-Type": "application/json" };
   const t = getToken();
   if (t) h["Authorization"] = "Bearer " + t;
   return h;
-}}
-function clearProtectedCalcData() {{
+}
+function clearProtectedCalcData() {
   document.getElementById("calcOut").textContent = "";
   document.getElementById("chatOut").textContent = "";
-}}
-async function doLogin() {{
+}
+async function doLogin() {
   const operator_id = document.getElementById("loginId").value.trim();
   const password = document.getElementById("loginPwd").value;
-  const r = await fetch("/api/auth/login", {{
-    method: "POST", headers: {{ "Content-Type": "application/json" }},
-    body: JSON.stringify({{ operator_id, password }})
-  }});
+  const r = await fetch("/api/auth/login", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ operator_id, password })
+  });
   const data = await r.json();
-  if (!r.ok) {{ showMsg(data.detail || "登录失败", true); return; }}
+  if (!r.ok) { showMsg(data.detail || "登录失败", true); return; }
   sessionStorage.setItem(TOKEN_KEY, data.access_token);
   document.getElementById("loginCard").classList.add("hidden");
   showMsg("已登录 (" + data.role_type + ")", false);
-}}
-function doLogout() {{ sessionStorage.removeItem(TOKEN_KEY); clearProtectedCalcData(); location.reload(); }}
-async function runCalc() {{
+}
+function doLogout() { sessionStorage.removeItem(TOKEN_KEY); clearProtectedCalcData(); location.reload(); }
+async function runCalc() {
   const costRaw = document.getElementById("cCost").value.trim();
   const isCheck = (costRaw !== "");
-  const payload = {{
+  const payload = {
     disease: document.getElementById("cDis").value.trim(),
     ins_type: document.getElementById("cIns").value || null,
     operation: document.getElementById("cOp").value.trim() || null,
     age: document.getElementById("cAge").value ? parseInt(document.getElementById("cAge").value, 10) : null,
     bed_days: document.getElementById("cDays").value ? parseInt(document.getElementById("cDays").value, 10) : null
-  }};
+  };
   let url = "/api/tools/query_dip_rule";
-  if (isCheck) {{
+  if (isCheck) {
     url = "/api/tools/check_patient_dip";
     payload.current_cost = parseFloat(costRaw);
     payload.patient_id = document.getElementById("cPid").value.trim() || null;
-  }}
-  const r = await fetch(url, {{ method: "POST", headers: authHeaders(), body: JSON.stringify(payload) }});
+  }
+  const r = await fetch(url, { method: "POST", headers: authHeaders(), body: JSON.stringify(payload) });
   const data = await r.json();
-  if (r.status === 401) {{
+  if (r.status === 401) {
     clearProtectedCalcData(); sessionStorage.removeItem(TOKEN_KEY);
     document.getElementById("loginCard").classList.remove("hidden");
     showMsg(data.detail || "患者判灯需要登录或令牌已失效", true); return;
-  }}
-  if (r.status === 403 || !r.ok) {{
+  }
+  if (r.status === 403 || !r.ok) {
     clearProtectedCalcData(); showMsg(data.detail || "无权访问或测算失败", true); return;
-  }}
+  }
   document.getElementById("calcOut").textContent = JSON.stringify(data, null, 2);
   showMsg("测算完成", false);
-}}
-async function sendChat() {{
+}
+async function sendChat() {
   const text = document.getElementById("chatText").value.trim();
-  if (!text) {{ showMsg("请输入提问内容", true); return; }}
-  const r = await fetch("/api/chat", {{
+  if (!text) { showMsg("请输入提问内容", true); return; }
+  const r = await fetch("/api/chat", {
     method: "POST", headers: authHeaders(),
-    body: JSON.stringify({{ text, channel: "web" }})
-  }});
+    body: JSON.stringify({ text, channel: "web" })
+  });
   const data = await r.json();
-  if (r.status === 401) {{
+  if (r.status === 401) {
     clearProtectedCalcData(); sessionStorage.removeItem(TOKEN_KEY);
     document.getElementById("loginCard").classList.remove("hidden");
     showMsg(data.detail || "登录已失效", true); return;
-  }}
+  }
   document.getElementById("chatOut").textContent = (data.reply || "") + (data.data ? "\n\n" + JSON.stringify(data.data, null, 2) : "");
-}}
-if (getToken()) {{
+}
+if (getToken()) {
   document.getElementById("loginCard").classList.add("hidden");
-}}
+}
 </script>
 </body>
 </html>
-"""
+""".replace("__STYLE__", _COMMON_STYLE).replace("__NAV__", _nav_html("calculator"))

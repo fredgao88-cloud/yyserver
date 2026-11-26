@@ -50,15 +50,58 @@ def test_workbench_fixes_wb_alert_auth_and_trend_contracts():
     assert "const barW = 28;" in ana_html
     assert "overflow-x:auto" in ana_html
 
-    # CSV 导出与公式注入防护
+    # WB-JS-001: 检查全部页面 <script> 不含原始控制字符 (\r / \t)，并在有 node 时执行 node --check
+    import re
+    import shutil
+    import subprocess
+    all_pages = [
+        main_mod.inpatient_workbench_page,
+        main_mod.analytics_workbench_page,
+        main_mod.dip_rules_admin_page,
+        main_mod.audit_logs_admin_page,
+        main_mod.reconciliation_workbench_page,
+        main_mod.calculator_workbench_page,
+        main_mod.admin_operators_page,
+    ]
+    node_bin = shutil.which("node")
+    for fn in all_pages:
+        html_src = asyncio.run(fn()).body.decode("utf-8")
+        m_js = re.search(r"<script>(.*?)</script>", html_src, re.S)
+        assert m_js is not None
+        js_code = m_js.group(1)
+        assert "\r" not in js_code and "\t" not in js_code
+        if node_bin:
+            subprocess.run([node_bin, "--check", "-"], input=js_code, text=True, encoding="utf-8", check=True)
+
+    # WB-EXPORT-001: 在院与对账导出改为调用后端受保护接口，前端不直接生成病例 CSV
     rec_html = asyncio.run(main_mod.reconciliation_workbench_page()).body.decode("utf-8")
-    for html_txt, fn_name in [
-        (inp_html, "exportInpatientCsv"),
-        (ana_html, "exportAnalyticsCsv"),
-        (rec_html, "exportReconCsv"),
-    ]:
-        assert fn_name in html_txt
-        assert "\ufeff" in html_txt
+    assert "/api/inpatient/alerts/export" in inp_html
+    assert "/api/reconciliation/settled/export" in rec_html
+    assert "exportAnalyticsCsv" in ana_html and ("\\uFEFF" in ana_html or "\ufeff" in ana_html)
+
+    # 校验后端导出权限 can_export_case=0 -> 403，can_export_case=1 -> 200 CSV
+    from unittest.mock import patch
+    with patch.object(main_mod, "get_operator", return_value={"operator_id": "ins01", "can_export_case": False}), \
+         patch.object(main_mod, "record_audit_log"):
+        try:
+            asyncio.run(main_mod.export_inpatient_alerts_csv(dept=None, level=None, operator={"sub": "ins01", "role": main_mod.ROLE_INSURANCE}))
+            assert False, "expected 403 when can_export_case is False"
+        except main_mod.HTTPException as exc:
+            assert exc.status_code == 403
+
+        try:
+            asyncio.run(main_mod.export_settled_reconciliation_csv(limit=10, dept=None, status=None, operator={"sub": "ins01", "role": main_mod.ROLE_INSURANCE}))
+            assert False, "expected 403 when can_export_case is False"
+        except main_mod.HTTPException as exc:
+            assert exc.status_code == 403
+
+    with patch.object(main_mod, "get_operator", return_value={"operator_id": "ins01", "can_export_case": True}), \
+         patch.object(main_mod, "record_audit_log"), \
+         patch.object(main_mod, "get_inpatient_alerts", return_value={"batch_id": "B1", "items": [{"zyh": "ZY1", "dept_name": "中医科", "bed": "1", "doctor_id": "D1", "disease": "M17.9", "ins_type": "职工", "current_cost_str": "100.00", "benchmark_str": "200.00", "ratio_percent": 50.0, "alert_level": "GREEN", "status": "正常"}]}):
+        csv_resp = asyncio.run(main_mod.export_inpatient_alerts_csv(dept=None, level=None, operator={"sub": "ins01", "role": main_mod.ROLE_INSURANCE}))
+        assert csv_resp.status_code == 200
+        assert "text/csv" in csv_resp.media_type
+        assert "ZY1" in csv_resp.body.decode("utf-8")
 
     # 根路径浏览器跳转 vs API JSON 兼容
     redir = asyncio.run(main_mod.index(accept="text/html,application/xhtml+xml"))

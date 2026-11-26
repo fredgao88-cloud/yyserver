@@ -201,6 +201,13 @@ def test_dip_op_001_canceled_operation_falls_back_to_conservative():
     assert tc_bio["arguments"]["operation"] == "活检"
     assert tc_bio["arguments"]["operation_status"] == "COMPLETED"
 
+    # “拟行胃镜，该检查前已完成抽血”不得把胃镜标为已完成（胃镜保持拟行/保守）
+    kw8, st8, _ = extract_operation_keyword("拟行胃镜，该检查前已完成抽血")
+    assert kw8 == "保守" and st8 == "PLANNED"
+    tc_draw2 = extract_tool_call("住院号 zy2025042901，诊断 K63.5，拟行胃镜，该检查前已完成抽血，当前费用 2500 元，职工医保")
+    assert tc_draw2["arguments"]["operation"] == "保守"
+    assert tc_draw2["arguments"]["operation_status"] == "PLANNED"
+
 
 def test_chat_audit_001_denied_vs_permitted():
     recorded = []

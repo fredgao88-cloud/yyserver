@@ -82,9 +82,39 @@ def test_run_settled_reconciliation_report_dedup_and_error_isolation():
         RuntimeError("transient error"),
     ]
     res = run_settled_reconciliation_report(limit=10, reader=fake_reader)
+    assert res["sampled_count"] == 2
+    assert res["reconciled_count"] == 1
+    assert res["unreconciled_count"] == 1
     assert res["total"] == 1
     assert res["matched_count"] == 1
     assert res["error_count"] == 1
+
+    # RECON-COVER-001: 零样本、全空详情、正常+空详情
+    r_zero = MagicMock()
+    r_zero.get_settled_cases.return_value = []
+    res0 = run_settled_reconciliation_report(limit=10, reader=r_zero)
+    assert res0["sampled_count"] == 0 and res0["reconciled_count"] == 0 and res0["unreconciled_count"] == 0
+
+    r_empty = MagicMock()
+    r_empty.get_settled_cases.return_value = [{"lsh": "ZY_E1", "settlement_id": "1"}]
+    r_empty.get_case_fee_detail.return_value = {}
+    res_empty = run_settled_reconciliation_report(limit=10, reader=r_empty)
+    assert res_empty["sampled_count"] == 1 and res_empty["reconciled_count"] == 0 and res_empty["unreconciled_count"] == 1
+    assert res_empty["unreconciled_reasons"][0]["reason"] == "EMPTY_DETAIL"
+
+    r_mix = MagicMock()
+    r_mix.get_settled_cases.return_value = [{"lsh": "ZY_OK", "settlement_id": "1"}, {"lsh": "ZY_E2", "settlement_id": "2"}]
+    r_mix.get_case_fee_detail.side_effect = [
+        {
+            "reconciliation_scope": "SINGLE_SETTLEMENT", "settlement_count": 1,
+            "zyjz": {"lsh": "ZY_OK", "id": "1", "amoney": Decimal("10"), "czmoney": Decimal("10"), "yjmoney": Decimal("0"), "yfmoney": Decimal("0")},
+            "category_sum": Decimal("10"), "cz_stat": {"total": Decimal("10")},
+            "fy_stat": {"total": Decimal("0"), "undispensed_count": 0, "undispensed": Decimal("0")},
+        },
+        {},
+    ]
+    res_mix = run_settled_reconciliation_report(limit=10, reader=r_mix)
+    assert res_mix["sampled_count"] == 2 and res_mix["reconciled_count"] == 1 and res_mix["unreconciled_count"] == 1
 
 
 def test_reconciliation_ui_and_rbac_protection():
