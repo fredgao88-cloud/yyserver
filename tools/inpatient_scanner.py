@@ -311,13 +311,16 @@ class InpatientScanner:
             local_conn.commit()
             print(f"[{batch_id}] Successfully persisted {len(evaluated_snapshots)} snapshot records to local_db.")
         except Exception as scan_err:
-            # FIX-08: 任意患者写入异常时回滚整个批次，确保快照原子性
+            # SNAP-LOG-001：使用受控错误码记录写入失败与真实回滚状态，严禁输出原始异常详情
+            rollback_ok = False
             try:
                 local_conn.rollback()
+                rollback_ok = True
             except Exception:
-                pass
-            print(f"[{batch_id}] ERROR: 批次写入异常，已回滚所有未提交快照记录: {scan_err}")
-            raise
+                rollback_ok = False
+            rb_state = "ROLLED_BACK" if rollback_ok else "ROLLBACK_FAILED"
+            print(f"[{batch_id}] ERROR: EVENT=SCAN_BATCH_FAILED err_type={type(scan_err).__name__} rollback_status={rb_state}")
+            raise RuntimeError(f"EVENT=SCAN_BATCH_FAILED batch={batch_id} rollback_status={rb_state}") from None
         finally:
             local_conn.close()
 

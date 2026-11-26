@@ -67,9 +67,12 @@ def _to_dec(val: Any, default: Optional[Decimal] = None) -> Decimal:
             return default
         raise ValueError("数值字段不能为空")
     try:
-        return Decimal(str(val).strip())
+        dec = Decimal(str(val).strip())
     except InvalidOperation as exc:
         raise ValueError(f"非法数值: {val}") from exc
+    if not dec.is_finite():
+        raise ValueError(f"数值必须为有限实数: {val}")
+    return dec
 
 
 def _quant2(val: Decimal) -> Decimal:
@@ -108,7 +111,11 @@ def normalize_rule_row(
     low_th = _to_dec(mapped.get("low_threshold"), Decimal("0.9000"))
     high_th = _to_dec(mapped.get("high_threshold"), Decimal("1.1000"))
 
-    if low_th <= 0 or high_th <= low_th:
+    if res_pt <= Decimal("0") or emp_pt <= Decimal("0"):
+        raise ValueError(f"点值必须大于 0: resident_point={res_pt}, employee_point={emp_pt}")
+    if coef <= Decimal("0") or coef > Decimal("10"):
+        raise ValueError(f"医院系数范围非法 (0 < coef <= 10): hosp_coef={coef}")
+    if low_th <= Decimal("0") or high_th <= low_th or high_th > Decimal("10"):
         raise ValueError(f"阈值范围非法: low={low_th}, high={high_th}")
 
     res_base = _quant2(dip_score * res_pt * coef)
@@ -206,6 +213,15 @@ def import_dip_rules_records(
     """
     if not rule_version or not source_doc:
         raise ValueError("rule_version 与 source_doc 不能为空")
+    if not raw_records:
+        return {
+            "success": False,
+            "dry_run": dry_run,
+            "total_rows": 0,
+            "valid_rows": 0,
+            "inserted_rows": 0,
+            "errors": [{"row": 0, "error": "RULE-IMPORT-001: 导入记录集不能为空，拒绝执行空批次导入或版本覆盖"}],
+        }
     eff_date = effective_date or date.today().isoformat()
     if review_status not in ("PENDING", "APPROVED", "ARCHIVED"):
         raise ValueError(f"非法审核状态: {review_status}")

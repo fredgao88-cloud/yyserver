@@ -62,10 +62,10 @@ def get_local_db_connection(as_dict: bool = True) -> Tuple[Any, Any]:
         except Exception as e:
             last_err = e
             if idx + 1 < len(candidates):
-                logger.warning("本地数据库连接失败 (host=%s): %s，尝试回退地址 %s", h, e, candidates[idx + 1])
+                logger.warning("EVENT=DB_CONNECT_FALLBACK host=%s next_host=%s err_type=%s", h, candidates[idx + 1], type(e).__name__)
             continue
             
-    raise ConnectionError(f"无法连接到本地数据库 his_agent_db (尝试地址: {candidates}): {last_err}")
+    raise ConnectionError(f"EVENT=DB_CONNECT_FAILED hosts={candidates} err_type={type(last_err).__name__ if last_err else 'Unknown'}")
 
 def query_approved_dip_rules(
     rule_version: str = "2026_SAMPLE_V1",
@@ -135,7 +135,7 @@ def record_audit_log(
         ))
         conn.commit()
     except Exception as e:
-        # FIX-11: 使用结构化日志记录审计写入异常，避免仅 print 导致高并发下日志丢失
-        logger.error("记录审计日志失败: action=%s operator=%s role=%s err=%s", action_type, operator_id, role_type, e, exc_info=True)
+        # AUDIT-LOG-001：仅输出受控事件码与动作类型，绝不输出原始驱动异常文本、堆栈或操作员敏感字段
+        logger.error("EVENT=AUDIT_LOG_WRITE_FAILED action=%s role=%s err_type=%s", action_type, role_type, type(e).__name__)
     finally:
         conn.close()

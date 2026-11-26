@@ -13,6 +13,49 @@ from decimal import Decimal
 from typing import Dict, Any, Optional
 from tools.dip_calculator import match_dip_rule, evaluate_traffic_light, normalize_insurance_type
 
+def extract_operation_keyword(text_clean: str):
+    """抽取手术/操作关键词并感知时态（已取消/拟行均回退为保守治疗基础分组）。"""
+    op_status = "UNKNOWN"
+    if any(k in text_clean for k in ["取消", "未做", "未行", "放弃", "暂不做"]):
+        op_status = "CANCELED"
+    elif any(k in text_clean for k in ["拟行", "拟做", "计划", "准备行", "拟实施", "准备做", "打算做"]):
+        op_status = "PLANNED"
+    elif any(k in text_clean for k in ["已完成", "已行", "已做", "做完", "术后", "已实施"]):
+        op_status = "COMPLETED"
+
+    op_keyword = None
+    op_note = ""
+    if op_status in ("CANCELED", "PLANNED"):
+        op_keyword = "保守"
+        if op_status == "CANCELED":
+            op_note = "（检测到手术/操作已取消，按保守治疗基础分组测算）"
+        else:
+            op_note = "（检测到操作为拟行/尚未执行状态，依规暂不计入手术操作组，按保守治疗分组测算；待实际执行后按新组结算）"
+    else:
+        candidate_ops = [
+            ("切除术+胃镜", "胃镜检查"),
+            ("切除+胃镜", "胃镜检查"),
+            ("胃镜检查", "胃镜检查"),
+            ("胃十二指肠镜", "胃十二指肠"),
+            ("活检", "活检"),
+            ("活组织", "活检"),
+            ("直肠息肉切除", "直肠息肉切除"),
+            ("胃息肉切除", "胃息肉切除"),
+            ("电子结肠镜", "电子结肠镜"),
+            ("结肠镜", "结肠镜"),
+            ("保守", "保守"),
+            ("胃镜", "胃镜"),
+            ("切除", "切除"),
+            ("治疗性操作", "综合-治疗性操作"),
+            ("操作", "综合-治疗性操作"),
+        ]
+        for pattern, op_kw in candidate_ops:
+            if pattern in text_clean:
+                op_keyword = op_kw
+                break
+    return op_keyword, op_status, op_note
+
+
 def parse_local_intent(text: str, channel: str = "web") -> Dict[str, Any]:
     """院内纯本地意图解析与参数提取（零云端调用）"""
     text_clean = text.strip()
@@ -126,47 +169,7 @@ def parse_local_intent(text: str, channel: str = "web") -> Dict[str, Any]:
     ins_type = norm_ins.get("category") if norm_ins.get("valid") else None
 
     # ---------------- 6. 操作识别与时态感知 ----------------
-    op_status = "UNKNOWN"
-    if any(k in text_clean for k in ["取消", "未做", "未行", "放弃", "暂不做"]):
-        op_status = "CANCELED"
-    elif any(k in text_clean for k in ["拟行", "拟做", "计划", "准备行", "拟实施", "准备做", "打算做"]):
-        op_status = "PLANNED"
-    elif any(k in text_clean for k in ["已完成", "已行", "已做", "做完", "术后", "已实施"]):
-        op_status = "COMPLETED"
-
-    op_keyword = None
-    op_note = ""
-    
-    if op_status in ("CANCELED", "PLANNED"):
-        # 依规范：拟行或已取消操作均尚未实际发生加分效力，一律回退至保守治疗/基础分组测算
-        op_keyword = "保守"
-        if op_status == "CANCELED":
-            op_note = "（检测到手术/操作已取消，按保守治疗基础分组测算）"
-        else:
-            op_note = "（检测到操作为拟行/尚未执行状态，依规暂不计入手术操作组，按保守治疗分组测算；待实际执行后按新组结算）"
-    else:
-        # 优先提取具体复合操作词，避免笼统词（如单纯“切除”）覆盖复合术式
-        candidate_ops = [
-            ("切除术+胃镜", "胃镜检查"),
-            ("切除+胃镜", "胃镜检查"),
-            ("胃镜检查", "胃镜检查"),
-            ("胃十二指肠镜", "胃十二指肠"),
-            ("活检", "活检"),
-            ("活组织", "活检"),
-            ("直肠息肉切除", "直肠息肉切除"),
-            ("胃息肉切除", "胃息肉切除"),
-            ("电子结肠镜", "电子结肠镜"),
-            ("结肠镜", "结肠镜"),
-            ("保守", "保守"),
-            ("胃镜", "胃镜"),
-            ("切除", "切除"),
-            ("治疗性操作", "综合-治疗性操作"),
-            ("操作", "综合-治疗性操作")
-        ]
-        for pattern, op_kw in candidate_ops:
-            if pattern in text_clean:
-                op_keyword = op_kw
-                break
+    op_keyword, op_status, op_note = extract_operation_keyword(text_clean)
 
     # ---------------- 7. 识别病种 (区分显式 ICD 编码与宽泛病名) ----------------
     disease = None

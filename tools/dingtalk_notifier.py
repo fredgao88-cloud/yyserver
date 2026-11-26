@@ -2,11 +2,12 @@
 """
 tools/dingtalk_notifier.py — 钉钉群机器人 Webhook 主动预警推送模块
 
-严格遵循隐私合规红线：
-1. 仅推送批次级脱敏统计（红/黄/绿/待定人数、科室维度的预警计数与工作台入口链接）；
+严格遵循隐私合规红线与 NOTIFY-DATA-001 / NOTIFY-ACK-001 规范：
+1. 出站载荷仅接受受控格式标识（batch_id / rule_version）及经目录/白名单核验的科室标签，
+   任何未核验自由文本在构建出站消息前一律丢弃或归并，绝不原样送入出站载荷；
 2. 严禁在钉钉消息体中包含任何患者姓名、住院号(visit_id)、床号、诊断编码或医生个人明细；
-3. 使用 Python 标准库 urllib / hmac / hashlib 实现，零额外外部依赖；
-4. 推送失败或未配置 Webhook 时安全降级记录日志，绝不阻断在院扫描主流程。
+3. DINGTALK_NOTIFY_ENABLED 禁用时，无论是否显式传入 webhook_url，一律在所有入口跳过发送；
+4. 仅当 HTTP 200 且响应体为合法 JSON 且显式包含 errcode == 0 时才判定为 sent=True。
 """
 import base64
 import hashlib
@@ -14,15 +15,25 @@ import hmac
 import json
 import logging
 import os
+import re
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
 
 logger = logging.getLogger("hospital_agent.dingtalk_notifier")
 
 DEFAULT_WORKBENCH_URL = "https://hospital-internal.local/inpatient"
+
+# 受控格式正则：仅允许系统生成的 BATCH_YYYYMMDD_HHMMSS（或短测试ID B1/B2），禁止任意自定义字母标记出站
+_CONTROLLED_BATCH_RE = re.compile(r"^BATCH_\d{8}_\d{6}$|^B\d{1,6}$")
+_CONTROLLED_VERSION_RE = re.compile(r"^\d{4}_[A-Z0-9_]{1,20}$")
+# 内置标准受控科室白名单（也可由调用方传入 his_ks 目录核验集合）
+DEFAULT_ALLOWED_DEPTS: Set[str] = {
+    "中医科", "骨伤科", "内科", "外科", "妇科", "儿科",
+    "康复医学科", "综合科", "急诊科", "老年病科", "针灸推拿科",
+}
 
 
 def _sign_webhook_url(webhook_url: str, secret: str, timestamp_ms: Optional[int] = None) -> str:
@@ -37,20 +48,71 @@ def _sign_webhook_url(webhook_url: str, secret: str, timestamp_ms: Optional[int]
     return f"{webhook_url}{sep}timestamp={ts}&sign={sign}"
 
 
-def build_alert_markdown(summary: Dict[str, Any], workbench_url: Optional[str] = None) -> Tuple[str, str]:
+def _sanitize_outbound_summary(
+    summary: Dict[str, Any],
+    allowed_depts: Optional[Set[str]] = None,
+) -> Dict[str, Any]:
     """
-    基于扫描摘要构建严格脱敏的钉钉 Markdown 消息 (title, text)。
-    仅包含聚合统计数字与科室计数，绝不包含患者级明细。
+    NOTIFY-DATA-001：独立构建受控出站对象，清洗并拦截任何非受控自由文本标记。
     """
-    batch_id = str(summary.get("batch_id") or "UNKNOWN")
-    cutoff = str(summary.get("data_cutoff_time") or "-")
-    rule_ver = str(summary.get("rule_version") or "-")
-    total = int(summary.get("total_scanned") or 0)
-    red_cnt = int(summary.get("RED") or 0)
-    yellow_cnt = int(summary.get("YELLOW") or 0)
-    green_cnt = int(summary.get("GREEN") or 0)
-    pending_cnt = int(summary.get("PENDING") or 0)
-    na_cnt = int(summary.get("NOT_APPLICABLE") or 0)
+    raw_batch = str(summary.get("batch_id") or "").strip()
+    safe_batch = raw_batch if _CONTROLLED_BATCH_RE.match(raw_batch) else "CONTROLLED_BATCH"
+
+    raw_ver = str(summary.get("rule_version") or "").strip()
+    safe_ver = raw_ver if _CONTROLLED_VERSION_RE.match(raw_ver) else "UNKNOWN_VERSION"
+
+    raw_cutoff = str(summary.get("data_cutoff_time") or "").strip()
+    safe_cutoff = raw_cutoff if re.match(r"^\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2}:\d{2})?$", raw_cutoff) else "-"
+
+    whitelist = allowed_depts if allowed_depts is not None else DEFAULT_ALLOWED_DEPTS
+    raw_dept_alerts = summary.get("dept_alert_counts") or {}
+    safe_depts: Dict[str, Dict[str, int]] = {}
+    if isinstance(raw_dept_alerts, dict):
+        for dept_key, counts in raw_dept_alerts.items():
+            if not isinstance(counts, dict):
+                continue
+            r_c = max(0, int(counts.get("RED") or 0))
+            y_c = max(0, int(counts.get("YELLOW") or 0))
+            if r_c == 0 and y_c == 0:
+                continue
+            d_clean = str(dept_key or "").strip()
+            label = d_clean if d_clean in whitelist else "其他已核验科室"
+            bucket = safe_depts.setdefault(label, {"RED": 0, "YELLOW": 0})
+            bucket["RED"] += r_c
+            bucket["YELLOW"] += y_c
+
+    return {
+        "batch_id": safe_batch,
+        "data_cutoff_time": safe_cutoff,
+        "rule_version": safe_ver,
+        "total_scanned": max(0, int(summary.get("total_scanned") or 0)),
+        "RED": max(0, int(summary.get("RED") or 0)),
+        "YELLOW": max(0, int(summary.get("YELLOW") or 0)),
+        "GREEN": max(0, int(summary.get("GREEN") or 0)),
+        "PENDING": max(0, int(summary.get("PENDING") or 0)),
+        "NOT_APPLICABLE": max(0, int(summary.get("NOT_APPLICABLE") or 0)),
+        "dept_alert_counts": safe_depts,
+    }
+
+
+def build_alert_markdown(
+    summary: Dict[str, Any],
+    workbench_url: Optional[str] = None,
+    allowed_depts: Optional[Set[str]] = None,
+) -> Tuple[str, str]:
+    """
+    基于受控净化后的出站对象构建钉钉 Markdown 消息 (title, text)。
+    """
+    safe = _sanitize_outbound_summary(summary, allowed_depts=allowed_depts)
+    batch_id = safe["batch_id"]
+    cutoff = safe["data_cutoff_time"]
+    rule_ver = safe["rule_version"]
+    total = safe["total_scanned"]
+    red_cnt = safe["RED"]
+    yellow_cnt = safe["YELLOW"]
+    green_cnt = safe["GREEN"]
+    pending_cnt = safe["PENDING"]
+    na_cnt = safe["NOT_APPLICABLE"]
 
     target_url = (workbench_url or os.getenv("WORKBENCH_INTERNAL_URL", DEFAULT_WORKBENCH_URL)).strip()
 
@@ -69,16 +131,14 @@ def build_alert_markdown(summary: Dict[str, Any], workbench_url: Optional[str] =
         f"- **汇总统计**：共 {total} 例（红灯 **{red_cnt}** | 黄灯 **{yellow_cnt}** | 绿灯 {green_cnt} | 待定 {pending_cnt} | 自费 {na_cnt}）",
     ]
 
-    dept_alerts = summary.get("dept_alert_counts") or {}
-    if isinstance(dept_alerts, dict) and dept_alerts:
+    dept_alerts = safe["dept_alert_counts"]
+    if dept_alerts:
         dept_parts = []
         for dept_name, counts in sorted(dept_alerts.items()):
-            r_c = int((counts or {}).get("RED", 0))
-            y_c = int((counts or {}).get("YELLOW", 0))
-            if r_c > 0 or y_c > 0:
-                dept_parts.append(f"{dept_name}(红{r_c}/黄{y_c})")
-        if dept_parts:
-            lines.append(f"- **预警科室分布**：{', '.join(dept_parts)}")
+            r_c = counts["RED"]
+            y_c = counts["YELLOW"]
+            dept_parts.append(f"{dept_name}(红{r_c}/黄{y_c})")
+        lines.append(f"- **预警科室分布**：{', '.join(dept_parts)}")
 
     lines.append("")
     lines.append(f"> 🔒 **隐私安全提示**：依据院内医疗数据合规要求，患者明细不在移动端群消息展示，请通过院内工作站访问专属 HTTPS 工作台查看：[进入预警看板]({target_url})")
@@ -91,13 +151,14 @@ def send_dingtalk_alert(
     secret: Optional[str] = None,
     notify_when_clear: bool = False,
     timeout: int = 8,
+    allowed_depts: Optional[Set[str]] = None,
 ) -> Dict[str, Any]:
     """
     发送钉钉群预警通知。
-    返回结构化状态字典 {"sent": bool, "skipped": bool, "reason": str, ...}，绝不抛出未捕获异常。
+    NOTIFY-ACK-001：禁用开关在所有入口生效；仅合法 JSON 且显式 errcode == 0 才返回 sent=True。
     """
     enabled = os.getenv("DINGTALK_NOTIFY_ENABLED", "true").strip().lower() in ("1", "true", "yes")
-    if not enabled and webhook_url is None:
+    if not enabled:
         return {"sent": False, "skipped": True, "reason": "DISABLED_BY_ENV"}
 
     url = (webhook_url if webhook_url is not None else os.getenv("DINGTALK_WEBHOOK_URL", "")).strip()
@@ -111,7 +172,7 @@ def send_dingtalk_alert(
 
     sec = (secret if secret is not None else os.getenv("DINGTALK_WEBHOOK_SECRET", "")).strip()
     signed_url = _sign_webhook_url(url, sec)
-    title, md_text = build_alert_markdown(summary)
+    title, md_text = build_alert_markdown(summary, allowed_depts=allowed_depts)
 
     payload = {
         "msgtype": "markdown",
@@ -135,16 +196,29 @@ def send_dingtalk_alert(
             try:
                 resp_json = json.loads(resp_raw)
             except ValueError:
-                resp_json = {"raw": resp_raw}
-            ok = (resp.status == 200 and resp_json.get("errcode", 0) == 0)
+                logger.warning("EVENT=DINGTALK_ACK_INVALID_JSON status=%s", getattr(resp, "status", "unknown"))
+                return {
+                    "sent": False,
+                    "skipped": False,
+                    "reason": "INVALID_JSON_RESPONSE",
+                }
+            if not isinstance(resp_json, dict) or "errcode" not in resp_json:
+                logger.warning("EVENT=DINGTALK_ACK_MISSING_ERRCODE status=%s", getattr(resp, "status", "unknown"))
+                return {
+                    "sent": False,
+                    "skipped": False,
+                    "reason": "MISSING_ERRCODE",
+                }
+            errcode = resp_json.get("errcode")
+            ok = (resp.status == 200 and errcode == 0)
             if not ok:
-                logger.warning("钉钉 Webhook 返回异常: status=%s body=%s", resp.status, resp_json)
+                logger.warning("EVENT=DINGTALK_ACK_ERROR status=%s errcode=%s", resp.status, errcode)
             return {
                 "sent": ok,
                 "skipped": False,
-                "reason": "OK" if ok else f"DINGTALK_ERR_{resp_json.get('errcode', resp.status)}",
+                "reason": "OK" if ok else f"DINGTALK_ERR_{errcode}",
                 "response": resp_json,
             }
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as exc:
-        logger.warning("钉钉 Webhook 推送失败（已隔离，不影响扫描主流程）: %s", exc)
-        return {"sent": False, "skipped": False, "reason": f"NETWORK_ERROR: {exc}"}
+        logger.warning("EVENT=DINGTALK_NETWORK_ERROR err_type=%s", type(exc).__name__)
+        return {"sent": False, "skipped": False, "reason": f"NETWORK_ERROR:{type(exc).__name__}"}

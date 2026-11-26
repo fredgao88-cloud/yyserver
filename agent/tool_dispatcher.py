@@ -12,6 +12,7 @@ from decimal import Decimal
 import re
 from typing import Any, Dict, Optional
 
+from agent.llm_router import extract_operation_keyword
 from auth.rbac import (
     ALERTS_ROLES,
     PATIENT_QUERY_ROLES,
@@ -83,11 +84,7 @@ def extract_tool_call(text: str, channel: str = "web") -> Optional[Dict[str, Any
         norm_ins = normalize_insurance_type(text_clean)
         ins_type = norm_ins.get("category") if norm_ins.get("valid") else None
 
-        op_kw = None
-        for kw in ["保守治疗", "保守", "胃镜检查", "胃镜", "切除"]:
-            if kw in text_clean:
-                op_kw = "保守" if "保守" in kw else kw
-                break
+        op_kw, op_status, _ = extract_operation_keyword(text_clean)
 
         return {
             "name": "check_patient_dip",
@@ -98,6 +95,7 @@ def extract_tool_call(text: str, channel: str = "web") -> Optional[Dict[str, Any
                 "age": int(age_m.group(1)) if age_m else None,
                 "ins_type": ins_type,
                 "operation": op_kw,
+                "operation_status": op_status,
                 "bed_days": int(bed_m.group(1)) if bed_m else None,
             },
         }

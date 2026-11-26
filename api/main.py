@@ -406,7 +406,7 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
     患者级接口：强制有效令牌，仅科室主任、医保办与管理员角色可访问。
     支持按角色实施科室范围 (dept_scope) 行级数据隔离及快照过期检测。
     """
-    from datetime import datetime, timedelta
+    from datetime import datetime, timedelta, timezone
     role = operator.get("role")
     op_info = get_operator(operator["sub"])
     user_dept = operator.get("dept") or (op_info.get("dept_scope") if op_info else "")
@@ -442,14 +442,18 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
         cutoff_time = latest_batch["data_cutoff_time"]
         synced_at = latest_batch["synced_at"]
 
-        # FIX-01: 确保 naive/aware datetime 一致性，pymssql 返回 naive datetime，统一去除 tzinfo
-        now_dt = datetime.now()
-        synced_at_naive = synced_at.replace(tzinfo=None) if synced_at and getattr(synced_at, 'tzinfo', None) else synced_at
+        # SNAP-TIME-001：统一转换为 UTC 再比较（无偏移数据库时间明确按东八区 UTC+8 解析）
+        _DB_TZ = timezone(timedelta(hours=8))
+        now_utc = datetime.now(timezone.utc)
         is_stale = False
         stale_warning = None
-        if synced_at_naive and (now_dt - synced_at_naive) > timedelta(hours=24):
-            is_stale = True
-            stale_warning = f"快照数据生成于 {synced_at_naive.strftime('%Y-%m-%d %H:%M:%S')}，已超过 24 小时未更新，请及时运行定时巡检任务"
+        if synced_at:
+            synced_aware = synced_at if getattr(synced_at, "tzinfo", None) is not None else synced_at.replace(tzinfo=_DB_TZ)
+            synced_utc = synced_aware.astimezone(timezone.utc)
+            if (now_utc - synced_utc) > timedelta(hours=24):
+                is_stale = True
+                synced_local = synced_aware.astimezone(_DB_TZ)
+                stale_warning = f"快照数据生成于 {synced_local.strftime('%Y-%m-%d %H:%M:%S')}，已超过 24 小时未更新，请及时运行定时巡检任务"
 
         sql = """
         SELECT visit_id, ward_name, bed_no, dept_id, dept_name, doctor_id, age,
@@ -693,15 +697,17 @@ async def chat_interaction(req: ChatRequest, authorization: Optional[str] = Head
         if tc is not None:
             result = dispatch_tool_call(tc, op)
 
-    # 严格合规审计日志：严禁截取或写入原始用户文本，只记录结构化意图代码
+    # CHAT-AUDIT-001：依据实际授权与调度结果记录 DENIED / PERMITTED
     intent_code = result.get("intent", "UNKNOWN")
+    res_status = (result.get("data") or {}).get("status") if isinstance(result.get("data"), dict) else None
+    is_denied = (intent_code == "tool_call_denied" or res_status in ("AUTH_REQUIRED", "FORBIDDEN"))
     record_audit_log(
         operator_id=op["sub"],
         role_type=op["role"],
         channel=req.channel or "web",
         action_type="CHAT_INTENT",
         target_ref=f"INTENT:{intent_code}",
-        auth_result="PERMITTED"
+        auth_result="DENIED" if is_denied else "PERMITTED"
     )
     return result
 
