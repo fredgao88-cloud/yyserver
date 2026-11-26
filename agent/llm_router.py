@@ -65,9 +65,19 @@ def extract_operation_keyword(text_clean: str):
     )
 
     for clause in clauses:
-        # 优先检查是否为明确指代前序操作的分句（如“该操作已完成”），防止被“操作”泛词抢先匹配
         has_pronoun = bool(_pronoun_re.search(clause))
-        if has_pronoun and last_op is not None:
+        matched_kw = None
+        matched_pat = None
+        for pattern, op_kw in candidate_ops:
+            if pattern in clause:
+                matched_kw = op_kw
+                matched_pat = pattern
+                break
+
+        # 仅当无具体术式名（或仅被泛词“操作”匹配且句中带明确指代词如“该操作”）时才继承更新上一操作；
+        # 若句中有明确具体操作（如“该检查前已完成活检”中的“活检”），优先绑定到该具体操作
+        is_pure_pronoun_ref = has_pronoun and (matched_kw is None or matched_pat == "操作")
+        if is_pure_pronoun_ref and last_op is not None:
             if any(k in clause for k in cancel_kws):
                 _set_op_state(last_op, "CANCELED")
             elif any(k in clause for k in completed_kws):
@@ -76,12 +86,6 @@ def extract_operation_keyword(text_clean: str):
                 if op_states.get(last_op) == "UNKNOWN":
                     _set_op_state(last_op, "PLANNED")
             continue
-
-        matched_kw = None
-        for pattern, op_kw in candidate_ops:
-            if pattern in clause:
-                matched_kw = op_kw
-                break
 
         if matched_kw is not None:
             last_op = matched_kw

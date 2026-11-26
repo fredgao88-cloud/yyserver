@@ -38,11 +38,13 @@ def test_workbench_fixes_wb_alert_auth_and_trend_contracts():
     assert "t.red_count" in ana_html
     assert "totalH - gH - yH" not in ana_html
 
-    # WB-AUTH-001: 401 清空数据+令牌并退回登录，403 清空数据
+    # WB-AUTH-001: 401 清空数据+令牌并退回登录，403 清空数据；先状态判定后 safeJson 解析；reqSeq/authEpoch 防并发回流
     assert "clearProtectedInpatientData" in inp_html
-    assert "r.status === 401" in inp_html and "r.status === 403" in inp_html
+    assert "inpReqSeq" in inp_html and "inpAuthEpoch" in inp_html and "safeJson" in inp_html
+    assert inp_html.index("if (r.status === 401)") < inp_html.index("await safeJson(r)")
     assert "clearProtectedAnalyticsData" in ana_html
-    assert "r.status === 401" in ana_html and "r.status === 403" in ana_html
+    assert "anaReqSeq" in ana_html and "anaAuthEpoch" in ana_html and "safeJson" in ana_html
+    assert ana_html.index("if (r.status === 401)") < ana_html.index("await safeJson(r)")
 
     # WB-TREND-001: 恒定正柱宽 + 动态 viewBox + 横向滚动
     assert "const barW = 28;" in ana_html

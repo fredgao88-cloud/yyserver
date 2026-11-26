@@ -194,6 +194,13 @@ def test_dip_op_001_canceled_operation_falls_back_to_conservative():
     assert tc_pro["arguments"]["operation"] == "胃镜"
     assert tc_pro["arguments"]["operation_status"] == "COMPLETED"
 
+    # “拟行胃镜，该检查前已完成活检”中“该检查前”是时间参照，应绑定到具体操作“活检”/COMPLETED
+    kw7, st7, _ = extract_operation_keyword("拟行胃镜，该检查前已完成活检")
+    assert kw7 == "活检" and st7 == "COMPLETED"
+    tc_bio = extract_tool_call("住院号 zy2025042901，诊断 K63.5，拟行胃镜，该检查前已完成活检，当前费用 2500 元，职工医保")
+    assert tc_bio["arguments"]["operation"] == "活检"
+    assert tc_bio["arguments"]["operation_status"] == "COMPLETED"
+
 
 def test_chat_audit_001_denied_vs_permitted():
     recorded = []

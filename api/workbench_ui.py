@@ -143,6 +143,9 @@ INPATIENT_ALERTS_HTML = f"""<!DOCTYPE html>
 <script>
 const TOKEN_KEY = "hospital_admin_token";
 let cachedItems = [];
+let inpReqSeq = 0;
+let inpAuthEpoch = 0;
+async function safeJson(r) {{ try {{ return await r.json(); }} catch (_) {{ return {{}}; }} }}
 function showMsg(text, isErr) {{
   const el = document.getElementById("msg");
   el.textContent = text;
@@ -181,23 +184,31 @@ function clearProtectedInpatientData() {{
   document.getElementById("sNA").textContent = "0";
 }}
 async function loadAlerts() {{
+  const mySeq = ++inpReqSeq;
+  const myEpoch = inpAuthEpoch;
   const dept = document.getElementById("filterDept").value.trim();
   const url = dept ? "/api/inpatient/alerts?dept=" + encodeURIComponent(dept) : "/api/inpatient/alerts";
   const r = await fetch(url, {{ headers: authHeaders() }});
-  const data = await r.json();
   if (r.status === 401) {{
+    inpAuthEpoch++;
     clearProtectedInpatientData();
     sessionStorage.removeItem(TOKEN_KEY);
     document.getElementById("mainArea").classList.add("hidden");
     document.getElementById("loginCard").classList.remove("hidden");
+    const data = await safeJson(r);
     showMsg(data.detail || "登录已失效，请重新登录", true);
     return;
   }}
   if (r.status === 403 || !r.ok) {{
+    inpAuthEpoch++;
     clearProtectedInpatientData();
+    const data = await safeJson(r);
     showMsg(data.detail || "无权访问或加载预警失败", true);
     return;
   }}
+  if (mySeq !== inpReqSeq || myEpoch !== inpAuthEpoch) return;
+  const data = await safeJson(r);
+  if (mySeq !== inpReqSeq || myEpoch !== inpAuthEpoch) return;
   cachedItems = data.items || [];
   const banner = document.getElementById("staleBanner");
   if (data.is_stale && data.stale_warning) {{
@@ -381,6 +392,9 @@ ANALYTICS_HTML = f"""<!DOCTYPE html>
 <script>
 const TOKEN_KEY = "hospital_admin_token";
 let cachedDoctors = [];
+let anaReqSeq = 0;
+let anaAuthEpoch = 0;
+async function safeJson(r) {{ try {{ return await r.json(); }} catch (_) {{ return {{}}; }} }}
 function showMsg(text, isErr) {{
   const el = document.getElementById("msg");
   el.textContent = text;
@@ -411,25 +425,33 @@ function clearProtectedAnalyticsData() {{
   while (svg.firstChild) svg.removeChild(svg.firstChild);
 }}
 async function loadReport() {{
+  const mySeq = ++anaReqSeq;
+  const myEpoch = anaAuthEpoch;
   const days = document.getElementById("daysSel").value;
   const dept = document.getElementById("deptId").value.trim();
   let url = "/api/analytics/doctor-performance?days=" + encodeURIComponent(days);
   if (dept) url += "&dept_id=" + encodeURIComponent(dept);
   const r = await fetch(url, {{ headers: authHeaders() }});
-  const data = await r.json();
   if (r.status === 401) {{
+    anaAuthEpoch++;
     clearProtectedAnalyticsData();
     sessionStorage.removeItem(TOKEN_KEY);
     document.getElementById("mainArea").classList.add("hidden");
     document.getElementById("loginCard").classList.remove("hidden");
+    const data = await safeJson(r);
     showMsg(data.detail || "登录已失效，请重新登录", true);
     return;
   }}
   if (r.status === 403 || !r.ok) {{
+    anaAuthEpoch++;
     clearProtectedAnalyticsData();
+    const data = await safeJson(r);
     showMsg(data.detail || "无权访问或加载报表失败", true);
     return;
   }}
+  if (mySeq !== anaReqSeq || myEpoch !== anaAuthEpoch) return;
+  const data = await safeJson(r);
+  if (mySeq !== anaReqSeq || myEpoch !== anaAuthEpoch) return;
   cachedDoctors = data.doctors || [];
   renderDoctors(cachedDoctors);
   renderTrends(data.trends || []);
