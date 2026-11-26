@@ -27,7 +27,7 @@ from tools.dip_importer import import_dip_rules_records, parse_csv_bytes
 from agent.llm_router import parse_local_intent
 from agent.tool_dispatcher import extract_tool_call, dispatch_tool_call
 from api.admin_ui import ADMIN_OPERATORS_HTML
-from api.workbench_ui import INPATIENT_ALERTS_HTML, ANALYTICS_HTML, DIP_RULES_ADMIN_HTML
+from api.workbench_ui import INPATIENT_ALERTS_HTML, ANALYTICS_HTML, DIP_RULES_ADMIN_HTML, AUDIT_LOGS_ADMIN_HTML
 from db.local_db import record_audit_log, get_local_db_connection
 from db.his_reader import HISReader
 from auth.rbac import (
@@ -600,6 +600,64 @@ async def analytics_workbench_page():
 async def dip_rules_admin_page():
     """纯本地静态工作台页面，通过 Bearer Token 调用 /api/admin/dip-rules/import 执行预检与导入。"""
     return HTMLResponse(content=DIP_RULES_ADMIN_HTML)
+
+@app.get("/admin/audit-logs", response_class=HTMLResponse, summary="合规审计日志监控 Web 控制台")
+async def audit_logs_admin_page():
+    """纯本地静态页面，通过 Bearer Token 调用 /api/admin/audit-logs 查询脱敏日志。"""
+    return HTMLResponse(content=AUDIT_LOGS_ADMIN_HTML)
+
+@app.get("/api/admin/audit-logs", summary="检索脱敏合规审计日志（仅管理员）")
+async def api_list_audit_logs(
+    days: int = Query(7, ge=1, le=90, description="查询最近天数 (1-90)"),
+    limit: int = Query(100, ge=1, le=200, description="最大返回条数 (1-200)"),
+    auth_result: Optional[str] = Query(None, description="PERMITTED 或 DENIED"),
+    action_type: Optional[str] = Query(None, description="动作类型精确筛选"),
+    operator: Dict[str, Any] = Depends(require_roles(ROLE_ADMIN)),
+):
+    from datetime import datetime, timedelta
+    if auth_result and auth_result.strip().upper() not in ("PERMITTED", "DENIED"):
+        raise HTTPException(status_code=400, detail="auth_result 仅支持 PERMITTED 或 DENIED")
+
+    since_dt = datetime.now() - timedelta(days=days)
+    cursor, conn = get_local_db_connection(as_dict=True)
+    try:
+        sql = """
+        SELECT TOP (%s)
+            log_id, operator_id, role_type, channel, action_type,
+            target_ref, auth_result, rule_version, batch_id, created_at
+        FROM dbo.agent_audit_log
+        WHERE created_at >= %s
+        """
+        params: List[Any] = [limit, since_dt]
+        if auth_result:
+            sql += " AND auth_result = %s"
+            params.append(auth_result.strip().upper())
+        if action_type and action_type.strip():
+            sql += " AND action_type = %s"
+            params.append(action_type.strip()[:50])
+        sql += " ORDER BY log_id DESC"
+        cursor.execute(sql, tuple(params))
+        rows = cursor.fetchall()
+    finally:
+        conn.close()
+
+    items = []
+    for r in rows:
+        ts = r.get("created_at")
+        items.append({
+            "log_id": r.get("log_id"),
+            "operator_id": r.get("operator_id"),
+            "role_type": r.get("role_type"),
+            "channel": r.get("channel"),
+            "action_type": r.get("action_type"),
+            "target_ref": r.get("target_ref"),
+            "auth_result": r.get("auth_result"),
+            "rule_version": r.get("rule_version"),
+            "batch_id": r.get("batch_id"),
+            "created_at": ts.strftime("%Y-%m-%d %H:%M:%S") if hasattr(ts, "strftime") else str(ts or ""),
+        })
+
+    return {"days": days, "total": len(items), "items": items}
 
 @app.get("/admin/operators", response_class=HTMLResponse, summary="操作员权限管理 Web 控制台")
 async def admin_operators_page():

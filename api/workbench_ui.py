@@ -53,6 +53,7 @@ def _nav_html(active: str) -> str:
         ("/inpatient", "在院预警看板", "inpatient"),
         ("/analytics", "医生绩效趋势", "analytics"),
         ("/admin/dip-rules", "DIP 规则导入", "dip-rules"),
+        ("/admin/audit-logs", "审计日志", "audit-logs"),
         ("/admin/operators", "操作员管理", "operators"),
     ]
     links = []
@@ -561,6 +562,170 @@ async function submitImport() {{
 if (getToken()) {{
   document.getElementById("loginCard").classList.add("hidden");
   document.getElementById("mainArea").classList.remove("hidden");
+}}
+</script>
+</body>
+</html>
+"""
+
+
+AUDIT_LOGS_ADMIN_HTML = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>合规审计日志监控台</title>
+<style>{_COMMON_STYLE}</style>
+</head>
+<body>
+<header>
+  <h1>🛡️ 院内 DIP 控费工作台 · 合规审计日志</h1>
+  <nav>{_nav_html("audit-logs")}</nav>
+</header>
+<div class="wrap">
+  <div id="msg"></div>
+  <div class="card" id="loginCard">
+    <h2>管理员身份认证</h2>
+    <div class="row">
+      <div class="field"><label>工号</label><input id="loginId" placeholder="请输入管理员工号"></div>
+      <div class="field"><label>口令</label><input id="loginPwd" type="password" placeholder="请输入口令"></div>
+      <button onclick="doLogin()">登录</button>
+    </div>
+  </div>
+
+  <div id="mainArea" class="hidden">
+    <div class="card">
+      <div class="row" style="justify-content:space-between;align-items:center;">
+        <div class="row" style="flex:1;">
+          <div class="field" style="max-width:150px;">
+            <label>时间范围</label>
+            <select id="daysSel">
+              <option value="1">最近 1 天</option>
+              <option value="7" selected>最近 7 天</option>
+              <option value="30">最近 30 天</option>
+            </select>
+          </div>
+          <div class="field" style="max-width:150px;">
+            <label>鉴权结果</label>
+            <select id="authResSel">
+              <option value="">全部</option>
+              <option value="PERMITTED">PERMITTED (允许)</option>
+              <option value="DENIED">DENIED (拒绝/拦截)</option>
+            </select>
+          </div>
+          <div class="field" style="max-width:180px;">
+            <label>操作类型 (可选)</label>
+            <input id="actionFilter" placeholder="如 LOGIN / CHAT_INTENT">
+          </div>
+          <button onclick="loadLogs()">查询日志</button>
+        </div>
+        <button class="danger" onclick="doLogout()">退出登录</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <h2 style="border:none;margin:0;padding:0;">审计记录列表（已脱敏，不含原始文本）</h2>
+        <span id="logCount" style="font-size:12px;color:#64748b;"></span>
+      </div>
+      <table>
+        <thead>
+          <tr><th>ID</th><th>时间</th><th>操作员</th><th>角色</th><th>渠道</th><th>动作类型</th><th>目标引用</th><th>结果</th><th>版本</th></tr>
+        </thead>
+        <tbody id="logTbody"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+const TOKEN_KEY = "hospital_admin_token";
+function showMsg(text, isErr) {{
+  const el = document.getElementById("msg");
+  el.textContent = text;
+  el.className = isErr ? "err" : "ok";
+}}
+function getToken() {{ return sessionStorage.getItem(TOKEN_KEY) || ""; }}
+function authHeaders() {{ return {{ "Authorization": "Bearer " + getToken() }}; }}
+function clearProtectedAuditData() {{
+  document.getElementById("logTbody").innerHTML = "";
+  document.getElementById("logCount").textContent = "";
+}}
+async function doLogin() {{
+  const operator_id = document.getElementById("loginId").value.trim();
+  const password = document.getElementById("loginPwd").value;
+  const r = await fetch("/api/auth/login", {{
+    method: "POST", headers: {{ "Content-Type": "application/json" }},
+    body: JSON.stringify({{ operator_id, password }})
+  }});
+  const data = await r.json();
+  if (!r.ok) {{ showMsg(data.detail || "登录失败", true); return; }}
+  sessionStorage.setItem(TOKEN_KEY, data.access_token);
+  document.getElementById("loginCard").classList.add("hidden");
+  document.getElementById("mainArea").classList.remove("hidden");
+  loadLogs();
+}}
+function doLogout() {{ sessionStorage.removeItem(TOKEN_KEY); location.reload(); }}
+async function loadLogs() {{
+  const days = document.getElementById("daysSel").value;
+  const authRes = document.getElementById("authResSel").value;
+  const action = document.getElementById("actionFilter").value.trim();
+  let url = "/api/admin/audit-logs?days=" + encodeURIComponent(days);
+  if (authRes) url += "&auth_result=" + encodeURIComponent(authRes);
+  if (action) url += "&action_type=" + encodeURIComponent(action);
+  const r = await fetch(url, {{ headers: authHeaders() }});
+  const data = await r.json();
+  if (r.status === 401) {{
+    clearProtectedAuditData();
+    sessionStorage.removeItem(TOKEN_KEY);
+    document.getElementById("mainArea").classList.add("hidden");
+    document.getElementById("loginCard").classList.remove("hidden");
+    showMsg(data.detail || "登录已失效，请重新登录", true);
+    return;
+  }}
+  if (r.status === 403 || !r.ok) {{
+    clearProtectedAuditData();
+    showMsg(data.detail || "无权查看审计日志（仅限管理员）", true);
+    return;
+  }}
+  const items = data.items || [];
+  document.getElementById("logCount").textContent = "共返回 " + items.length + " 条";
+  const tbody = document.getElementById("logTbody");
+  tbody.innerHTML = "";
+  for (const row of items) {{
+    const tr = document.createElement("tr");
+    const vals = [
+      String(row.log_id || "-"),
+      row.created_at || "-",
+      row.operator_id || "-",
+      row.role_type || "-",
+      row.channel || "-",
+      row.action_type || "-",
+      row.target_ref || "-",
+    ];
+    for (const v of vals) {{
+      const td = document.createElement("td");
+      td.textContent = v;
+      tr.appendChild(td);
+    }}
+    const tdRes = document.createElement("td");
+    const badge = document.createElement("span");
+    badge.className = "badge " + (row.auth_result === "DENIED" ? "badge-RED" : "badge-GREEN");
+    badge.textContent = row.auth_result || "-";
+    tdRes.appendChild(badge);
+    tr.appendChild(tdRes);
+
+    const tdVer = document.createElement("td");
+    tdVer.textContent = row.rule_version || "-";
+    tr.appendChild(tdVer);
+    tbody.appendChild(tr);
+  }}
+  showMsg("审计日志已刷新", false);
+}}
+if (getToken()) {{
+  document.getElementById("loginCard").classList.add("hidden");
+  document.getElementById("mainArea").classList.remove("hidden");
+  loadLogs();
 }}
 </script>
 </body>
