@@ -52,6 +52,7 @@ def _nav_html(active: str) -> str:
     items = [
         ("/inpatient", "在院预警看板", "inpatient"),
         ("/analytics", "医生绩效趋势", "analytics"),
+        ("/reconciliation", "决算对账", "reconciliation"),
         ("/admin/dip-rules", "DIP 规则导入", "dip-rules"),
         ("/admin/audit-logs", "审计日志", "audit-logs"),
         ("/admin/operators", "操作员管理", "operators"),
@@ -726,6 +727,184 @@ if (getToken()) {{
   document.getElementById("loginCard").classList.add("hidden");
   document.getElementById("mainArea").classList.remove("hidden");
   loadLogs();
+}}
+</script>
+</body>
+</html>
+"""
+
+
+RECONCILIATION_HTML = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>出院决算账实对账看板</title>
+<style>{_COMMON_STYLE}</style>
+</head>
+<body>
+<header>
+  <h1>🧾 院内 DIP 控费工作台 · 出院决算账实对账</h1>
+  <nav>{_nav_html("reconciliation")}</nav>
+</header>
+<div class="wrap">
+  <div id="msg"></div>
+  <div class="card" id="loginCard">
+    <h2>医保办 / 管理员认证</h2>
+    <div class="row">
+      <div class="field"><label>工号</label><input id="loginId" placeholder="请输入工号"></div>
+      <div class="field"><label>口令</label><input id="loginPwd" type="password" placeholder="请输入口令"></div>
+      <button onclick="doLogin()">登录</button>
+    </div>
+  </div>
+
+  <div id="mainArea" class="hidden">
+    <div class="card">
+      <div class="row" style="justify-content:space-between;align-items:center;">
+        <div class="row" style="flex:1;">
+          <div class="field" style="max-width:150px;">
+            <label>状态筛选</label>
+            <select id="statusFilter" onchange="renderReconRows()">
+              <option value="">全部</option>
+              <option value="MISMATCH">账实差异</option>
+              <option value="UNDISPENSED_ONLY">仅存在未发药</option>
+              <option value="MATCHED">账实相符</option>
+            </select>
+          </div>
+          <div class="field" style="max-width:180px;">
+            <label>科室筛选 (可选)</label>
+            <input id="deptFilter" placeholder="科室名称">
+          </div>
+          <div class="field" style="max-width:130px;">
+            <label>抽检条数</label>
+            <select id="limitSel">
+              <option value="20">最近 20 例</option>
+              <option value="50" selected>最近 50 例</option>
+              <option value="100">最近 100 例</option>
+            </select>
+          </div>
+          <button onclick="loadRecon()">执行 SERIALIZABLE 对账</button>
+        </div>
+        <button class="danger" onclick="doLogout()">退出登录</button>
+      </div>
+      <div class="stats" style="margin-top:14px;">
+        <div class="stat-box"><div>总核对病例</div><div class="num" id="rTotal">0</div></div>
+        <div class="stat-box"><div>账实相符</div><div class="num" style="color:var(--ok)" id="rMatch">0</div></div>
+        <div class="stat-box"><div>未发药异常</div><div class="num" style="color:var(--warn)" id="rUnfy">0</div></div>
+        <div class="stat-box"><div>账实差异</div><div class="num" style="color:var(--danger)" id="rMis">0</div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>对账明细列表（已脱敏，不含患者姓名）</h2>
+      <table>
+        <thead>
+          <tr><th>住院流水号</th><th>科室</th><th>结算时间</th><th>对账口径</th><th>主单总额</th><th>类目差异</th><th>临床差异</th><th>药房差异</th><th>未发药(笔/元)</th><th>状态</th></tr>
+        </thead>
+        <tbody id="reconTbody"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+const TOKEN_KEY = "hospital_admin_token";
+let cachedRecon = [];
+function showMsg(text, isErr) {{
+  const el = document.getElementById("msg");
+  el.textContent = text;
+  el.className = isErr ? "err" : "ok";
+}}
+function getToken() {{ return sessionStorage.getItem(TOKEN_KEY) || ""; }}
+function authHeaders() {{ return {{ "Authorization": "Bearer " + getToken() }}; }}
+function clearProtectedReconData() {{
+  cachedRecon = [];
+  document.getElementById("reconTbody").innerHTML = "";
+  document.getElementById("rTotal").textContent = "0";
+  document.getElementById("rMatch").textContent = "0";
+  document.getElementById("rUnfy").textContent = "0";
+  document.getElementById("rMis").textContent = "0";
+}}
+async function doLogin() {{
+  const operator_id = document.getElementById("loginId").value.trim();
+  const password = document.getElementById("loginPwd").value;
+  const r = await fetch("/api/auth/login", {{
+    method: "POST", headers: {{ "Content-Type": "application/json" }},
+    body: JSON.stringify({{ operator_id, password }})
+  }});
+  const data = await r.json();
+  if (!r.ok) {{ showMsg(data.detail || "登录失败", true); return; }}
+  sessionStorage.setItem(TOKEN_KEY, data.access_token);
+  document.getElementById("loginCard").classList.add("hidden");
+  document.getElementById("mainArea").classList.remove("hidden");
+  loadRecon();
+}}
+function doLogout() {{ sessionStorage.removeItem(TOKEN_KEY); location.reload(); }}
+async function loadRecon() {{
+  const limit = document.getElementById("limitSel").value;
+  const dept = document.getElementById("deptFilter").value.trim();
+  let url = "/api/reconciliation/settled?limit=" + encodeURIComponent(limit);
+  if (dept) url += "&dept=" + encodeURIComponent(dept);
+  const r = await fetch(url, {{ headers: authHeaders() }});
+  const data = await r.json();
+  if (r.status === 401) {{
+    clearProtectedReconData();
+    sessionStorage.removeItem(TOKEN_KEY);
+    document.getElementById("mainArea").classList.add("hidden");
+    document.getElementById("loginCard").classList.remove("hidden");
+    showMsg(data.detail || "登录已失效，请重新登录", true);
+    return;
+  }}
+  if (r.status === 403 || !r.ok) {{
+    clearProtectedReconData();
+    showMsg(data.detail || "无权访问出院对账（仅限医保办/管理员）", true);
+    return;
+  }}
+  cachedRecon = data.items || [];
+  document.getElementById("rTotal").textContent = String(data.total || 0);
+  document.getElementById("rMatch").textContent = String(data.matched_count || 0);
+  document.getElementById("rUnfy").textContent = String(data.undispensed_only_count || 0);
+  document.getElementById("rMis").textContent = String(data.mismatch_count || 0);
+  renderReconRows();
+  showMsg("已完成 SERIALIZABLE 事务隔离级出院账实核对", false);
+}}
+function renderReconRows() {{
+  const st = document.getElementById("statusFilter").value;
+  const tbody = document.getElementById("reconTbody");
+  tbody.innerHTML = "";
+  const list = st ? cachedRecon.filter(x => x.recon_status === st) : cachedRecon;
+  for (const row of list) {{
+    const tr = document.createElement("tr");
+    const vals = [
+      row.visit_id || "-",
+      row.dept_name || "-",
+      row.settlement_time || "-",
+      row.reconciliation_scope || "-",
+      row.total_amount_str || "-",
+      row.category_diff_str || "0.00",
+      row.clinical_diff_str || "0.00",
+      row.pharmacy_diff_str || "0.00",
+      String(row.undispensed_count || 0) + " / " + (row.undispensed_amount_str || "0.00")
+    ];
+    for (const v of vals) {{
+      const td = document.createElement("td");
+      td.textContent = v;
+      tr.appendChild(td);
+    }}
+    const tdSt = document.createElement("td");
+    const badge = document.createElement("span");
+    const cls = row.recon_status === "MISMATCH" ? "badge-RED" : (row.recon_status === "UNDISPENSED_ONLY" ? "badge-YELLOW" : "badge-GREEN");
+    badge.className = "badge " + cls;
+    badge.textContent = row.recon_status || "-";
+    tdSt.appendChild(badge);
+    tr.appendChild(tdSt);
+    tbody.appendChild(tr);
+  }}
+}}
+if (getToken()) {{
+  document.getElementById("loginCard").classList.add("hidden");
+  document.getElementById("mainArea").classList.remove("hidden");
+  loadRecon();
 }}
 </script>
 </body>

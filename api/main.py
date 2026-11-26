@@ -27,7 +27,10 @@ from tools.dip_importer import import_dip_rules_records, parse_csv_bytes
 from agent.llm_router import parse_local_intent
 from agent.tool_dispatcher import extract_tool_call, dispatch_tool_call
 from api.admin_ui import ADMIN_OPERATORS_HTML
-from api.workbench_ui import INPATIENT_ALERTS_HTML, ANALYTICS_HTML, DIP_RULES_ADMIN_HTML, AUDIT_LOGS_ADMIN_HTML
+from api.workbench_ui import (
+    INPATIENT_ALERTS_HTML, ANALYTICS_HTML, DIP_RULES_ADMIN_HTML, AUDIT_LOGS_ADMIN_HTML, RECONCILIATION_HTML
+)
+from tools.reconciliation_reporter import run_settled_reconciliation_report
 from db.local_db import record_audit_log, get_local_db_connection
 from db.his_reader import HISReader
 from auth.rbac import (
@@ -600,6 +603,28 @@ async def analytics_workbench_page():
 async def dip_rules_admin_page():
     """纯本地静态工作台页面，通过 Bearer Token 调用 /api/admin/dip-rules/import 执行预检与导入。"""
     return HTMLResponse(content=DIP_RULES_ADMIN_HTML)
+
+@app.get("/reconciliation", response_class=HTMLResponse, summary="出院决算账实对账看板 Web 工作台")
+async def reconciliation_workbench_page():
+    """纯本地静态页面，通过 Bearer Token 调用 /api/reconciliation/settled 执行核对。"""
+    return HTMLResponse(content=RECONCILIATION_HTML)
+
+@app.get("/api/reconciliation/settled", summary="出院决算账实自动对账接口（医保办/管理员）")
+async def api_settled_reconciliation(
+    limit: int = Query(30, ge=1, le=100, description="抽检最近已结算病例数"),
+    dept: Optional[str] = Query(None, description="按科室名称筛选"),
+    operator: Dict[str, Any] = Depends(require_roles(ROLE_INSURANCE, ROLE_ADMIN)),
+):
+    report = run_settled_reconciliation_report(limit=limit, department=dept.strip() if dept else None)
+    record_audit_log(
+        operator_id=operator["sub"],
+        role_type=operator["role"],
+        channel="API",
+        action_type="SETTLED_RECONCILIATION",
+        target_ref=f"LIMIT:{limit}",
+        auth_result="PERMITTED",
+    )
+    return report
 
 @app.get("/admin/audit-logs", response_class=HTMLResponse, summary="合规审计日志监控 Web 控制台")
 async def audit_logs_admin_page():
