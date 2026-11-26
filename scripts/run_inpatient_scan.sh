@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 院内 DIP 在院患者定时巡检脚本（防重入锁 + 脱敏日志 + 钉钉推送）
 # 推荐 crontab 配置（每 15 分钟执行一次）：
-# */15 * * * * /opt/hospital-agent/scripts/run_inpatient_scan.sh >> /var/log/hospital_agent_scan.log 2>&1
+# */15 * * * * /opt/hospital-agent/scripts/run_inpatient_scan.sh >> /opt/hospital-agent/logs/inpatient_scan.log 2>&1
 
 set -euo pipefail
 

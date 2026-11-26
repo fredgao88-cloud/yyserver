@@ -10,3 +10,4 @@ nginx/ssl/
 *.crt
 .venv*/
 freetds.conf
+logs/
