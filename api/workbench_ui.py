@@ -116,6 +116,7 @@ INPATIENT_ALERTS_HTML = f"""<!DOCTYPE html>
         <div class="stat-box"><div>黄灯观察</div><div class="num" style="color:var(--warn)" id="sYellow">0</div></div>
         <div class="stat-box"><div>绿灯正常</div><div class="num" style="color:var(--ok)" id="sGreen">0</div></div>
         <div class="stat-box"><div>待定核查</div><div class="num" id="sPending">0</div></div>
+        <div class="stat-box"><div>自费不适用</div><div class="num" id="sNA">0</div></div>
       </div>
     </div>
 
@@ -160,12 +161,38 @@ async function doLogin() {{
   loadAlerts();
 }}
 function doLogout() {{ sessionStorage.removeItem(TOKEN_KEY); location.reload(); }}
+function clearProtectedInpatientData() {{
+  cachedItems = [];
+  document.getElementById("tbody").innerHTML = "";
+  document.getElementById("batchMeta").textContent = "";
+  const banner = document.getElementById("staleBanner");
+  banner.textContent = "";
+  banner.style.display = "none";
+  document.getElementById("sTotal").textContent = "0";
+  document.getElementById("sRed").textContent = "0";
+  document.getElementById("sYellow").textContent = "0";
+  document.getElementById("sGreen").textContent = "0";
+  document.getElementById("sPending").textContent = "0";
+  document.getElementById("sNA").textContent = "0";
+}}
 async function loadAlerts() {{
   const dept = document.getElementById("filterDept").value.trim();
   const url = dept ? "/api/inpatient/alerts?dept=" + encodeURIComponent(dept) : "/api/inpatient/alerts";
   const r = await fetch(url, {{ headers: authHeaders() }});
   const data = await r.json();
-  if (!r.ok) {{ showMsg(data.detail || "加载预警失败", true); return; }}
+  if (r.status === 401) {{
+    clearProtectedInpatientData();
+    sessionStorage.removeItem(TOKEN_KEY);
+    document.getElementById("mainArea").classList.add("hidden");
+    document.getElementById("loginCard").classList.remove("hidden");
+    showMsg(data.detail || "登录已失效，请重新登录", true);
+    return;
+  }}
+  if (r.status === 403 || !r.ok) {{
+    clearProtectedInpatientData();
+    showMsg(data.detail || "无权访问或加载预警失败", true);
+    return;
+  }}
   cachedItems = data.items || [];
   const banner = document.getElementById("staleBanner");
   if (data.is_stale && data.stale_warning) {{
@@ -179,18 +206,20 @@ async function loadAlerts() {{
   renderRows();
 }}
 function updateStats() {{
-  let r = 0, y = 0, g = 0, p = 0;
+  let r = 0, y = 0, g = 0, p = 0, na = 0;
   for (const it of cachedItems) {{
     if (it.alert_level === "RED") r++;
     else if (it.alert_level === "YELLOW") y++;
     else if (it.alert_level === "GREEN") g++;
-    else p++;
+    else if (it.alert_level === "NOT_APPLICABLE") na++;
+    else if (it.alert_level === "PENDING") p++;
   }}
   document.getElementById("sTotal").textContent = String(cachedItems.length);
   document.getElementById("sRed").textContent = String(r);
   document.getElementById("sYellow").textContent = String(y);
   document.getElementById("sGreen").textContent = String(g);
   document.getElementById("sPending").textContent = String(p);
+  document.getElementById("sNA").textContent = String(na);
 }}
 function renderRows() {{
   const level = document.getElementById("filterLevel").value;
@@ -280,7 +309,9 @@ ANALYTICS_HTML = f"""<!DOCTYPE html>
     <div class="card">
       <h2>历史批次红/黄/绿趋势分布</h2>
       <div id="trendSummary" style="font-size:13px;color:#475569;margin-bottom:8px;"></div>
-      <svg id="trendSvg" width="100%" height="200" viewBox="0 0 800 200" style="background:#f8fafc;border:1px solid var(--border);border-radius:6px;"></svg>
+      <div style="overflow-x:auto;border:1px solid var(--border);border-radius:6px;background:#f8fafc;">
+        <svg id="trendSvg" height="200" viewBox="0 0 800 200" style="display:block;min-width:800px;"></svg>
+      </div>
     </div>
 
     <div class="card">
@@ -319,6 +350,12 @@ async function doLogin() {{
   loadReport();
 }}
 function doLogout() {{ sessionStorage.removeItem(TOKEN_KEY); location.reload(); }}
+function clearProtectedAnalyticsData() {{
+  document.getElementById("docTbody").innerHTML = "";
+  document.getElementById("trendSummary").textContent = "";
+  const svg = document.getElementById("trendSvg");
+  while (svg.firstChild) svg.removeChild(svg.firstChild);
+}}
 async function loadReport() {{
   const days = document.getElementById("daysSel").value;
   const dept = document.getElementById("deptId").value.trim();
@@ -326,7 +363,19 @@ async function loadReport() {{
   if (dept) url += "&dept_id=" + encodeURIComponent(dept);
   const r = await fetch(url, {{ headers: authHeaders() }});
   const data = await r.json();
-  if (!r.ok) {{ showMsg(data.detail || "加载报表失败", true); return; }}
+  if (r.status === 401) {{
+    clearProtectedAnalyticsData();
+    sessionStorage.removeItem(TOKEN_KEY);
+    document.getElementById("mainArea").classList.add("hidden");
+    document.getElementById("loginCard").classList.remove("hidden");
+    showMsg(data.detail || "登录已失效，请重新登录", true);
+    return;
+  }}
+  if (r.status === 403 || !r.ok) {{
+    clearProtectedAnalyticsData();
+    showMsg(data.detail || "无权访问或加载报表失败", true);
+    return;
+  }}
   renderDoctors(data.doctors || []);
   renderTrends(data.trends || []);
   showMsg("已加载近 " + data.days + " 天共 " + data.total_snapshots + " 条快照记录", false);
@@ -358,14 +407,17 @@ function renderTrends(trends) {{
   document.getElementById("trendSummary").textContent = "共 " + trends.length + " 个历史扫描批次";
   if (!trends.length) return;
   const ns = "http://www.w3.org/2000/svg";
-  const maxTotal = Math.max(...trends.map(t => t.total || 1), 1);
-  const barW = Math.min(48, Math.floor(720 / trends.length) - 8);
+  const maxTotal = Math.max(...trends.map(t => (t.green_count || 0) + (t.yellow_count || 0) + (t.red_count || 0)), 1);
+  const barW = 28;
+  const gap = 10;
+  const svgW = Math.max(800, 60 + trends.length * (barW + gap));
+  svg.setAttribute("viewBox", "0 0 " + svgW + " 200");
+  svg.style.minWidth = svgW + "px";
   trends.forEach((t, i) => {{
-    const x = 40 + i * (barW + 10);
-    const totalH = Math.round(((t.total || 0) / maxTotal) * 140);
+    const x = 30 + i * (barW + gap);
     const gH = Math.round(((t.green_count || 0) / maxTotal) * 140);
     const yH = Math.round(((t.yellow_count || 0) / maxTotal) * 140);
-    const rH = Math.max(0, totalH - gH - yH);
+    const rH = Math.round(((t.red_count || 0) / maxTotal) * 140);
     const addRect = (y, h, fill) => {{
       if (h <= 0) return;
       const rect = document.createElementNS(ns, "rect");

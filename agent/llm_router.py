@@ -57,7 +57,26 @@ def extract_operation_keyword(text_clean: str):
                 op_states[existing_op] = new_state
         op_states[target_op] = new_state
 
+    _pronoun_re = re.compile(r"(?:该操作|该手术|该检查|此操作|此手术|此检查|该项|上述操作|上述手术|上述检查|前项)")
+    _tense_strip_re = re.compile(
+        r"(?:现已|已经|已完成|已行|已做|做完|术后|已实施|暂不做|准备行|拟实施|准备做|打算做|"
+        r"取消|未做|未行|放弃|拟行|拟做|计划|原定|原本|随后|后来|最终|确定|决定|还是|改为|变成|"
+        r"完成|实施|执行|目前|已|暂|了|的|呢|\s)+"
+    )
+
     for clause in clauses:
+        # 优先检查是否为明确指代前序操作的分句（如“该操作已完成”），防止被“操作”泛词抢先匹配
+        has_pronoun = bool(_pronoun_re.search(clause))
+        if has_pronoun and last_op is not None:
+            if any(k in clause for k in cancel_kws):
+                _set_op_state(last_op, "CANCELED")
+            elif any(k in clause for k in completed_kws):
+                _set_op_state(last_op, "COMPLETED")
+            elif any(k in clause for k in planned_kws):
+                if op_states.get(last_op) == "UNKNOWN":
+                    _set_op_state(last_op, "PLANNED")
+            continue
+
         matched_kw = None
         for pattern, op_kw in candidate_ops:
             if pattern in clause:
@@ -75,16 +94,8 @@ def extract_operation_keyword(text_clean: str):
             else:
                 op_states.setdefault(matched_kw, "UNKNOWN")
         elif last_op is not None:
-            # DIP-OP-001：仅当分句包含明确指代词或剥除时间副词与时态动词后无剩余独立宾语时，才继承更新上一操作
-            has_pronoun = bool(re.search(r"(?:该操作|该手术|该检查|此操作|此手术|此检查|该项|上述操作|上述手术|上述检查|前项)", clause))
-            residual = re.sub(
-                r"(?:现已|已经|已|暂|目前|随后|后来|最终|确定|决定|还是|改为|变成|"
-                r"取消|未做|未行|放弃|暂不做|拟行|拟做|计划|准备行|拟实施|准备做|打算做|"
-                r"已完成|已行|已做|做完|术后|已实施|原定|原本|了|的|呢|\s)+",
-                "",
-                clause,
-            ).strip()
-            if not has_pronoun and residual:
+            residual = _tense_strip_re.sub("", clause).strip()
+            if residual:
                 continue
             if any(k in clause for k in cancel_kws):
                 _set_op_state(last_op, "CANCELED")

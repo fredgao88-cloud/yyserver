@@ -25,3 +25,25 @@ def test_workbench_pages_return_200_without_external_cdn_or_xss():
         cleaned = body.replace("http://www.w3.org/2000/svg", "")
         assert "http://" not in cleaned and "https://" not in cleaned
         assert "cdn" not in cleaned.lower()
+
+
+def test_workbench_fixes_wb_alert_auth_and_trend_contracts():
+    inp_html = asyncio.run(main_mod.inpatient_workbench_page()).body.decode("utf-8")
+    ana_html = asyncio.run(main_mod.analytics_workbench_page()).body.decode("utf-8")
+
+    # WB-ALERT-001: 待定与自费独立统计，红柱直接用 red_count
+    assert 'id="sNA"' in inp_html
+    assert 'alert_level === "NOT_APPLICABLE"' in inp_html
+    assert 'alert_level === "PENDING"' in inp_html
+    assert "t.red_count" in ana_html
+    assert "totalH - gH - yH" not in ana_html
+
+    # WB-AUTH-001: 401 清空数据+令牌并退回登录，403 清空数据
+    assert "clearProtectedInpatientData" in inp_html
+    assert "r.status === 401" in inp_html and "r.status === 403" in inp_html
+    assert "clearProtectedAnalyticsData" in ana_html
+    assert "r.status === 401" in ana_html and "r.status === 403" in ana_html
+
+    # WB-TREND-001: 恒定正柱宽 + 动态 viewBox + 横向滚动
+    assert "const barW = 28;" in ana_html
+    assert "overflow-x:auto" in ana_html

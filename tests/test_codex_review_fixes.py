@@ -181,6 +181,19 @@ def test_dip_op_001_canceled_operation_falls_back_to_conservative():
     assert tc_inf["arguments"]["operation"] == "胃镜"
     assert tc_inf["arguments"]["operation_status"] == "COMPLETED"
 
+    # “拟行胃镜，随后已完成”与“拟行胃镜，该操作已完成”均须返回 胃镜/COMPLETED
+    kw5, st5, _ = extract_operation_keyword("拟行胃镜，随后已完成")
+    assert kw5 == "胃镜" and st5 == "COMPLETED"
+    tc_sub = extract_tool_call("住院号 zy2025042901，诊断 K63.5，拟行胃镜，随后已完成，当前费用 2500 元，职工医保")
+    assert tc_sub["arguments"]["operation"] == "胃镜"
+    assert tc_sub["arguments"]["operation_status"] == "COMPLETED"
+
+    kw6, st6, _ = extract_operation_keyword("拟行胃镜，该操作已完成")
+    assert kw6 == "胃镜" and st6 == "COMPLETED"
+    tc_pro = extract_tool_call("住院号 zy2025042901，诊断 K63.5，拟行胃镜，该操作已完成，当前费用 2500 元，职工医保")
+    assert tc_pro["arguments"]["operation"] == "胃镜"
+    assert tc_pro["arguments"]["operation_status"] == "COMPLETED"
+
 
 def test_chat_audit_001_denied_vs_permitted():
     recorded = []
