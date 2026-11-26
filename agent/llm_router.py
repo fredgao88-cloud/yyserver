@@ -14,46 +14,64 @@ from typing import Dict, Any, Optional
 from tools.dip_calculator import match_dip_rule, evaluate_traffic_light, normalize_insurance_type
 
 def extract_operation_keyword(text_clean: str):
-    """抽取手术/操作关键词并感知时态（已取消/拟行均回退为保守治疗基础分组）。"""
-    op_status = "UNKNOWN"
-    if any(k in text_clean for k in ["取消", "未做", "未行", "放弃", "暂不做"]):
-        op_status = "CANCELED"
-    elif any(k in text_clean for k in ["拟行", "拟做", "计划", "准备行", "拟实施", "准备做", "打算做"]):
-        op_status = "PLANNED"
-    elif any(k in text_clean for k in ["已完成", "已行", "已做", "做完", "术后", "已实施"]):
-        op_status = "COMPLETED"
+    """
+    DIP-OP-001：按分句将手术/操作关键词与其修饰时态绑定，
+    避免其他无关分句（如“计划出院”）污染已明确完成的操作（如“已完成胃镜”）；
+    同时若后续分句明确取消了操作（如“原定胃镜检查，现已取消胃镜”），以取消为准回退保守。
+    """
+    candidate_ops = [
+        ("切除术+胃镜", "胃镜检查"),
+        ("切除+胃镜", "胃镜检查"),
+        ("胃镜检查", "胃镜检查"),
+        ("胃十二指肠镜", "胃十二指肠"),
+        ("活检", "活检"),
+        ("活组织", "活检"),
+        ("直肠息肉切除", "直肠息肉切除"),
+        ("胃息肉切除", "胃息肉切除"),
+        ("电子结肠镜", "电子结肠镜"),
+        ("结肠镜", "结肠镜"),
+        ("保守", "保守"),
+        ("胃镜", "胃镜"),
+        ("切除", "切除"),
+        ("治疗性操作", "综合-治疗性操作"),
+        ("操作", "综合-治疗性操作"),
+    ]
+    cancel_kws = ("取消", "未做", "未行", "放弃", "暂不做")
+    planned_kws = ("拟行", "拟做", "计划", "准备行", "拟实施", "准备做", "打算做")
+    completed_kws = ("已完成", "已行", "已做", "做完", "术后", "已实施")
 
-    op_keyword = None
-    op_note = ""
-    if op_status in ("CANCELED", "PLANNED"):
-        op_keyword = "保守"
-        if op_status == "CANCELED":
-            op_note = "（检测到手术/操作已取消，按保守治疗基础分组测算）"
-        else:
-            op_note = "（检测到操作为拟行/尚未执行状态，依规暂不计入手术操作组，按保守治疗分组测算；待实际执行后按新组结算）"
-    else:
-        candidate_ops = [
-            ("切除术+胃镜", "胃镜检查"),
-            ("切除+胃镜", "胃镜检查"),
-            ("胃镜检查", "胃镜检查"),
-            ("胃十二指肠镜", "胃十二指肠"),
-            ("活检", "活检"),
-            ("活组织", "活检"),
-            ("直肠息肉切除", "直肠息肉切除"),
-            ("胃息肉切除", "胃息肉切除"),
-            ("电子结肠镜", "电子结肠镜"),
-            ("结肠镜", "结肠镜"),
-            ("保守", "保守"),
-            ("胃镜", "胃镜"),
-            ("切除", "切除"),
-            ("治疗性操作", "综合-治疗性操作"),
-            ("操作", "综合-治疗性操作"),
-        ]
+    clauses = [c.strip() for c in re.split(r"[，,；;。！？!?]+", text_clean or "") if c.strip()]
+    if not clauses:
+        clauses = [text_clean or ""]
+
+    op_clauses = []
+    for clause in clauses:
+        matched_kw = None
         for pattern, op_kw in candidate_ops:
-            if pattern in text_clean:
-                op_keyword = op_kw
+            if pattern in clause:
+                matched_kw = op_kw
                 break
-    return op_keyword, op_status, op_note
+        if matched_kw is not None:
+            op_clauses.append((clause, matched_kw))
+
+    if op_clauses:
+        # 优先检查所有含操作词的分句中是否有取消或拟行
+        for clause, _ in op_clauses:
+            if any(k in clause for k in cancel_kws):
+                return "保守", "CANCELED", "（检测到手术/操作已取消，按保守治疗基础分组测算）"
+        for clause, _ in op_clauses:
+            if any(k in clause for k in planned_kws):
+                return "保守", "PLANNED", "（检测到操作为拟行/尚未执行状态，依规暂不计入手术操作组，按保守治疗分组测算；待实际执行后按新组结算）"
+        first_clause, first_kw = op_clauses[0]
+        status = "COMPLETED" if any(k in first_clause for k in completed_kws) else "UNKNOWN"
+        return first_kw, status, ""
+
+    # 兜底：整句未命中具体术式名，但明确提到手术已取消/拟行时回退保守
+    if any(k in text_clean for k in cancel_kws):
+        return "保守", "CANCELED", "（检测到手术/操作已取消，按保守治疗基础分组测算）"
+    if any(k in text_clean for k in planned_kws):
+        return "保守", "PLANNED", "（检测到操作为拟行/尚未执行状态，依规暂不计入手术操作组，按保守治疗分组测算；待实际执行后按新组结算）"
+    return None, "UNKNOWN", ""
 
 
 def parse_local_intent(text: str, channel: str = "web") -> Dict[str, Any]:

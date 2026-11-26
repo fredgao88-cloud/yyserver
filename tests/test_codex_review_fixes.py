@@ -25,9 +25,10 @@ from tools.inpatient_scanner import InpatientScanner
 
 
 def test_notify_data_001_blocks_arbitrary_text_in_outbound_payload():
+    # 未登记但同格式的版本标记也必须被拦截
     summary = {
         "batch_id": "CUSTOM_LEAK_MARKER_XYZ",
-        "rule_version": "2026 BAD VER!",
+        "rule_version": "2026_UNREGISTERED_V9",
         "data_cutoff_time": "2026-11-26 08:00:00",
         "total_scanned": 5,
         "RED": 2,
@@ -40,10 +41,17 @@ def test_notify_data_001_blocks_arbitrary_text_in_outbound_payload():
     }
     _, text = build_alert_markdown(summary)
     assert "CUSTOM_LEAK_MARKER_XYZ" not in text
-    assert "2026 BAD VER!" not in text
+    assert "2026_UNREGISTERED_V9" not in text
+    assert "CONTROLLED_VERSION" in text
     assert "任意注入科室_SENSITIVE_TAG" not in text
     assert "中医科(红1/黄0)" in text
     assert "其他已核验科室(红1/黄1)" in text
+
+    # 已批准登记版本可以正常出站
+    summary_ok = dict(summary, batch_id="BATCH_20261126_080000", rule_version="2026_SAMPLE_V1")
+    _, text_ok = build_alert_markdown(summary_ok)
+    assert "2026_SAMPLE_V1" in text_ok
+    assert "BATCH_20261126_080000" in text_ok
 
 
 def test_notify_ack_001_disabled_and_strict_json_ack(monkeypatch):
@@ -57,11 +65,13 @@ def test_notify_ack_001_disabled_and_strict_json_ack(monkeypatch):
     assert res_dis["skipped"] is True
     assert res_dis["reason"] == "DISABLED_BY_ENV"
 
-    # 2) 非 JSON、缺 errcode、非零 errcode 一律 sent=False；仅 errcode==0 为 True
+    # 2) 非 JSON、缺 errcode、bool(false)、str("0")、非零整数一律 sent=False；仅整数 0 为 True
     monkeypatch.setenv("DINGTALK_NOTIFY_ENABLED", "true")
     for raw_body, expect_sent in [
         ("not-json-html", False),
         (json.dumps({"errmsg": "no code"}), False),
+        (json.dumps({"errcode": False, "errmsg": "bool false"}), False),
+        (json.dumps({"errcode": "0", "errmsg": "str zero"}), False),
         (json.dumps({"errcode": 310000, "errmsg": "sign error"}), False),
         (json.dumps({"errcode": 0, "errmsg": "ok"}), True),
     ]:
@@ -108,6 +118,17 @@ def test_dip_op_001_canceled_operation_falls_back_to_conservative():
     assert tc["name"] == "check_patient_dip"
     assert tc["arguments"]["operation"] == "保守"
     assert tc["arguments"]["operation_status"] == "CANCELED"
+
+    # 拟行胃镜也回退保守
+    tc_plan = extract_tool_call("住院号 zy2025042901，诊断 K63.5，拟行胃镜，费用 2500 元，职工医保")
+    assert tc_plan is not None
+    assert tc_plan["arguments"]["operation"] == "保守"
+
+    # “已完成胃镜，计划出院”不得被后半句“计划”污染
+    tc_done = extract_tool_call("住院号 zy2025042901，诊断 K63.5，已完成胃镜，计划出院，当前费用 2500 元，职工医保")
+    assert tc_done is not None
+    assert tc_done["arguments"]["operation"] == "胃镜"
+    assert tc_done["arguments"]["operation_status"] == "COMPLETED"
 
 
 def test_chat_audit_001_denied_vs_permitted():

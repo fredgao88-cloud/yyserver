@@ -28,7 +28,8 @@ DEFAULT_WORKBENCH_URL = "https://hospital-internal.local/inpatient"
 
 # 受控格式正则：仅允许系统生成的 BATCH_YYYYMMDD_HHMMSS（或短测试ID B1/B2），禁止任意自定义字母标记出站
 _CONTROLLED_BATCH_RE = re.compile(r"^BATCH_\d{8}_\d{6}$|^B\d{1,6}$")
-_CONTROLLED_VERSION_RE = re.compile(r"^\d{4}_[A-Z0-9_]{1,20}$")
+# 受控已批准规则版本白名单（仅受控映射值可进入出站载荷）
+DEFAULT_ALLOWED_VERSIONS: Set[str] = {"2026_SAMPLE_V1"}
 # 内置标准受控科室白名单（也可由调用方传入 his_ks 目录核验集合）
 DEFAULT_ALLOWED_DEPTS: Set[str] = {
     "中医科", "骨伤科", "内科", "外科", "妇科", "儿科",
@@ -51,15 +52,22 @@ def _sign_webhook_url(webhook_url: str, secret: str, timestamp_ms: Optional[int]
 def _sanitize_outbound_summary(
     summary: Dict[str, Any],
     allowed_depts: Optional[Set[str]] = None,
+    allowed_versions: Optional[Set[str]] = None,
 ) -> Dict[str, Any]:
     """
-    NOTIFY-DATA-001：独立构建受控出站对象，清洗并拦截任何非受控自由文本标记。
+    NOTIFY-DATA-001：独立构建受控出站对象，清洗并拦截任何非受控或未登记版本/自由文本标记。
     """
     raw_batch = str(summary.get("batch_id") or "").strip()
     safe_batch = raw_batch if _CONTROLLED_BATCH_RE.match(raw_batch) else "CONTROLLED_BATCH"
 
+    env_versions = {
+        v.strip()
+        for v in os.getenv("DINGTALK_ALLOWED_VERSIONS", "").split(",")
+        if v.strip()
+    }
+    ver_whitelist = (allowed_versions if allowed_versions is not None else DEFAULT_ALLOWED_VERSIONS) | env_versions
     raw_ver = str(summary.get("rule_version") or "").strip()
-    safe_ver = raw_ver if _CONTROLLED_VERSION_RE.match(raw_ver) else "UNKNOWN_VERSION"
+    safe_ver = raw_ver if raw_ver in ver_whitelist else "CONTROLLED_VERSION"
 
     raw_cutoff = str(summary.get("data_cutoff_time") or "").strip()
     safe_cutoff = raw_cutoff if re.match(r"^\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2}:\d{2})?$", raw_cutoff) else "-"
@@ -210,7 +218,13 @@ def send_dingtalk_alert(
                     "reason": "MISSING_ERRCODE",
                 }
             errcode = resp_json.get("errcode")
-            ok = (resp.status == 200 and errcode == 0)
+            # NOTIFY-ACK-001：必须为整数类型的 0，拒绝 bool(False==0)、字符串 "0" 等非整数回执
+            ok = (
+                resp.status == 200
+                and not isinstance(errcode, bool)
+                and isinstance(errcode, int)
+                and errcode == 0
+            )
             if not ok:
                 logger.warning("EVENT=DINGTALK_ACK_ERROR status=%s errcode=%s", resp.status, errcode)
             return {
