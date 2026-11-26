@@ -266,6 +266,7 @@ function renderRows() {
   }
 }
 async function exportInpatientCsv() {
+  const myEpoch = inpAuthEpoch;
   const level = document.getElementById("filterLevel").value;
   const dept = document.getElementById("filterDept").value.trim();
   const qs = [];
@@ -288,7 +289,9 @@ async function exportInpatientCsv() {
     showMsg(err.detail || "无权导出病例明细（需开通 can_export_case 权限）", true);
     return;
   }
+  if (myEpoch !== inpAuthEpoch) return;
   const blob = await r.blob();
+  if (myEpoch !== inpAuthEpoch) return;
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = "inpatient_alerts.csv";
@@ -995,7 +998,9 @@ RECONCILIATION_HTML = r"""<!DOCTYPE html>
         <button class="danger" onclick="doLogout()">退出登录</button>
       </div>
       <div class="stats" style="margin-top:14px;">
-        <div class="stat-box"><div>总核对病例</div><div class="num" id="rTotal">0</div></div>
+        <div class="stat-box"><div>抽样病例</div><div class="num" id="rSampled">0</div></div>
+        <div class="stat-box"><div>已核对病例</div><div class="num" id="rTotal">0</div></div>
+        <div class="stat-box"><div>未核对病例</div><div class="num" style="color:var(--warn)" id="rUnrecon">0</div></div>
         <div class="stat-box"><div>账实相符</div><div class="num" style="color:var(--ok)" id="rMatch">0</div></div>
         <div class="stat-box"><div>未发药异常</div><div class="num" style="color:var(--warn)" id="rUnfy">0</div></div>
         <div class="stat-box"><div>账实差异</div><div class="num" style="color:var(--danger)" id="rMis">0</div></div>
@@ -1004,6 +1009,7 @@ RECONCILIATION_HTML = r"""<!DOCTYPE html>
 
     <div class="card">
       <h2>对账明细列表（已脱敏，不含患者姓名）</h2>
+      <div id="unreconBanner" style="font-size:12px;color:#92400e;background:#fef3c7;padding:8px 12px;border-radius:6px;margin-bottom:8px;display:none;"></div>
       <table>
         <thead>
           <tr><th>住院流水号</th><th>科室</th><th>结算时间</th><th>对账口径</th><th>主单总额</th><th>类目差异</th><th>临床差异</th><th>药房差异</th><th>未发药(笔/元)</th><th>状态</th></tr>
@@ -1017,6 +1023,9 @@ RECONCILIATION_HTML = r"""<!DOCTYPE html>
 <script>
 const TOKEN_KEY = "hospital_admin_token";
 let cachedRecon = [];
+let reconReqSeq = 0;
+let reconAuthEpoch = 0;
+async function safeReconJson(r) { try { return await r.json(); } catch (_) { return {}; } }
 function showMsg(text, isErr) {
   const el = document.getElementById("msg");
   el.textContent = text;
@@ -1027,10 +1036,15 @@ function authHeaders() { return { "Authorization": "Bearer " + getToken() }; }
 function clearProtectedReconData() {
   cachedRecon = [];
   document.getElementById("reconTbody").innerHTML = "";
+  document.getElementById("rSampled").textContent = "0";
   document.getElementById("rTotal").textContent = "0";
+  document.getElementById("rUnrecon").textContent = "0";
   document.getElementById("rMatch").textContent = "0";
   document.getElementById("rUnfy").textContent = "0";
   document.getElementById("rMis").textContent = "0";
+  const ub = document.getElementById("unreconBanner");
+  ub.textContent = "";
+  ub.style.display = "none";
 }
 async function doLogin() {
   const operator_id = document.getElementById("loginId").value.trim();
@@ -1039,41 +1053,65 @@ async function doLogin() {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ operator_id, password })
   });
-  const data = await r.json();
+  const data = await safeReconJson(r);
   if (!r.ok) { showMsg(data.detail || "登录失败", true); return; }
+  reconAuthEpoch++;
   sessionStorage.setItem(TOKEN_KEY, data.access_token);
   document.getElementById("loginCard").classList.add("hidden");
   document.getElementById("mainArea").classList.remove("hidden");
   loadRecon();
 }
-function doLogout() { sessionStorage.removeItem(TOKEN_KEY); location.reload(); }
+function doLogout() { reconAuthEpoch++; clearProtectedReconData(); sessionStorage.removeItem(TOKEN_KEY); location.reload(); }
 async function loadRecon() {
+  const mySeq = ++reconReqSeq;
+  const myEpoch = reconAuthEpoch;
   const limit = document.getElementById("limitSel").value;
   const dept = document.getElementById("deptFilter").value.trim();
   let url = "/api/reconciliation/settled?limit=" + encodeURIComponent(limit);
   if (dept) url += "&dept=" + encodeURIComponent(dept);
   const r = await fetch(url, { headers: authHeaders() });
-  const data = await r.json();
   if (r.status === 401) {
+    reconAuthEpoch++;
     clearProtectedReconData();
     sessionStorage.removeItem(TOKEN_KEY);
     document.getElementById("mainArea").classList.add("hidden");
     document.getElementById("loginCard").classList.remove("hidden");
-    showMsg(data.detail || "登录已失效，请重新登录", true);
+    const err = await safeReconJson(r);
+    showMsg(err.detail || "登录已失效，请重新登录", true);
     return;
   }
   if (r.status === 403 || !r.ok) {
+    reconAuthEpoch++;
     clearProtectedReconData();
-    showMsg(data.detail || "无权访问出院对账（仅限医保办/管理员）", true);
+    const err = await safeReconJson(r);
+    showMsg(err.detail || "无权访问出院对账（仅限医保办/管理员）", true);
     return;
   }
+  if (mySeq !== reconReqSeq || myEpoch !== reconAuthEpoch) return;
+  const data = await safeReconJson(r);
+  if (mySeq !== reconReqSeq || myEpoch !== reconAuthEpoch) return;
   cachedRecon = data.items || [];
-  document.getElementById("rTotal").textContent = String(data.total || 0);
+  const sampled = data.sampled_count != null ? data.sampled_count : (data.total || 0);
+  const reconciled = data.reconciled_count != null ? data.reconciled_count : (data.total || 0);
+  const unreconciled = data.unreconciled_count != null ? data.unreconciled_count : 0;
+  document.getElementById("rSampled").textContent = String(sampled);
+  document.getElementById("rTotal").textContent = String(reconciled);
+  document.getElementById("rUnrecon").textContent = String(unreconciled);
   document.getElementById("rMatch").textContent = String(data.matched_count || 0);
   document.getElementById("rUnfy").textContent = String(data.undispensed_only_count || 0);
   document.getElementById("rMis").textContent = String(data.mismatch_count || 0);
+  const ub = document.getElementById("unreconBanner");
+  if (unreconciled > 0) {
+    const reasons = (data.unreconciled_reasons || []).map(x => (x.visit_id || "-") + ":" + (x.reason || "-")).join("；");
+    ub.textContent = "⚠️ 部分完成：共抽样 " + sampled + " 例，成功核对 " + reconciled + " 例，未核对 " + unreconciled + " 例" + (reasons ? "（" + reasons + "）" : "");
+    ub.style.display = "block";
+    showMsg("部分完成：存在 " + unreconciled + " 例未完成核对", true);
+  } else {
+    ub.textContent = "";
+    ub.style.display = "none";
+    showMsg("已完成 SERIALIZABLE 事务隔离级出院账实核对", false);
+  }
   renderReconRows();
-  showMsg("已完成 SERIALIZABLE 事务隔离级出院账实核对", false);
 }
 function renderReconRows() {
   const st = document.getElementById("statusFilter").value;
@@ -1108,8 +1146,8 @@ function renderReconRows() {
     tbody.appendChild(tr);
   }
 }
-async function safeReconJson(r) { try { return await r.json(); } catch (_) { return {}; } }
 async function exportReconCsv() {
+  const myEpoch = reconAuthEpoch;
   const limit = document.getElementById("limitSel").value;
   const dept = document.getElementById("deptFilter").value.trim();
   const st = document.getElementById("statusFilter").value;
@@ -1118,6 +1156,7 @@ async function exportReconCsv() {
   if (st) qs.push("status=" + encodeURIComponent(st));
   const r = await fetch("/api/reconciliation/settled/export?" + qs.join("&"), { headers: authHeaders() });
   if (r.status === 401) {
+    reconAuthEpoch++;
     clearProtectedReconData();
     sessionStorage.removeItem(TOKEN_KEY);
     document.getElementById("mainArea").classList.add("hidden");
@@ -1131,7 +1170,9 @@ async function exportReconCsv() {
     showMsg(err.detail || "无权导出对账明细（需开通 can_export_case 权限）", true);
     return;
   }
+  if (myEpoch !== reconAuthEpoch) return;
   const blob = await r.blob();
+  if (myEpoch !== reconAuthEpoch) return;
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = "settled_reconciliation.csv";

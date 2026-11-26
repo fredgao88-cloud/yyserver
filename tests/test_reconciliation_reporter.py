@@ -123,7 +123,11 @@ def test_reconciliation_ui_and_rbac_protection():
     body = resp.body.decode("utf-8")
     assert "出院决算账实对账" in body
     assert "clearProtectedReconData" in body
-    assert "r.status === 401" in body and "r.status === 403" in body
+    assert "reconReqSeq" in body and "reconAuthEpoch" in body and "safeReconJson" in body
+    load_section = body[body.index("async function loadRecon()"):body.index("function renderReconRows(")]
+    assert load_section.index("if (r.status === 401)") < load_section.index("await safeReconJson(r)")
+    assert 'id="rSampled"' in body and 'id="rUnrecon"' in body and "unreconBanner" in body
+    assert "部分完成" in body
     assert "http://" not in body and "https://" not in body
 
     dep = require_roles(ROLE_INSURANCE, main_mod.ROLE_ADMIN)
