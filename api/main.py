@@ -27,6 +27,7 @@ from tools.dip_importer import import_dip_rules_records, parse_csv_bytes
 from agent.llm_router import parse_local_intent
 from agent.tool_dispatcher import extract_tool_call, dispatch_tool_call
 from api.admin_ui import ADMIN_OPERATORS_HTML
+from api.workbench_ui import INPATIENT_ALERTS_HTML, ANALYTICS_HTML, DIP_RULES_ADMIN_HTML
 from db.local_db import record_audit_log, get_local_db_connection
 from db.his_reader import HISReader
 from auth.rbac import (
@@ -584,6 +585,21 @@ async def get_doctor_performance(
     return report
 
 
+
+@app.get("/inpatient", response_class=HTMLResponse, summary="在院患者 DIP 控费预警看板 Web 工作台")
+async def inpatient_workbench_page():
+    """纯本地静态工作台页面，所有患者数据通过 Bearer Token 调用 /api/inpatient/alerts 获取。"""
+    return HTMLResponse(content=INPATIENT_ALERTS_HTML)
+
+@app.get("/analytics", response_class=HTMLResponse, summary="医生绩效与历史趋势看板 Web 工作台")
+async def analytics_workbench_page():
+    """纯本地静态工作台页面，所有绩效数据通过 Bearer Token 调用 /api/analytics/doctor-performance 获取。"""
+    return HTMLResponse(content=ANALYTICS_HTML)
+
+@app.get("/admin/dip-rules", response_class=HTMLResponse, summary="DIP 规则目录批量导入 Web 控制台")
+async def dip_rules_admin_page():
+    """纯本地静态工作台页面，通过 Bearer Token 调用 /api/admin/dip-rules/import 执行预检与导入。"""
+    return HTMLResponse(content=DIP_RULES_ADMIN_HTML)
 
 @app.get("/admin/operators", response_class=HTMLResponse, summary="操作员权限管理 Web 控制台")
 async def admin_operators_page():
