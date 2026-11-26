@@ -42,7 +42,7 @@ def extract_operation_keyword(text_clean: str):
     cancel_kws = ("取消", "未做", "未行", "放弃", "暂不做")
     planned_kws = ("拟行", "拟做", "计划", "准备行", "拟实施", "准备做", "打算做", "原定")
     completed_kws = ("已完成", "已行", "已做", "做完", "术后", "已实施")
-    non_op_planned_nouns = ("出院", "入院", "转科", "复查", "随访", "回家", "办手续")
+    non_op_nouns = ("出院", "入院", "手续", "转科", "复查", "随访", "回家", "床位", "病历", "签字", "缴费", "结算", "餐饮", "陪护")
 
     clauses = [c.strip() for c in re.split(r"[，,；;。！？!?]+", text_clean or "") if c.strip()]
     if not clauses:
@@ -75,11 +75,14 @@ def extract_operation_keyword(text_clean: str):
             else:
                 op_states.setdefault(matched_kw, "UNKNOWN")
         elif last_op is not None:
+            # 若无术式分句包含明确的非手术行政/临床事务名词（如“入院手续”“出院”），严禁将其时态继承给上一手术操作
+            if any(n in clause for n in non_op_nouns):
+                continue
             if any(k in clause for k in cancel_kws):
                 _set_op_state(last_op, "CANCELED")
             elif any(k in clause for k in completed_kws):
                 _set_op_state(last_op, "COMPLETED")
-            elif any(k in clause for k in planned_kws) and not any(n in clause for n in non_op_planned_nouns):
+            elif any(k in clause for k in planned_kws):
                 if op_states.get(last_op) == "UNKNOWN":
                     _set_op_state(last_op, "PLANNED")
 

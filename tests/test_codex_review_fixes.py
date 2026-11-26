@@ -47,12 +47,17 @@ def test_notify_data_001_blocks_arbitrary_text_in_outbound_payload():
     assert "中医科(红1/黄0)" in text
     assert "其他已核验科室(红1/黄1)" in text
 
-    # 已批准登记版本可以正常出站，且传入符合格式的自定义批次 B314159 也不得原样出现在请求体中
+    # 已批准登记版本可以正常出站；自定义批次 B314159 既不得原样出站，也不得出现其公开 SHA-256 摘要，且重发复用同一随机 ID
+    import hashlib
+    b_sha = hashlib.sha256(b"B314159").hexdigest()[:8].upper()
     summary_ok = dict(summary, batch_id="B314159", rule_version="2026_SAMPLE_V1")
-    _, text_ok = build_alert_markdown(summary_ok)
-    assert "2026_SAMPLE_V1" in text_ok
-    assert "B314159" not in text_ok
-    assert "ALERT-" in text_ok
+    _, text_ok_1 = build_alert_markdown(summary_ok)
+    _, text_ok_2 = build_alert_markdown(summary_ok)
+    assert "2026_SAMPLE_V1" in text_ok_1
+    assert "B314159" not in text_ok_1
+    assert b_sha not in text_ok_1
+    assert "NOTIFY-" in text_ok_1
+    assert text_ok_1 == text_ok_2
 
 
 def test_notify_ack_001_disabled_and_strict_json_ack(monkeypatch):
@@ -148,6 +153,21 @@ def test_dip_op_001_canceled_operation_falls_back_to_conservative():
     assert tc_omit is not None
     assert tc_omit["arguments"]["operation"] == "保守"
     assert tc_omit["arguments"]["operation_status"] == "CANCELED"
+
+    # “拟行胃镜，已完成入院手续”不应把胃镜改成已完成
+    from agent.llm_router import extract_operation_keyword
+    kw1, st1, _ = extract_operation_keyword("拟行胃镜，已完成入院手续")
+    assert kw1 == "保守" and st1 == "PLANNED"
+    tc_adm = extract_tool_call("住院号 zy2025042901，诊断 K63.5，拟行胃镜，已完成入院手续，当前费用 2500 元，职工医保")
+    assert tc_adm["arguments"]["operation"] == "保守"
+    assert tc_adm["arguments"]["operation_status"] == "PLANNED"
+
+    # “已完成胃镜，取消出院”不应把胃镜改成已取消
+    kw2, st2, _ = extract_operation_keyword("已完成胃镜，取消出院")
+    assert kw2 == "胃镜" and st2 == "COMPLETED"
+    tc_dis = extract_tool_call("住院号 zy2025042901，诊断 K63.5，已完成胃镜，取消出院，当前费用 2500 元，职工医保")
+    assert tc_dis["arguments"]["operation"] == "胃镜"
+    assert tc_dis["arguments"]["operation_status"] == "COMPLETED"
 
 
 def test_chat_audit_001_denied_vs_permitted():
