@@ -9,7 +9,7 @@
 - 支持渠道分流（钉钉渠道患者级查询自动激活隐私盾牌）。
 """
 from fastapi import FastAPI, HTTPException, Query, Header, Depends
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from contextlib import asynccontextmanager
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
@@ -810,12 +810,19 @@ async def chat_interaction(req: ChatRequest, authorization: Optional[str] = Head
     )
     return result
 
-@app.get("/", summary="轻量级院内服务首页")
-async def index():
+@app.get("/api/info", summary="院内服务元数据接口")
+async def api_info():
     return {
         "system": "私立医院智能业务管理 Agent 系统",
         "version": "v1.2",
         "engine": "Database-Backed DIP Rule Engine (36 sample rules in his_agent_db)",
         "health_check": "/health",
-        "api_docs": "/docs"
+        "workbench": "/inpatient",
+        "api_docs": "/docs" if _ENABLE_API_DOCS else None,
     }
+
+@app.get("/", summary="轻量级院内服务首页（浏览器访问自动跳转工作台）")
+async def index(accept: Optional[str] = Header(None)):
+    if accept and "text/html" in accept.lower():
+        return RedirectResponse(url="/inpatient", status_code=302)
+    return await api_info()

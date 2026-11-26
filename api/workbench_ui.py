@@ -109,6 +109,7 @@ INPATIENT_ALERTS_HTML = f"""<!DOCTYPE html>
             <input id="filterDept" placeholder="科室 ID 或名称">
           </div>
           <button onclick="loadAlerts()">查询预警</button>
+          <button class="secondary" onclick="exportInpatientCsv()">导出 CSV</button>
         </div>
         <button class="danger" onclick="doLogout()">退出登录</button>
       </div>
@@ -251,6 +252,32 @@ function renderRows() {{
     tbody.appendChild(tr);
   }}
 }}
+function downloadCsv(filename, headers, rows) {{
+  if (!rows.length) {{ showMsg("暂无可导出数据", true); return; }}
+  const esc = (v) => {{
+    let s = String(v == null ? "" : v);
+    if (/^[=+\-@\t\r]/.test(s) && !/^-?\d+(?:\.\d+)?%?$/.test(s)) s = "'" + s;
+    return '"' + s.replace(/"/g, '""') + '"';
+  }};
+  const lines = [headers.map(esc).join(",")].concat(rows.map(r => r.map(esc).join(",")));
+  const blob = new Blob(["\uFEFF" + lines.join("\r\n")], {{ type: "text/csv;charset=utf-8;" }});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}}
+function exportInpatientCsv() {{
+  const level = document.getElementById("filterLevel").value;
+  const list = level ? cachedItems.filter(x => x.alert_level === level) : cachedItems;
+  const headers = ["住院号", "科室", "床号", "医生工号", "主诊断", "参保类型", "当前费用(元)", "DIP基准(元)", "占比(%)", "灯号", "状态"];
+  const rows = list.map(it => [
+    it.zyh, it.dept_name, it.bed, it.doctor_id, it.disease, it.ins_type,
+    it.current_cost_str || it.current_cost, it.benchmark_str || it.benchmark,
+    it.ratio_percent, it.alert_level, it.status
+  ]);
+  downloadCsv("inpatient_alerts.csv", headers, rows);
+}}
 if (getToken()) {{
   document.getElementById("loginCard").classList.add("hidden");
   document.getElementById("mainArea").classList.remove("hidden");
@@ -303,6 +330,7 @@ ANALYTICS_HTML = f"""<!DOCTYPE html>
             <input id="deptId" placeholder="如 101">
           </div>
           <button onclick="loadReport()">刷新报表</button>
+          <button class="secondary" onclick="exportAnalyticsCsv()">导出 CSV</button>
         </div>
         <button class="danger" onclick="doLogout()">退出登录</button>
       </div>
@@ -330,6 +358,7 @@ ANALYTICS_HTML = f"""<!DOCTYPE html>
 
 <script>
 const TOKEN_KEY = "hospital_admin_token";
+let cachedDoctors = [];
 function showMsg(text, isErr) {{
   const el = document.getElementById("msg");
   el.textContent = text;
@@ -353,6 +382,7 @@ async function doLogin() {{
 }}
 function doLogout() {{ sessionStorage.removeItem(TOKEN_KEY); location.reload(); }}
 function clearProtectedAnalyticsData() {{
+  cachedDoctors = [];
   document.getElementById("docTbody").innerHTML = "";
   document.getElementById("trendSummary").textContent = "";
   const svg = document.getElementById("trendSvg");
@@ -378,7 +408,8 @@ async function loadReport() {{
     showMsg(data.detail || "无权访问或加载报表失败", true);
     return;
   }}
-  renderDoctors(data.doctors || []);
+  cachedDoctors = data.doctors || [];
+  renderDoctors(cachedDoctors);
   renderTrends(data.trends || []);
   showMsg("已加载近 " + data.days + " 天共 " + data.total_snapshots + " 条快照记录", false);
 }}
@@ -441,6 +472,26 @@ function renderTrends(trends) {{
     txt.textContent = (t.cutoff_time || t.batch_id || "").slice(5, 16);
     svg.appendChild(txt);
   }});
+}}
+function exportAnalyticsCsv() {{
+  if (!cachedDoctors.length) {{ showMsg("暂无可导出数据", true); return; }}
+  const esc = (v) => {{
+    let s = String(v == null ? "" : v);
+    if (/^[=+\-@\t\r]/.test(s) && !/^-?\d+(?:\.\d+)?%?$/.test(s)) s = "'" + s;
+    return '"' + s.replace(/"/g, '""') + '"';
+  }};
+  const headers = ["医生工号", "科室", "病例数", "红灯", "黄灯", "绿灯", "绿灯达标率(%)", "平均费用比(%)", "总费用(元)", "总基准(元)"];
+  const rows = cachedDoctors.map(d => [
+    d.doctor_id, d.dept_name, d.total_cases, d.red_count, d.yellow_count, d.green_count,
+    d.green_rate_percent, d.avg_fee_ratio_percent, d.total_fee_str || d.total_fee, d.total_benchmark_str || d.total_benchmark
+  ]);
+  const lines = [headers.map(esc).join(",")].concat(rows.map(r => r.map(esc).join(",")));
+  const blob = new Blob(["\uFEFF" + lines.join("\r\n")], {{ type: "text/csv;charset=utf-8;" }});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "doctor_performance.csv";
+  a.click();
+  URL.revokeObjectURL(a.href);
 }}
 if (getToken()) {{
   document.getElementById("loginCard").classList.add("hidden");
@@ -510,6 +561,7 @@ DIP_RULES_ADMIN_HTML = f"""<!DOCTYPE html>
 
 <script>
 const TOKEN_KEY = "hospital_admin_token";
+let cachedDoctors = [];
 function showMsg(text, isErr) {{
   const el = document.getElementById("msg");
   el.textContent = text;
@@ -641,6 +693,7 @@ AUDIT_LOGS_ADMIN_HTML = f"""<!DOCTYPE html>
 
 <script>
 const TOKEN_KEY = "hospital_admin_token";
+let cachedDoctors = [];
 function showMsg(text, isErr) {{
   const el = document.getElementById("msg");
   el.textContent = text;
@@ -784,6 +837,7 @@ RECONCILIATION_HTML = f"""<!DOCTYPE html>
             </select>
           </div>
           <button onclick="loadRecon()">执行 SERIALIZABLE 对账</button>
+          <button class="secondary" onclick="exportReconCsv()">导出 CSV</button>
         </div>
         <button class="danger" onclick="doLogout()">退出登录</button>
       </div>
@@ -900,6 +954,28 @@ function renderReconRows() {{
     tr.appendChild(tdSt);
     tbody.appendChild(tr);
   }}
+}}
+function exportReconCsv() {{
+  const st = document.getElementById("statusFilter").value;
+  const list = st ? cachedRecon.filter(x => x.recon_status === st) : cachedRecon;
+  if (!list.length) {{ showMsg("暂无可导出数据", true); return; }}
+  const esc = (v) => {{
+    let s = String(v == null ? "" : v);
+    if (/^[=+\-@\t\r]/.test(s) && !/^-?\d+(?:\.\d+)?%?$/.test(s)) s = "'" + s;
+    return '"' + s.replace(/"/g, '""') + '"';
+  }};
+  const headers = ["住院流水号", "科室", "结算时间", "对账口径", "主单总额", "类目差异", "临床差异", "药房差异", "未发药笔数", "未发药金额", "状态"];
+  const rows = list.map(r => [
+    r.visit_id, r.dept_name, r.settlement_time, r.reconciliation_scope, r.total_amount_str,
+    r.category_diff_str, r.clinical_diff_str, r.pharmacy_diff_str, r.undispensed_count, r.undispensed_amount_str, r.recon_status
+  ]);
+  const lines = [headers.map(esc).join(",")].concat(rows.map(r => r.map(esc).join(",")));
+  const blob = new Blob(["\uFEFF" + lines.join("\r\n")], {{ type: "text/csv;charset=utf-8;" }});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "settled_reconciliation.csv";
+  a.click();
+  URL.revokeObjectURL(a.href);
 }}
 if (getToken()) {{
   document.getElementById("loginCard").classList.add("hidden");
