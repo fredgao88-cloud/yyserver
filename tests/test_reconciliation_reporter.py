@@ -125,6 +125,8 @@ def test_reconciliation_ui_and_rbac_protection():
     assert "clearProtectedReconData" in body
     assert "reconReqSeq" in body and "reconAuthEpoch" in body and "safeReconJson" in body
     assert "parseReconReportJson" in body and "对账结果读取失败" in body
+    assert "data.reconciled_count + data.unreconciled_count !== data.sampled_count" in body
+    assert "data.unreconciled_reasons.length !== data.unreconciled_count" in body
     load_section = body[body.index("async function loadRecon()"):body.index("function renderReconRows(")]
     export_section = body[body.index("async function exportReconCsv()"):body.index("if (getToken())")]
     assert load_section.index("if (myEpoch !== reconAuthEpoch) return;") < load_section.index("if (r.status === 401)")

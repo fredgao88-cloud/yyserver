@@ -71,24 +71,32 @@ const columns: DataTableColumns<ReconciliationItem> = [
   }
 ];
 
+let reconReqSeq = 0;
+
 async function loadData() {
+  const mySeq = ++reconReqSeq;
   loading.value = true;
   loadError.value = '';
   try {
-    report.value = await fetchSettledReconciliation(limit.value, dept.value.trim() || undefined);
-    if (report.value.unreconciled_count > 0) {
-      window.$message?.warning(`部分完成：存在 ${report.value.unreconciled_count} 例未完成核对`);
+    const res = await fetchSettledReconciliation(limit.value, dept.value.trim() || undefined);
+    if (mySeq !== reconReqSeq) return;
+    report.value = res;
+    if (res.unreconciled_count > 0) {
+      window.$message?.warning(`部分完成：存在 ${res.unreconciled_count} 例未完成核对`);
     } else {
       window.$message?.success('已完成 SERIALIZABLE 事务隔离级出院账实核对');
     }
   } catch (err: any) {
+    if (mySeq !== reconReqSeq) return;
     if (err?.status !== 499 && err?.status !== 401) {
       report.value = null;
       loadError.value = err?.message || '对账结果读取失败';
       window.$message?.error(loadError.value);
     }
   } finally {
-    loading.value = false;
+    if (mySeq === reconReqSeq) {
+      loading.value = false;
+    }
   }
 }
 

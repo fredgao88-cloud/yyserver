@@ -93,16 +93,24 @@ const columns: DataTableColumns<InpatientAlertItem> = [
   }
 ];
 
+let inpReqSeq = 0;
+
 async function loadData() {
+  const mySeq = ++inpReqSeq;
   loading.value = true;
   try {
-    report.value = await fetchInpatientAlerts(filterDept.value.trim() || undefined);
+    const res = await fetchInpatientAlerts(filterDept.value.trim() || undefined);
+    if (mySeq !== inpReqSeq) return;
+    report.value = res;
   } catch (err: any) {
+    if (mySeq !== inpReqSeq) return;
     if (err?.status !== 499 && err?.status !== 401) {
       window.$message?.error(err?.message || '加载在院预警失败');
     }
   } finally {
-    loading.value = false;
+    if (mySeq === inpReqSeq) {
+      loading.value = false;
+    }
   }
 }
 

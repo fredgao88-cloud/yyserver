@@ -1050,7 +1050,11 @@ async function parseReconReportJson(r) {
     !isCount(data.sampled_count) ||
     !isCount(data.reconciled_count) ||
     !isCount(data.unreconciled_count) ||
-    !Array.isArray(data.items)
+    !Array.isArray(data.items) ||
+    !Array.isArray(data.unreconciled_reasons) ||
+    data.items.length !== data.reconciled_count ||
+    data.reconciled_count + data.unreconciled_count !== data.sampled_count ||
+    data.unreconciled_reasons.length !== data.unreconciled_count
   ) {
     return null;
   }

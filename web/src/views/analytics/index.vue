@@ -64,10 +64,14 @@ const columns: DataTableColumns<DoctorPerformanceItem> = [
   { title: 'DIP 基准(元)', key: 'total_benchmark_str', width: 125 }
 ];
 
+let anaReqSeq = 0;
+
 async function loadData() {
+  const mySeq = ++anaReqSeq;
   loading.value = true;
   try {
     const res = await fetchDoctorPerformance(days.value, canFilterDept.value ? deptId.value.trim() || undefined : undefined);
+    if (mySeq !== anaReqSeq) return;
     report.value = res;
     const trends = res.trends || [];
     updateOptions(opts => {
@@ -80,11 +84,14 @@ async function loadData() {
       return opts;
     });
   } catch (err: any) {
+    if (mySeq !== anaReqSeq) return;
     if (err?.status !== 499 && err?.status !== 401) {
       window.$message?.error(err?.message || '加载绩效报表失败');
     }
   } finally {
-    loading.value = false;
+    if (mySeq === anaReqSeq) {
+      loading.value = false;
+    }
   }
 }
 
