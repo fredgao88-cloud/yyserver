@@ -142,13 +142,18 @@ def run_net_egress_isolated() -> None:
 def run_proxy_egress_and_notify_log_isolated():
     """
     NET-EGRESS-001 & NOTIFY-LOG-001 独立 Compose 栈全链路验收：
-    - 独立 docker compose 项目构建 internal=true 与 edge 隔离网络（与生产容器完全解耦）；
-    - 使用最小 TDS 7.4 模拟 HIS 与带测试根 CA 签发证书的 HTTPS 模拟钉钉服务 (oapi.dingtalk.com:443)；
-    - 在测试 API 容器内直接调用真实应用连接配置 (HIS_FREETDS_SECTION=hisdb_proxy + db.his_reader.HISReader)
-      与真实通知函数 (tools.dingtalk_notifier.send_dingtalk_alert, 目标 http://nginx:8443/robot/send)；
-    - 校验：经 Compose 别名 nginx 代理成功、直连 edge 绕过受阻、停代理后两个应用调用均失败；
-    - 校验：HTTPS 200、403、上游宕机 502 下代理与上游正确传递签名凭据且代理 access/error 日志零泄露。
+    - 受 TEST-ISO-001 保护：未显式设置 NET_TEST_ISOLATED=1 时立即跳过，不执行任何文件读取或子进程调用；
+    - 独立 docker compose 项目构建 internal=true 与 edge 隔离网络（自包含生成临时 freetds.conf，不依赖 .gitignore 文件）；
+    - 使用最小 TDS 7.4 模拟 HIS 与同时含 DNS:oapi.dingtalk.com 与 IP SAN 的测试证书 HTTPS 模拟钉钉服务，
+      并向测试客户端与 Nginx 注入同一测试 Root CA；
+    - 在同配置非隔离对照 (hospital_edge) 与隔离 api (internal=true) 上对照验证相同直连目标：对照成功、隔离受阻；
+    - 先恢复上游确认健康，再单独停止 nginx 验证 HIS 与通知双双失败，最后重启 nginx 验证双双恢复；
+    - 校验 HTTPS 200、403、上游宕机 502 下代理与上游正确传递签名凭据且代理 access/error 日志零泄露。
     """
+    if os.environ.get("NET_TEST_ISOLATED") != "1":
+        print("[SKIP] TEST-ISO-001 (NET-EGRESS-001 / NOTIFY-LOG-001 Proxy): 未设置 NET_TEST_ISOLATED=1，跳过容器代理与日志实测")
+        return
+
     import re
     import tempfile
     from pathlib import Path
@@ -273,20 +278,13 @@ httpd.serve_forever()
         cert_dir.mkdir(mode=0o755, exist_ok=True)
         os.chmod(log_dir, 0o777)
 
-        # 生成测试 Root CA 与 oapi.dingtalk.com 测试服务端证书（用于校验 nginx proxy_ssl_verify on）
+        # 生成测试 Root CA（服务端叶证书将在 mock_notify 拿到 edge IP 后签发，同时包含 DNS:oapi.dingtalk.com 与 IP SAN）
         ca_key = cert_dir / "ca.key"
         ca_crt = cert_dir / "ca.crt"
         srv_key = cert_dir / "server.key"
         srv_csr = cert_dir / "server.csr"
         srv_crt = cert_dir / "server.crt"
         srv_ext = cert_dir / "server.ext"
-        srv_ext.write_text(
-            "basicConstraints=CA:FALSE\n"
-            "keyUsage=critical,digitalSignature,keyEncipherment\n"
-            "extendedKeyUsage=serverAuth\n"
-            "subjectAltName=DNS:oapi.dingtalk.com\n",
-            encoding="utf-8",
-        )
         assert _run([
             "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
             "-keyout", str(ca_key), "-out", str(ca_crt), "-days", "2",
@@ -294,18 +292,21 @@ httpd.serve_forever()
             "-addext", "basicConstraints=critical,CA:TRUE",
             "-addext", "keyUsage=critical,keyCertSign,cRLSign",
         ]).returncode == 0, "生成测试 Root CA 失败"
-        assert _run([
-            "openssl", "req", "-newkey", "rsa:2048", "-nodes",
-            "-keyout", str(srv_key), "-out", str(srv_csr),
-            "-subj", "/CN=oapi.dingtalk.com",
-        ]).returncode == 0, "生成测试服务端 CSR 失败"
-        assert _run([
-            "openssl", "x509", "-req", "-in", str(srv_csr),
-            "-CA", str(ca_crt), "-CAkey", str(ca_key), "-CAcreateserial",
-            "-out", str(srv_crt), "-days", "2", "-extfile", str(srv_ext),
-        ]).returncode == 0, "签发测试服务端证书失败"
-        for p in (ca_crt, srv_crt, srv_key):
-            os.chmod(p, 0o644)
+        os.chmod(ca_crt, 0o644)
+
+        freetds_path = tmp_path / "freetds.conf"
+        freetds_path.write_text(
+            "[global]\n"
+            "    tds version = 7.4\n"
+            "    openssl ciphers = DEFAULT@SECLEVEL=0\n\n"
+            "[hisdb_proxy]\n"
+            "    host = nginx\n"
+            "    port = 1433\n"
+            "    tds version = 7.4\n"
+            "    encryption = off\n",
+            encoding="utf-8",
+        )
+        os.chmod(freetds_path, 0o644)
 
         his_script_path = tmp_path / "mock_his_tds.py"
         his_script_path.write_text(mock_his_tds_py, encoding="utf-8")
@@ -339,26 +340,47 @@ httpd.serve_forever()
     volumes:
       - {notify_script_path}:/tmp/mock_notify_https.py:ro
       - {cert_dir}:/tmp/certs:ro
-    command: ["sh", "-c", "python /tmp/mock_notify_https.py & echo $$! > /tmp/srv.pid; sleep 180"]
+    command: ["sh", "-c", "i=0; while [ ! -f /tmp/certs/server.crt ] && [ $$i -lt 100 ]; do sleep 0.2; i=$$((i+1)); done; python /tmp/mock_notify_https.py & echo $$! > /tmp/srv.pid; sleep 180"]
 
   api:
     image: {api_image}
     networks:
       - hospital_internal
     environment:
-      - FREETDSCONF=/opt/hospital-agent/freetds.conf
+      - FREETDSCONF=/tmp/test_freetds.conf
       - HIS_FREETDS_SECTION=hisdb_proxy
       - HIS_LOGIN_TIMEOUT=3
       - HIS_USER=test_reader
       - HIS_PASS=SyntheticHisPass_123
       - HIS_DB=his
+      - SSL_CERT_FILE=/tmp/test_ca.crt
       - DINGTALK_NOTIFY_ENABLED=true
       - DINGTALK_WEBHOOK_URL=http://nginx:8443/robot/send?access_token={synth_token}
       - DINGTALK_WEBHOOK_SECRET={synth_secret}
     volumes:
       - {repo_root}/db:/opt/hospital-agent/db:ro
       - {repo_root}/tools:/opt/hospital-agent/tools:ro
-      - {repo_root}/freetds.conf:/opt/hospital-agent/freetds.conf:ro
+      - {freetds_path}:/tmp/test_freetds.conf:ro
+      - {ca_crt}:/tmp/test_ca.crt:ro
+    command: ["sleep", "180"]
+
+  api_open:
+    image: {api_image}
+    networks:
+      - hospital_edge
+    environment:
+      - FREETDSCONF=/tmp/test_freetds.conf
+      - HIS_LOGIN_TIMEOUT=3
+      - HIS_USER=test_reader
+      - HIS_PASS=SyntheticHisPass_123
+      - HIS_DB=his
+      - SSL_CERT_FILE=/tmp/test_ca.crt
+      - DINGTALK_NOTIFY_ENABLED=true
+    volumes:
+      - {repo_root}/db:/opt/hospital-agent/db:ro
+      - {repo_root}/tools:/opt/hospital-agent/tools:ro
+      - {freetds_path}:/tmp/test_freetds.conf:ro
+      - {ca_crt}:/tmp/test_ca.crt:ro
     command: ["sleep", "180"]
 
   nginx:
@@ -394,15 +416,10 @@ networks:
             time.sleep(2.0)
 
             c_ids = {}
-            for svc in ("api", "nginx", "mock_his", "mock_notify"):
+            for svc in ("api", "api_open", "nginx", "mock_his", "mock_notify"):
                 r = _run(compose_base + ["ps", "-q", svc])
                 assert r.returncode == 0 and r.stdout.strip(), f"找不到 Compose 服务 {svc}: {r.stderr}"
                 c_ids[svc] = r.stdout.strip()
-
-            allow_conf = _run(["docker", "exec", c_ids["nginx"], "cat", "/etc/nginx/internal_allow.conf"])
-            assert allow_conf.returncode == 0 and "allow " in allow_conf.stdout and "deny all;" in allow_conf.stdout, (
-                f"动态 allow 配置异常: {allow_conf.stdout} {allow_conf.stderr}"
-            )
 
             mock_his_edge_ip = json.loads(_run(["docker", "inspect", c_ids["mock_his"]]).stdout)[0][
                 "NetworkSettings"]["Networks"][f"{project_name}_hospital_edge"]["IPAddress"]
@@ -410,6 +427,44 @@ networks:
                 "NetworkSettings"]["Networks"][f"{project_name}_hospital_edge"]["IPAddress"]
             proxy_edge_ip = json.loads(_run(["docker", "inspect", c_ids["nginx"]]).stdout)[0][
                 "NetworkSettings"]["Networks"][f"{project_name}_hospital_edge"]["IPAddress"]
+
+            # 签发同时覆盖 DNS:oapi.dingtalk.com 与 IP:mock_notify_edge_ip 的测试服务端证书并通知 mock_notify 启动 HTTPS 监听
+            srv_ext.write_text(
+                "basicConstraints=CA:FALSE\n"
+                "keyUsage=critical,digitalSignature,keyEncipherment\n"
+                "extendedKeyUsage=serverAuth\n"
+                f"subjectAltName=DNS:oapi.dingtalk.com,IP:{mock_notify_edge_ip}\n",
+                encoding="utf-8",
+            )
+            assert _run([
+                "openssl", "req", "-newkey", "rsa:2048", "-nodes",
+                "-keyout", str(srv_key), "-out", str(srv_csr),
+                "-subj", "/CN=oapi.dingtalk.com",
+            ]).returncode == 0, "生成测试服务端 CSR 失败"
+            assert _run([
+                "openssl", "x509", "-req", "-in", str(srv_csr),
+                "-CA", str(ca_crt), "-CAkey", str(ca_key), "-CAcreateserial",
+                "-out", str(srv_crt), "-days", "2", "-extfile", str(srv_ext),
+            ]).returncode == 0, "签发测试服务端证书失败"
+            for p in (srv_crt, srv_key):
+                os.chmod(p, 0o644)
+
+            # 等待 mock_notify 启动完成且 HTTPS 端口就绪
+            for _ in range(30):
+                ready_r = _run([
+                    "docker", "exec", c_ids["api_open"], "python", "-c",
+                    f"import socket; s=socket.create_connection(('{mock_notify_edge_ip}', 443), timeout=1); s.close()"
+                ])
+                if ready_r.returncode == 0:
+                    break
+                time.sleep(0.2)
+            else:
+                raise AssertionError("mock_notify HTTPS 443 端口未及时就绪")
+
+            allow_conf = _run(["docker", "exec", c_ids["nginx"], "cat", "/etc/nginx/internal_allow.conf"])
+            assert allow_conf.returncode == 0 and "allow " in allow_conf.stdout and "deny all;" in allow_conf.stdout, (
+                f"动态 allow 配置异常: {allow_conf.stdout} {allow_conf.stderr}"
+            )
 
             # 1) 经 Compose 服务别名 nginx 调用真实应用 HISReader 与 send_dingtalk_alert (HTTPS proxy_ssl_verify on)
             app_via_proxy_script = """
@@ -467,14 +522,15 @@ print(json.dumps(out, ensure_ascii=False))
             )
             captured_sign = qs["sign"][0]
 
-            # 2) 直连绕过代理必须受阻（HISReader 直连 mock_his edge IP 与 send_dingtalk_alert 直连 mock_notify HTTPS 均失败）
-            direct_block_script = f"""
-import json, os, shutil
+            # 2) 直连正反对照：同一目标 URL (含可信 Test CA 与匹配 IP SAN 证书) 与 [hisdb_direct]，
+            #    在放通对照容器 api_open (hospital_edge) 上必须双双成功，在隔离容器 api (internal:true) 内必须双双受阻且非 TLS 报错
+            direct_script = f"""
+import json, os, ssl, urllib.request, urllib.error
 from pathlib import Path
 from db.his_reader import HISReader
 from tools.dingtalk_notifier import send_dingtalk_alert
 
-orig_conf = Path("/opt/hospital-agent/freetds.conf").read_text(encoding="utf-8")
+orig_conf = Path("/tmp/test_freetds.conf").read_text(encoding="utf-8")
 tmp_conf = Path("/tmp/freetds_direct.conf")
 tmp_conf.write_text(
     orig_conf + "\\n[hisdb_direct]\\n    host = {mock_his_edge_ip}\\n    port = 1433\\n    tds version = 7.4\\n    encryption = off\\n",
@@ -483,27 +539,59 @@ tmp_conf.write_text(
 os.environ["FREETDSCONF"] = str(tmp_conf)
 os.environ["HIS_FREETDS_SECTION"] = "hisdb_direct"
 
-his_direct_failed = False
+his_ok = False
+his_err = ""
 try:
-    HISReader().get_connection()
-except Exception:
-    his_direct_failed = True
+    c = HISReader().get_connection()
+    cur = c.cursor()
+    cur.execute("SELECT 1")
+    c.close()
+    his_ok = True
+except Exception as exc:
+    his_err = f"{{type(exc).__name__}}: {{exc}}"
 
-notify_direct = send_dingtalk_alert(
+notify_res = send_dingtalk_alert(
     {{"RED": 1, "YELLOW": 0, "GREEN": 1, "total_scanned": 2, "rule_version": "2026_SAMPLE_V1", "data_cutoff_time": "2026-11-27 10:00:00"}},
     webhook_url="https://{mock_notify_edge_ip}:443/robot/send?access_token={synth_token}",
     secret="{synth_secret}",
     timeout=2,
 )
-print(json.dumps({{"his_direct_failed": his_direct_failed, "notify_direct": notify_direct}}, ensure_ascii=False))
+
+# 探明底层直连 HTTPS 是否因 TLS 失败还是纯网络不可达
+direct_ssl_error = False
+try:
+    urllib.request.urlopen("https://{mock_notify_edge_ip}:443/robot/send", timeout=2)
+except urllib.error.URLError as e:
+    if isinstance(e.reason, ssl.SSLError):
+        direct_ssl_error = True
+except Exception:
+    pass
+
+print(json.dumps({{
+    "his_ok": his_ok,
+    "his_err": his_err,
+    "notify_res": notify_res,
+    "direct_ssl_error": direct_ssl_error,
+}}, ensure_ascii=False))
 """
-            res_direct = _run(["docker", "exec", c_ids["api"], "python", "-c", direct_block_script])
+            # 2a) 非隔离对照容器 (hospital_edge)：证明证书与 IP SAN、CA 信任、HIS 直连配置全部有效，可直连成功
+            res_open = _run(["docker", "exec", c_ids["api_open"], "python", "-c", direct_script])
+            assert res_open.returncode == 0, f"放通对照检测异常: {res_open.stderr}\n{res_open.stdout}"
+            d_open = json.loads(res_open.stdout.strip())
+            assert d_open["his_ok"] is True, f"放通网络对照组 HIS 直连应成功却失败: {d_open}"
+            assert d_open["notify_res"].get("sent") is True and d_open["notify_res"].get("response", {}).get("errcode") == 0, (
+                f"放通网络对照组直连 HTTPS 通知（含 Test CA 与 IP SAN）应成功却失败: {d_open}"
+            )
+
+            # 2b) 隔离应用容器 (internal:true)：同一目标、同一 CA 与配置，在隔离网络内必须因网络不可达失败（绝非 TLS 证书错误）
+            res_direct = _run(["docker", "exec", c_ids["api"], "python", "-c", direct_script])
             assert res_direct.returncode == 0, f"直连阻断检查异常: {res_direct.stderr}"
             d_dir = json.loads(res_direct.stdout.strip())
-            assert d_dir["his_direct_failed"] is True, f"HISReader 竟允许直连绕过代理: {d_dir}"
-            assert d_dir["notify_direct"].get("sent") is False and str(d_dir["notify_direct"].get("reason", "")).startswith("NETWORK_ERROR:"), (
+            assert d_dir["his_ok"] is False, f"HISReader 竟允许在隔离网直连绕过代理: {d_dir}"
+            assert d_dir["notify_res"].get("sent") is False and str(d_dir["notify_res"].get("reason", "")).startswith("NETWORK_ERROR:"), (
                 f"send_dingtalk_alert 直连竟未受阻: {d_dir}"
             )
+            assert d_dir["direct_ssl_error"] is False, f"直连失败原因竟为 TLS 证书报错而非网络隔离: {d_dir}"
 
             # edge 侧非内网容器直接访问代理 8443 应返回 403
             edge_res = _run([
@@ -515,7 +603,7 @@ print(json.dumps({{"his_direct_failed": his_direct_failed, "notify_direct": noti
             ])
             assert edge_res.returncode == 0 and edge_res.stdout.strip() == "403", f"edge 侧访问代理未被拒 403: {edge_res.stdout} {edge_res.stderr}"
 
-            # 3) 停掉 HTTPS 模拟上游（触发 connect() failed -> 502），验证 error_log 不泄密
+            # 3) 停掉 HTTPS 模拟上游（触发 connect() failed -> 502），验证失败后立即恢复上游并确认真实通知恢复成功
             assert _run(["docker", "exec", c_ids["mock_notify"], "sh", "-c", "kill $(cat /tmp/srv.pid)"]).returncode == 0
             time.sleep(0.3)
             res_502 = _run([
@@ -527,33 +615,74 @@ print(json.dumps({{"his_direct_failed": his_direct_failed, "notify_direct": noti
             d_502 = json.loads(res_502.stdout.strip())
             assert d_502.get("sent") is False and str(d_502.get("reason", "")).startswith("NETWORK_ERROR:"), f"上游宕机未触发失败: {d_502}"
 
+            # 恢复 mock_notify 上游并断言经 nginx 发送再次成功，从而把后续失败明确归因于停止 nginx 本身
+            assert _run([
+                "docker", "exec", "-d", c_ids["mock_notify"], "sh", "-c",
+                "python /tmp/mock_notify_https.py & echo $! > /tmp/srv.pid"
+            ]).returncode == 0
+            for _ in range(25):
+                r_up = _run([
+                    "docker", "exec", c_ids["api_open"], "python", "-c",
+                    f"import socket; s=socket.create_connection(('{mock_notify_edge_ip}', 443), timeout=1); s.close()"
+                ])
+                if r_up.returncode == 0:
+                    break
+                time.sleep(0.2)
+            res_upstream_recovered = _run([
+                "docker", "exec", c_ids["api"], "python", "-c",
+                "import json; from tools.dingtalk_notifier import send_dingtalk_alert; "
+                "print(json.dumps(send_dingtalk_alert({'RED': 1, 'YELLOW': 0, 'GREEN': 1, 'total_scanned': 2, 'rule_version': '2026_SAMPLE_V1', 'data_cutoff_time': '2026-11-27 10:00:00'})))"
+            ])
+            assert res_upstream_recovered.returncode == 0
+            d_up_rec = json.loads(res_upstream_recovered.stdout.strip())
+            assert d_up_rec.get("sent") is True, f"恢复上游后通知未恢复成功: {d_up_rec}"
+
             nginx_logs_before_stop = _run(["docker", "logs", c_ids["nginx"]])
 
-            # 4) 停掉独立 Compose 栈的 nginx 代理服务，验证两个应用调用（HISReader + send_dingtalk_alert）均立即失败
+            # 4) 在两个模拟上游均健康的前提下，单独停止 nginx，验证 HISReader 与 send_dingtalk_alert 双双失败；随后启动 nginx，验证两者双双恢复成功
             assert _run(compose_base + ["stop", "-t", "1", "nginx"]).returncode == 0
-            after_stop_script = """
+            proxy_pair_probe = """
 import json
 from db.his_reader import HISReader
 from tools.dingtalk_notifier import send_dingtalk_alert
 
-his_failed = False
+his_ok = False
 try:
-    HISReader().get_connection()
+    conn = HISReader().get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT 1")
+    conn.close()
+    his_ok = True
 except Exception:
-    his_failed = True
+    his_ok = False
 
 notify_res = send_dingtalk_alert(
     {"RED": 1, "YELLOW": 0, "GREEN": 1, "total_scanned": 2, "rule_version": "2026_SAMPLE_V1", "data_cutoff_time": "2026-11-27 10:00:00"},
     timeout=2,
 )
-print(json.dumps({"his_failed": his_failed, "notify_res": notify_res}, ensure_ascii=False))
+print(json.dumps({"his_ok": his_ok, "notify_res": notify_res}, ensure_ascii=False))
 """
-            res_stopped = _run(["docker", "exec", c_ids["api"], "python", "-c", after_stop_script])
+            res_stopped = _run(["docker", "exec", c_ids["api"], "python", "-c", proxy_pair_probe])
             assert res_stopped.returncode == 0, f"停代理验证执行失败: {res_stopped.stderr}"
             d_stop = json.loads(res_stopped.stdout.strip())
-            assert d_stop["his_failed"] is True, f"停 nginx 后 HISReader 仍成功: {d_stop}"
+            assert d_stop["his_ok"] is False, f"停 nginx 后 HISReader 仍成功: {d_stop}"
             assert d_stop["notify_res"].get("sent") is False and str(d_stop["notify_res"].get("reason", "")).startswith("NETWORK_ERROR:"), (
                 f"停 nginx 后 send_dingtalk_alert 未失败: {d_stop}"
+            )
+
+            assert _run(compose_base + ["start", "nginx"]).returncode == 0
+            for _ in range(25):
+                chk_allow = _run(["docker", "exec", c_ids["nginx"], "cat", "/etc/nginx/internal_allow.conf"])
+                if chk_allow.returncode == 0 and "allow " in chk_allow.stdout:
+                    break
+                time.sleep(0.2)
+            time.sleep(0.5)
+            res_recovered = _run(["docker", "exec", c_ids["api"], "python", "-c", proxy_pair_probe])
+            assert res_recovered.returncode == 0, f"重启代理后恢复验证失败: {res_recovered.stderr}"
+            d_rec = json.loads(res_recovered.stdout.strip())
+            assert d_rec["his_ok"] is True, f"恢复 nginx 后 HISReader 未恢复成功: {d_rec}"
+            assert d_rec["notify_res"].get("sent") is True and d_rec["notify_res"].get("response", {}).get("errcode") == 0, (
+                f"恢复 nginx 后 send_dingtalk_alert 未恢复成功: {d_rec}"
             )
 
             # 5) 核查全部 Nginx 日志与容器输出均无 token/secret/sign，且 access.log 保留 200/403/502 无参路径
@@ -569,7 +698,7 @@ print(json.dumps({"his_failed": his_failed, "notify_res": notify_res}, ensure_as
                 f"access.log 未完整保留 200/403/502 状态与无参路径: {access_txt}"
             )
 
-            print("PASS [NET-EGRESS 5 · Isolated Compose App Paths (HISReader + send_dingtalk_alert HTTPS, Direct Blocked, Stop-Proxy Fails)]:", json.dumps(d_ok, ensure_ascii=False))
+            print("PASS [NET-EGRESS 5 · Isolated Compose App Paths (Open-Net Control OK, Isolated Direct Blocked, Stop/Start Nginx Verified)]:", json.dumps({"via_proxy": d_ok, "open_control_direct": {"his_ok": d_open["his_ok"], "notify_sent": d_open["notify_res"]["sent"]}, "after_nginx_recover": {"his_ok": d_rec["his_ok"], "notify_sent": d_rec["notify_res"]["sent"]}}, ensure_ascii=False))
             print("PASS [NOTIFY-LOG-001 · Zero Secret Leak Across HTTPS 200/403/502]: access.log sanitized, error_log clean")
         finally:
             _run(compose_base + ["down", "-t", "1", "-v", "--remove-orphans"], timeout=60)
