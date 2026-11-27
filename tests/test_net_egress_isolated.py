@@ -139,6 +139,53 @@ def run_net_egress_isolated() -> None:
         _run(["docker", "rm", "-f", mock_name])
 
 
+def _assert_isolated_direct_blocked(probe_result: dict) -> None:
+    """
+    NET-EGRESS-001：严格判别隔离网络下的直连失败原因，拒绝把 TCP 可达后的 HTTP 403/500 或 TLS 证书报错误判为网络隔离。
+    """
+    assert probe_result.get("his_ok") is False, f"HISReader 竟允许在隔离网直连绕过代理: {probe_result}"
+    assert probe_result.get("tcp_reachable") is False, f"底层 TCP 连接直连目标成功（未隔离）: {probe_result}"
+    assert probe_result.get("raw_http_status") is None, f"收到直连目标 HTTP 响应 {probe_result.get('raw_http_status')}（网络实际可达）: {probe_result}"
+    assert probe_result.get("raw_tls_error") is False, f"直连失败原因为 TLS 证书握手错误而非网络隔离: {probe_result}"
+    notify_res = probe_result.get("notify_res") or {}
+    assert notify_res.get("sent") is False and notify_res.get("reason") == "NETWORK_ERROR:URLError", (
+        f"send_dingtalk_alert 未以 URLError（网络不可达）失败: {probe_result}"
+    )
+
+
+def _assert_nginx_logs_sanitized(
+    pre_stop_stdout: str,
+    pre_stop_stderr: str,
+    post_restart_logs_res,
+    log_dir,
+    sensitive_markers,
+    expected_statuses=(" 200 ", " 403 ", " 502 "),
+) -> None:
+    """
+    NOTIFY-LOG-001：合并停代理前输出、重启恢复请求后的完整容器输出以及挂载日志文件，确保无任何敏感凭据落盘或输出。
+    """
+    assert getattr(post_restart_logs_res, "returncode", 1) == 0, (
+        f"读取重启恢复后的 nginx 容器日志失败: {getattr(post_restart_logs_res, 'stderr', '')}"
+    )
+    all_logs = [
+        pre_stop_stdout or "",
+        pre_stop_stderr or "",
+        getattr(post_restart_logs_res, "stdout", "") or "",
+        getattr(post_restart_logs_res, "stderr", "") or "",
+    ]
+    for lf in log_dir.glob("*"):
+        if lf.is_file():
+            all_logs.append(lf.read_text(encoding="utf-8", errors="ignore"))
+    combined_logs = "\n".join(all_logs)
+    for sensitive in sensitive_markers:
+        assert sensitive not in combined_logs, f"Nginx 日志或容器输出发现敏感内容 {sensitive!r}"
+    access_file = log_dir / "access.log"
+    access_txt = access_file.read_text(encoding="utf-8", errors="ignore") if access_file.exists() else ""
+    assert "/robot/send" in access_txt, f"access.log 缺少 /robot/send 记录: {access_txt}"
+    for status_code in expected_statuses:
+        assert status_code in access_txt, f"access.log 缺少状态码 {status_code}: {access_txt}"
+
+
 def run_proxy_egress_and_notify_log_isolated():
     """
     NET-EGRESS-001 & NOTIFY-LOG-001 独立 Compose 栈全链路验收：
@@ -523,9 +570,10 @@ print(json.dumps(out, ensure_ascii=False))
             captured_sign = qs["sign"][0]
 
             # 2) 直连正反对照：同一目标 URL (含可信 Test CA 与匹配 IP SAN 证书) 与 [hisdb_direct]，
-            #    在放通对照容器 api_open (hospital_edge) 上必须双双成功，在隔离容器 api (internal:true) 内必须双双受阻且非 TLS 报错
+            #    在放通对照容器 api_open (hospital_edge) 上必须双双成功（TCP+HTTP+应用调用均通），
+            #    在隔离容器 api (internal:true) 内必须 TCP 不通、无 HTTP 响应、非 TLS 错误且应用调用失败
             direct_script = f"""
-import json, os, ssl, urllib.request, urllib.error
+import json, os, socket, ssl, urllib.request, urllib.error
 from pathlib import Path
 from db.his_reader import HISReader
 from tools.dingtalk_notifier import send_dingtalk_alert
@@ -550,6 +598,30 @@ try:
 except Exception as exc:
     his_err = f"{{type(exc).__name__}}: {{exc}}"
 
+tcp_reachable = False
+tcp_err = ""
+try:
+    with socket.create_connection(("{mock_notify_edge_ip}", 443), timeout=2):
+        tcp_reachable = True
+except Exception as exc:
+    tcp_err = f"{{type(exc).__name__}}: {{exc}}"
+
+raw_http_status = None
+raw_tls_error = False
+try:
+    req_raw = urllib.request.Request("https://{mock_notify_edge_ip}:443/forbidden", data=b"{{}}", method="POST")
+    with urllib.request.urlopen(req_raw, timeout=2) as resp:
+        raw_http_status = resp.status
+except urllib.error.HTTPError as e:
+    raw_http_status = e.code
+except ssl.SSLError:
+    raw_tls_error = True
+except urllib.error.URLError as e:
+    if isinstance(e.reason, ssl.SSLError):
+        raw_tls_error = True
+except Exception:
+    pass
+
 notify_res = send_dingtalk_alert(
     {{"RED": 1, "YELLOW": 0, "GREEN": 1, "total_scanned": 2, "rule_version": "2026_SAMPLE_V1", "data_cutoff_time": "2026-11-27 10:00:00"}},
     webhook_url="https://{mock_notify_edge_ip}:443/robot/send?access_token={synth_token}",
@@ -557,41 +629,39 @@ notify_res = send_dingtalk_alert(
     timeout=2,
 )
 
-# 探明底层直连 HTTPS 是否因 TLS 失败还是纯网络不可达
-direct_ssl_error = False
-try:
-    urllib.request.urlopen("https://{mock_notify_edge_ip}:443/robot/send", timeout=2)
-except urllib.error.URLError as e:
-    if isinstance(e.reason, ssl.SSLError):
-        direct_ssl_error = True
-except Exception:
-    pass
-
 print(json.dumps({{
     "his_ok": his_ok,
     "his_err": his_err,
+    "tcp_reachable": tcp_reachable,
+    "tcp_err": tcp_err,
+    "raw_http_status": raw_http_status,
+    "raw_tls_error": raw_tls_error,
     "notify_res": notify_res,
-    "direct_ssl_error": direct_ssl_error,
 }}, ensure_ascii=False))
 """
-            # 2a) 非隔离对照容器 (hospital_edge)：证明证书与 IP SAN、CA 信任、HIS 直连配置全部有效，可直连成功
+            hits_before_direct = len(_run(["docker", "exec", c_ids["mock_notify"], "cat", "/tmp/notify_hits.jsonl"]).stdout.strip().splitlines())
+
+            # 2a) 非隔离对照容器 (hospital_edge)：证明证书与 IP SAN、CA 信任、TCP、HTTPS 与 HIS 直连配置全部有效
             res_open = _run(["docker", "exec", c_ids["api_open"], "python", "-c", direct_script])
             assert res_open.returncode == 0, f"放通对照检测异常: {res_open.stderr}\n{res_open.stdout}"
             d_open = json.loads(res_open.stdout.strip())
+            assert d_open["tcp_reachable"] is True and d_open["raw_http_status"] == 200 and d_open["raw_tls_error"] is False, (
+                f"放通对照组直连 HTTPS TLS/TCP 检查未达预期: {d_open}"
+            )
             assert d_open["his_ok"] is True, f"放通网络对照组 HIS 直连应成功却失败: {d_open}"
             assert d_open["notify_res"].get("sent") is True and d_open["notify_res"].get("response", {}).get("errcode") == 0, (
                 f"放通网络对照组直连 HTTPS 通知（含 Test CA 与 IP SAN）应成功却失败: {d_open}"
             )
 
-            # 2b) 隔离应用容器 (internal:true)：同一目标、同一 CA 与配置，在隔离网络内必须因网络不可达失败（绝非 TLS 证书错误）
+            # 2b) 隔离应用容器 (internal:true)：严格确认 TCP 不可达、无 HTTP 状态返回、非 TLS 失败，且不触发上游请求命中
             res_direct = _run(["docker", "exec", c_ids["api"], "python", "-c", direct_script])
             assert res_direct.returncode == 0, f"直连阻断检查异常: {res_direct.stderr}"
             d_dir = json.loads(res_direct.stdout.strip())
-            assert d_dir["his_ok"] is False, f"HISReader 竟允许在隔离网直连绕过代理: {d_dir}"
-            assert d_dir["notify_res"].get("sent") is False and str(d_dir["notify_res"].get("reason", "")).startswith("NETWORK_ERROR:"), (
-                f"send_dingtalk_alert 直连竟未受阻: {d_dir}"
+            _assert_isolated_direct_blocked(d_dir)
+            hits_after_open_and_isolated = len(_run(["docker", "exec", c_ids["mock_notify"], "cat", "/tmp/notify_hits.jsonl"]).stdout.strip().splitlines())
+            assert hits_after_open_and_isolated == hits_before_direct + 2, (
+                f"mock_notify 命中计数异常（仅应来自 api_open 的 raw + notify_res 两次）: before={hits_before_direct}, after={hits_after_open_and_isolated}"
             )
-            assert d_dir["direct_ssl_error"] is False, f"直连失败原因竟为 TLS 证书报错而非网络隔离: {d_dir}"
 
             # edge 侧非内网容器直接访问代理 8443 应返回 403
             edge_res = _run([
@@ -685,21 +755,18 @@ print(json.dumps({"his_ok": his_ok, "notify_res": notify_res}, ensure_ascii=Fals
                 f"恢复 nginx 后 send_dingtalk_alert 未恢复成功: {d_rec}"
             )
 
-            # 5) 核查全部 Nginx 日志与容器输出均无 token/secret/sign，且 access.log 保留 200/403/502 无参路径
-            all_logs = [nginx_logs_before_stop.stdout, nginx_logs_before_stop.stderr]
-            for lf in log_dir.glob("*"):
-                if lf.is_file():
-                    all_logs.append(lf.read_text(encoding="utf-8", errors="ignore"))
-            combined_logs = "\n".join(all_logs)
-            for sensitive in (synth_token, synth_secret, captured_sign, "SYNTH_SIG_403", "SYNTH_EDGE", "access_token=", "sign="):
-                assert sensitive not in combined_logs, f"Nginx 日志发现敏感内容 {sensitive!r}: {combined_logs}"
-            access_txt = (log_dir / "access.log").read_text(encoding="utf-8", errors="ignore") if (log_dir / "access.log").exists() else ""
-            assert "/robot/send" in access_txt and " 200 " in access_txt and " 403 " in access_txt and " 502 " in access_txt, (
-                f"access.log 未完整保留 200/403/502 状态与无参路径: {access_txt}"
+            # 5) 在最终恢复请求完成后、销毁容器前读取重启后的完整容器输出，并合并停代理前日志与挂载日志文件统一检视
+            nginx_logs_after_recover = _run(["docker", "logs", c_ids["nginx"]])
+            _assert_nginx_logs_sanitized(
+                nginx_logs_before_stop.stdout,
+                nginx_logs_before_stop.stderr,
+                nginx_logs_after_recover,
+                log_dir,
+                sensitive_markers=(synth_token, synth_secret, captured_sign, "SYNTH_SIG_403", "SYNTH_EDGE", "access_token=", "sign="),
             )
 
             print("PASS [NET-EGRESS 5 · Isolated Compose App Paths (Open-Net Control OK, Isolated Direct Blocked, Stop/Start Nginx Verified)]:", json.dumps({"via_proxy": d_ok, "open_control_direct": {"his_ok": d_open["his_ok"], "notify_sent": d_open["notify_res"]["sent"]}, "after_nginx_recover": {"his_ok": d_rec["his_ok"], "notify_sent": d_rec["notify_res"]["sent"]}}, ensure_ascii=False))
-            print("PASS [NOTIFY-LOG-001 · Zero Secret Leak Across HTTPS 200/403/502]: access.log sanitized, error_log clean")
+            print("PASS [NOTIFY-LOG-001 · Zero Secret Leak Across HTTPS 200/403/502 & Post-Restart]: access.log + pre/post container logs clean")
         finally:
             _run(compose_base + ["down", "-t", "1", "-v", "--remove-orphans"], timeout=60)
 
