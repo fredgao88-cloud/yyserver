@@ -163,6 +163,19 @@ async def login(req: LoginRequest):
         "role_type": op["role_type"]
     }
 
+@app.get("/api/auth/me", summary="获取当前已登录操作员信息")
+async def auth_me(operator: Dict[str, Any] = Depends(require_roles(*ALL_ROLES))):
+    """基于有效 Bearer 令牌返回当前在岗操作员基础信息与权限标识（绝不返回口令哈希）"""
+    op_rec = get_operator(operator["sub"])
+    return {
+        "operator_id": operator["sub"],
+        "display_name": (op_rec.get("display_name") if op_rec else None) or operator["sub"],
+        "role_type": operator["role"],
+        "dept_scope": operator.get("dept") or "",
+        "doctor_id": operator.get("doctor_id") or "",
+        "can_export_case": bool(op_rec.get("can_export_case")) if op_rec else False,
+    }
+
 @app.post("/api/tools/query_dip_rule", summary="DIP 规则检索与基准测算接口")
 async def query_dip_rule(req: QueryDipRuleRequest, authorization: Optional[str] = Header(None)):
     """

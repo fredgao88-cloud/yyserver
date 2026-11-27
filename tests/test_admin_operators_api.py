@@ -96,3 +96,14 @@ def test_admin_operators_crud_and_self_lockout_guard():
         assert res_other["success"] is True
         assert res_other["status"] == "DISABLED"
         assert mock_status.called
+
+
+def test_auth_me_returns_sanitized_operator_profile():
+    op = {"sub": "ins01", "role": "INSURANCE_OFFICER", "dept": "101", "doctor_id": ""}
+    with patch("api.main.get_operator", return_value={"operator_id": "ins01", "display_name": "王主任", "can_export_case": 1, "password_hash": "SECRET"}):
+        res = asyncio.run(main_mod.auth_me(operator=op))
+        assert res["operator_id"] == "ins01"
+        assert res["display_name"] == "王主任"
+        assert res["role_type"] == "INSURANCE_OFFICER"
+        assert res["can_export_case"] is True
+        assert "password_hash" not in str(res)

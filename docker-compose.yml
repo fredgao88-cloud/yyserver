@@ -34,8 +34,32 @@ services:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./nginx/https.conf:/etc/nginx/conf.d/default.conf:ro
       - ./nginx/ssl:/etc/nginx/ssl:ro
+      - ./web/dist:/usr/share/nginx/html:ro
     depends_on:
       - api
+
+  wg:
+    build: ./wireguard
+    image: hospital-agent-wg:v1.0
+    container_name: hospital_agent_wg
+    restart: unless-stopped
+    networks:
+      - hospital_edge
+    ports:
+      - "51820:51820/udp"
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv4.conf.all.src_valid_mark=1
+    environment:
+      - WG_ENDPOINT_HOST=${WG_ENDPOINT_HOST:-8b000a4b23ee.sn.mynetname.net}
+      - WG_ENDPOINT_PORT=${WG_ENDPOINT_PORT:-51820}
+      - WG_WORKBENCH_IP=${WG_WORKBENCH_IP:-192.168.1.100}
+    volumes:
+      - ./wireguard/config:/etc/wireguard
+    depends_on:
+      - nginx
 
 networks:
   hospital_internal:
