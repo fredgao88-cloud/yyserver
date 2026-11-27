@@ -11,6 +11,7 @@ NET-EGRESS-001 隔离部署出站与健康检查实测验收 (tests/test_net_egr
 """
 import json
 import os
+import re
 import ssl
 import subprocess
 import sys
@@ -141,10 +142,11 @@ def run_net_egress_isolated() -> None:
 
 def _assert_isolated_direct_blocked(probe_result: dict) -> None:
     """
-    NET-EGRESS-001：严格判别隔离网络下的直连失败原因，拒绝把 TCP 可达后的 HTTP 403/500 或 TLS 证书报错误判为网络隔离。
+    NET-EGRESS-001：严格判别隔离网络下的直连失败原因，拒绝把 HIS 1433 TCP 可达后查询失败、或通知 TCP 可达后 HTTP 403/500/TLS 错判为网络隔离。
     """
+    assert probe_result.get("his_tcp_reachable") is False, f"HIS 1433 端口在隔离网竟 TCP 可达: {probe_result}"
     assert probe_result.get("his_ok") is False, f"HISReader 竟允许在隔离网直连绕过代理: {probe_result}"
-    assert probe_result.get("tcp_reachable") is False, f"底层 TCP 连接直连目标成功（未隔离）: {probe_result}"
+    assert probe_result.get("tcp_reachable") is False, f"通知端口底层 TCP 连接直连目标成功（未隔离）: {probe_result}"
     assert probe_result.get("raw_http_status") is None, f"收到直连目标 HTTP 响应 {probe_result.get('raw_http_status')}（网络实际可达）: {probe_result}"
     assert probe_result.get("raw_tls_error") is False, f"直连失败原因为 TLS 证书握手错误而非网络隔离: {probe_result}"
     notify_res = probe_result.get("notify_res") or {}
@@ -153,16 +155,26 @@ def _assert_isolated_direct_blocked(probe_result: dict) -> None:
     )
 
 
+_DINGTALK_SAFE_LOG_RE = re.compile(
+    r'^\S+ - \[[^\]]+\] "(?P<method>[A-Z]+) (?P<uri>\S+) HTTP/[^"]+" (?P<status>\d{3}) (?P<bytes>\d+) \S+$'
+)
+
+
 def _assert_nginx_logs_sanitized(
     pre_stop_stdout: str,
     pre_stop_stderr: str,
     post_restart_logs_res,
     log_dir,
     sensitive_markers,
-    expected_statuses=(" 200 ", " 403 ", " 502 "),
+    expected_records=(
+        ("POST", "/robot/send", 200),
+        ("POST", "/forbidden", 403),
+        ("POST", "/robot/send", 502),
+    ),
 ) -> None:
     """
-    NOTIFY-LOG-001：合并停代理前输出、重启恢复请求后的完整容器输出以及挂载日志文件，确保无任何敏感凭据落盘或输出。
+    NOTIFY-LOG-001：合并停代理前输出、重启恢复请求后的完整容器输出以及挂载日志文件，确保无敏感凭据，
+    并按 dingtalk_safe 格式逐行解析 method / uri / status 列核实各预期场景状态码。
     """
     assert getattr(post_restart_logs_res, "returncode", 1) == 0, (
         f"读取重启恢复后的 nginx 容器日志失败: {getattr(post_restart_logs_res, 'stderr', '')}"
@@ -179,11 +191,19 @@ def _assert_nginx_logs_sanitized(
     combined_logs = "\n".join(all_logs)
     for sensitive in sensitive_markers:
         assert sensitive not in combined_logs, f"Nginx 日志或容器输出发现敏感内容 {sensitive!r}"
+
     access_file = log_dir / "access.log"
     access_txt = access_file.read_text(encoding="utf-8", errors="ignore") if access_file.exists() else ""
-    assert "/robot/send" in access_txt, f"access.log 缺少 /robot/send 记录: {access_txt}"
-    for status_code in expected_statuses:
-        assert status_code in access_txt, f"access.log 缺少状态码 {status_code}: {access_txt}"
+    parsed_records = set()
+    for line in access_txt.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        m = _DINGTALK_SAFE_LOG_RE.match(s)
+        assert m is not None, f"access.log 行不符合 dingtalk_safe 格式: {s!r}"
+        parsed_records.add((m.group("method"), m.group("uri"), int(m.group("status"))))
+    for rec in expected_records:
+        assert rec in parsed_records, f"access.log 缺少预期日志记录 {rec!r}，实际解析集合: {sorted(parsed_records)}"
 
 
 def run_proxy_egress_and_notify_log_isolated():
@@ -587,6 +607,14 @@ tmp_conf.write_text(
 os.environ["FREETDSCONF"] = str(tmp_conf)
 os.environ["HIS_FREETDS_SECTION"] = "hisdb_direct"
 
+his_tcp_reachable = False
+his_tcp_err = ""
+try:
+    with socket.create_connection(("{mock_his_edge_ip}", 1433), timeout=2):
+        his_tcp_reachable = True
+except Exception as exc:
+    his_tcp_err = f"{{type(exc).__name__}}: {{exc}}"
+
 his_ok = False
 his_err = ""
 try:
@@ -630,6 +658,8 @@ notify_res = send_dingtalk_alert(
 )
 
 print(json.dumps({{
+    "his_tcp_reachable": his_tcp_reachable,
+    "his_tcp_err": his_tcp_err,
     "his_ok": his_ok,
     "his_err": his_err,
     "tcp_reachable": tcp_reachable,
@@ -641,19 +671,21 @@ print(json.dumps({{
 """
             hits_before_direct = len(_run(["docker", "exec", c_ids["mock_notify"], "cat", "/tmp/notify_hits.jsonl"]).stdout.strip().splitlines())
 
-            # 2a) 非隔离对照容器 (hospital_edge)：证明证书与 IP SAN、CA 信任、TCP、HTTPS 与 HIS 直连配置全部有效
+            # 2a) 非隔离对照容器 (hospital_edge)：证明 HIS 1433 TCP+查询、通知 TCP+HTTPS(Test CA + IP SAN) 全部直连有效
             res_open = _run(["docker", "exec", c_ids["api_open"], "python", "-c", direct_script])
             assert res_open.returncode == 0, f"放通对照检测异常: {res_open.stderr}\n{res_open.stdout}"
             d_open = json.loads(res_open.stdout.strip())
+            assert d_open["his_tcp_reachable"] is True and d_open["his_ok"] is True, (
+                f"放通网络对照组 HIS TCP/应用查询应全部成功却失败: {d_open}"
+            )
             assert d_open["tcp_reachable"] is True and d_open["raw_http_status"] == 200 and d_open["raw_tls_error"] is False, (
                 f"放通对照组直连 HTTPS TLS/TCP 检查未达预期: {d_open}"
             )
-            assert d_open["his_ok"] is True, f"放通网络对照组 HIS 直连应成功却失败: {d_open}"
             assert d_open["notify_res"].get("sent") is True and d_open["notify_res"].get("response", {}).get("errcode") == 0, (
                 f"放通网络对照组直连 HTTPS 通知（含 Test CA 与 IP SAN）应成功却失败: {d_open}"
             )
 
-            # 2b) 隔离应用容器 (internal:true)：严格确认 TCP 不可达、无 HTTP 状态返回、非 TLS 失败，且不触发上游请求命中
+            # 2b) 隔离应用容器 (internal:true)：严格确认 HIS 1433 与通知 443 均 TCP 不可达、无 HTTP 响应、非 TLS 报错且不命中上游
             res_direct = _run(["docker", "exec", c_ids["api"], "python", "-c", direct_script])
             assert res_direct.returncode == 0, f"直连阻断检查异常: {res_direct.stderr}"
             d_dir = json.loads(res_direct.stdout.strip())
