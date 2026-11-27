@@ -40,6 +40,7 @@ class HISReader:
             raise ValueError("HIS_PASS environment variable must be explicitly configured and non-empty.")
         self.database = os.getenv('HIS_DB', 'his')
         self.charset = 'cp936'
+        self.login_timeout = int(os.getenv('HIS_LOGIN_TIMEOUT', '60'))
 
     def get_connection(self):
         """Establish read-only connection to HIS SQL Server 2012."""
@@ -48,7 +49,8 @@ class HISReader:
             user=self.user,
             password=self.password,
             database=self.database,
-            charset=self.charset
+            charset=self.charset,
+            login_timeout=self.login_timeout,
         )
 
     def get_settled_cases(self, limit: int = 50, department: Optional[str] = None) -> List[Dict[str, Any]]:

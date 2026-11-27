@@ -261,9 +261,11 @@ export async function fetchSettledReconciliation(limit = 50, dept?: string): Pro
   if (dept) params.set('dept', dept);
   const data = await hospitalRequest<unknown>(`/api/reconciliation/settled?${params.toString()}`);
 
-  // RECON-COVER-001：严格校验覆盖计数之和、明细长度与原因数组一致性，拒绝矛盾/残缺对象冒充有效空批次
+  // RECON-COVER-001：严格校验覆盖计数之和、明细长度与原因数组及元素完整性，拒绝矛盾/残缺对象冒充有效空批次或引发模板 TypeError
   const isNonNegInt = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v >= 0;
-  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+  const isNonEmptyStr = (v: unknown): v is string => typeof v === 'string' && v.trim().length > 0;
+  const isPlainObj = (v: unknown): v is Record<string, unknown> => Boolean(v) && typeof v === 'object' && !Array.isArray(v);
+  if (!isPlainObj(data)) {
     throw new HospitalApiError('对账结果读取失败：响应内容无法解析，请重新查询', 502);
   }
   const rep = data as Partial<ReconciliationReport>;
@@ -275,7 +277,9 @@ export async function fetchSettledReconciliation(limit = 50, dept?: string): Pro
     !Array.isArray(rep.unreconciled_reasons) ||
     rep.items.length !== rep.reconciled_count ||
     rep.reconciled_count + rep.unreconciled_count !== rep.sampled_count ||
-    rep.unreconciled_reasons.length !== rep.unreconciled_count
+    rep.unreconciled_reasons.length !== rep.unreconciled_count ||
+    !rep.items.every(item => isPlainObj(item)) ||
+    !rep.unreconciled_reasons.every(item => isPlainObj(item) && isNonEmptyStr(item.visit_id) && isNonEmptyStr(item.reason))
   ) {
     throw new HospitalApiError('对账结果读取失败：核对计数与明细结构不一致，请重新查询', 502);
   }

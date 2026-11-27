@@ -1043,10 +1043,10 @@ async function parseReconReportJson(r) {
   let data = null;
   try { data = await r.json(); } catch (_) { return null; }
   const isCount = (v) => typeof v === "number" && Number.isInteger(v) && v >= 0;
+  const isPlainObj = (v) => Boolean(v) && typeof v === "object" && !Array.isArray(v);
+  const isNonEmptyStr = (v) => typeof v === "string" && v.trim().length > 0;
   if (
-    !data ||
-    typeof data !== "object" ||
-    Array.isArray(data) ||
+    !isPlainObj(data) ||
     !isCount(data.sampled_count) ||
     !isCount(data.reconciled_count) ||
     !isCount(data.unreconciled_count) ||
@@ -1054,7 +1054,9 @@ async function parseReconReportJson(r) {
     !Array.isArray(data.unreconciled_reasons) ||
     data.items.length !== data.reconciled_count ||
     data.reconciled_count + data.unreconciled_count !== data.sampled_count ||
-    data.unreconciled_reasons.length !== data.unreconciled_count
+    data.unreconciled_reasons.length !== data.unreconciled_count ||
+    !data.items.every((item) => isPlainObj(item)) ||
+    !data.unreconciled_reasons.every((item) => isPlainObj(item) && isNonEmptyStr(item.visit_id) && isNonEmptyStr(item.reason))
   ) {
     return null;
   }
