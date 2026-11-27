@@ -189,20 +189,23 @@ async function loadAlerts() {
   const dept = document.getElementById("filterDept").value.trim();
   const url = dept ? "/api/inpatient/alerts?dept=" + encodeURIComponent(dept) : "/api/inpatient/alerts";
   const r = await fetch(url, { headers: authHeaders() });
+  if (myEpoch !== inpAuthEpoch) return;
   if (r.status === 401) {
-    inpAuthEpoch++;
+    const failEpoch = ++inpAuthEpoch;
     clearProtectedInpatientData();
     sessionStorage.removeItem(TOKEN_KEY);
     document.getElementById("mainArea").classList.add("hidden");
     document.getElementById("loginCard").classList.remove("hidden");
     const data = await safeJson(r);
+    if (inpAuthEpoch !== failEpoch) return;
     showMsg(data.detail || "登录已失效，请重新登录", true);
     return;
   }
   if (r.status === 403 || !r.ok) {
-    inpAuthEpoch++;
+    if (mySeq !== inpReqSeq || myEpoch !== inpAuthEpoch) return;
     clearProtectedInpatientData();
     const data = await safeJson(r);
+    if (mySeq !== inpReqSeq || myEpoch !== inpAuthEpoch) return;
     showMsg(data.detail || "无权访问或加载预警失败", true);
     return;
   }
@@ -274,18 +277,21 @@ async function exportInpatientCsv() {
   if (level) qs.push("level=" + encodeURIComponent(level));
   const url = "/api/inpatient/alerts/export" + (qs.length ? "?" + qs.join("&") : "");
   const r = await fetch(url, { headers: authHeaders() });
+  if (myEpoch !== inpAuthEpoch) return;
   if (r.status === 401) {
-    inpAuthEpoch++;
+    const failEpoch = ++inpAuthEpoch;
     clearProtectedInpatientData();
     sessionStorage.removeItem(TOKEN_KEY);
     document.getElementById("mainArea").classList.add("hidden");
     document.getElementById("loginCard").classList.remove("hidden");
     const err = await safeJson(r);
+    if (inpAuthEpoch !== failEpoch) return;
     showMsg(err.detail || "登录已失效，请重新登录", true);
     return;
   }
   if (r.status === 403 || !r.ok) {
     const err = await safeJson(r);
+    if (myEpoch !== inpAuthEpoch) return;
     showMsg(err.detail || "无权导出病例明细（需开通 can_export_case 权限）", true);
     return;
   }
@@ -307,23 +313,27 @@ async function triggerManualScan() {
     headers: { "Content-Type": "application/json", ...authHeaders() },
     body: JSON.stringify({ limit: 50, notify_dingtalk: false })
   });
+  if (myEpoch !== inpAuthEpoch) return;
   if (r.status === 401) {
-    inpAuthEpoch++;
+    const failEpoch = ++inpAuthEpoch;
     clearProtectedInpatientData();
     sessionStorage.removeItem(TOKEN_KEY);
     document.getElementById("mainArea").classList.add("hidden");
     document.getElementById("loginCard").classList.remove("hidden");
     const err = await safeJson(r);
+    if (inpAuthEpoch !== failEpoch) return;
     showMsg(err.detail || "登录已失效，请重新登录", true);
     return;
   }
   if (r.status === 403) {
     const err = await safeJson(r);
+    if (myEpoch !== inpAuthEpoch) return;
     showMsg(err.detail || "无权触发全局扫描（仅限医保办/管理员，本科室预警查看不受影响）", true);
     return;
   }
   if (!r.ok) {
     const err = await safeJson(r);
+    if (myEpoch !== inpAuthEpoch) return;
     showMsg(err.detail || "扫描触发失败", true);
     return;
   }
@@ -454,20 +464,23 @@ async function loadReport() {
   let url = "/api/analytics/doctor-performance?days=" + encodeURIComponent(days);
   if (dept) url += "&dept_id=" + encodeURIComponent(dept);
   const r = await fetch(url, { headers: authHeaders() });
+  if (myEpoch !== anaAuthEpoch) return;
   if (r.status === 401) {
-    anaAuthEpoch++;
+    const failEpoch = ++anaAuthEpoch;
     clearProtectedAnalyticsData();
     sessionStorage.removeItem(TOKEN_KEY);
     document.getElementById("mainArea").classList.add("hidden");
     document.getElementById("loginCard").classList.remove("hidden");
     const data = await safeJson(r);
+    if (anaAuthEpoch !== failEpoch) return;
     showMsg(data.detail || "登录已失效，请重新登录", true);
     return;
   }
   if (r.status === 403 || !r.ok) {
-    anaAuthEpoch++;
+    if (mySeq !== anaReqSeq || myEpoch !== anaAuthEpoch) return;
     clearProtectedAnalyticsData();
     const data = await safeJson(r);
+    if (mySeq !== anaReqSeq || myEpoch !== anaAuthEpoch) return;
     showMsg(data.detail || "无权访问或加载报表失败", true);
     return;
   }
@@ -1026,6 +1039,23 @@ let cachedRecon = [];
 let reconReqSeq = 0;
 let reconAuthEpoch = 0;
 async function safeReconJson(r) { try { return await r.json(); } catch (_) { return {}; } }
+async function parseReconReportJson(r) {
+  let data = null;
+  try { data = await r.json(); } catch (_) { return null; }
+  const isCount = (v) => typeof v === "number" && Number.isInteger(v) && v >= 0;
+  if (
+    !data ||
+    typeof data !== "object" ||
+    Array.isArray(data) ||
+    !isCount(data.sampled_count) ||
+    !isCount(data.reconciled_count) ||
+    !isCount(data.unreconciled_count) ||
+    !Array.isArray(data.items)
+  ) {
+    return null;
+  }
+  return data;
+}
 function showMsg(text, isErr) {
   const el = document.getElementById("msg");
   el.textContent = text;
@@ -1070,30 +1100,38 @@ async function loadRecon() {
   let url = "/api/reconciliation/settled?limit=" + encodeURIComponent(limit);
   if (dept) url += "&dept=" + encodeURIComponent(dept);
   const r = await fetch(url, { headers: authHeaders() });
+  if (myEpoch !== reconAuthEpoch) return;
   if (r.status === 401) {
-    reconAuthEpoch++;
+    const failEpoch = ++reconAuthEpoch;
     clearProtectedReconData();
     sessionStorage.removeItem(TOKEN_KEY);
     document.getElementById("mainArea").classList.add("hidden");
     document.getElementById("loginCard").classList.remove("hidden");
     const err = await safeReconJson(r);
+    if (reconAuthEpoch !== failEpoch) return;
     showMsg(err.detail || "登录已失效，请重新登录", true);
     return;
   }
   if (r.status === 403 || !r.ok) {
-    reconAuthEpoch++;
+    if (mySeq !== reconReqSeq || myEpoch !== reconAuthEpoch) return;
     clearProtectedReconData();
     const err = await safeReconJson(r);
+    if (mySeq !== reconReqSeq || myEpoch !== reconAuthEpoch) return;
     showMsg(err.detail || "无权访问出院对账（仅限医保办/管理员）", true);
     return;
   }
   if (mySeq !== reconReqSeq || myEpoch !== reconAuthEpoch) return;
-  const data = await safeReconJson(r);
+  const data = await parseReconReportJson(r);
   if (mySeq !== reconReqSeq || myEpoch !== reconAuthEpoch) return;
-  cachedRecon = data.items || [];
-  const sampled = data.sampled_count != null ? data.sampled_count : (data.total || 0);
-  const reconciled = data.reconciled_count != null ? data.reconciled_count : (data.total || 0);
-  const unreconciled = data.unreconciled_count != null ? data.unreconciled_count : 0;
+  if (!data) {
+    clearProtectedReconData();
+    showMsg("对账结果读取失败：响应内容无法解析或缺少核对计数，请重新查询", true);
+    return;
+  }
+  cachedRecon = data.items;
+  const sampled = data.sampled_count;
+  const reconciled = data.reconciled_count;
+  const unreconciled = data.unreconciled_count;
   document.getElementById("rSampled").textContent = String(sampled);
   document.getElementById("rTotal").textContent = String(reconciled);
   document.getElementById("rUnrecon").textContent = String(unreconciled);
@@ -1155,18 +1193,21 @@ async function exportReconCsv() {
   if (dept) qs.push("dept=" + encodeURIComponent(dept));
   if (st) qs.push("status=" + encodeURIComponent(st));
   const r = await fetch("/api/reconciliation/settled/export?" + qs.join("&"), { headers: authHeaders() });
+  if (myEpoch !== reconAuthEpoch) return;
   if (r.status === 401) {
-    reconAuthEpoch++;
+    const failEpoch = ++reconAuthEpoch;
     clearProtectedReconData();
     sessionStorage.removeItem(TOKEN_KEY);
     document.getElementById("mainArea").classList.add("hidden");
     document.getElementById("loginCard").classList.remove("hidden");
     const err = await safeReconJson(r);
+    if (reconAuthEpoch !== failEpoch) return;
     showMsg(err.detail || "登录已失效，请重新登录", true);
     return;
   }
   if (r.status === 403 || !r.ok) {
     const err = await safeReconJson(r);
+    if (myEpoch !== reconAuthEpoch) return;
     showMsg(err.detail || "无权导出对账明细（需开通 can_export_case 权限）", true);
     return;
   }

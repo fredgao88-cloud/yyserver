@@ -16,6 +16,7 @@ services:
       - LOCAL_DB_USER=${LOCAL_DB_USER:-sa}
       - LOCAL_DB_PASS=${LOCAL_DB_PASS}
       - LOCAL_DB_NAME=${LOCAL_DB_NAME:-his_agent_db}
+      - HIS_FREETDS_SECTION=${HIS_FREETDS_SECTION:-hisdb_proxy}
     volumes:
       - .:/opt/hospital-agent
 
@@ -30,6 +31,7 @@ services:
       - "80:80"
       - "443:443"
     volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./nginx/https.conf:/etc/nginx/conf.d/default.conf:ro
       - ./nginx/ssl:/etc/nginx/ssl:ro
     depends_on:

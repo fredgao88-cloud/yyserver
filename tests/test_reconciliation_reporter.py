@@ -124,8 +124,14 @@ def test_reconciliation_ui_and_rbac_protection():
     assert "出院决算账实对账" in body
     assert "clearProtectedReconData" in body
     assert "reconReqSeq" in body and "reconAuthEpoch" in body and "safeReconJson" in body
+    assert "parseReconReportJson" in body and "对账结果读取失败" in body
     load_section = body[body.index("async function loadRecon()"):body.index("function renderReconRows(")]
+    export_section = body[body.index("async function exportReconCsv()"):body.index("if (getToken())")]
+    assert load_section.index("if (myEpoch !== reconAuthEpoch) return;") < load_section.index("if (r.status === 401)")
     assert load_section.index("if (r.status === 401)") < load_section.index("await safeReconJson(r)")
+    assert load_section.index("await parseReconReportJson(r)") < load_section.index("已完成 SERIALIZABLE")
+    assert export_section.index("if (myEpoch !== reconAuthEpoch) return;") < export_section.index("if (r.status === 401)")
+    assert export_section.index("if (r.status === 401)") < export_section.index("await safeReconJson(r)")
     assert 'id="rSampled"' in body and 'id="rUnrecon"' in body and "unreconBanner" in body
     assert "部分完成" in body
     assert "http://" not in body and "https://" not in body
