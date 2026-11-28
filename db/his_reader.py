@@ -575,15 +575,22 @@ class HISReader:
         finally:
             conn.close()
 
-    def get_active_inpatients(self, department: Optional[str] = None, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    def get_active_inpatients(
+        self,
+        department: Optional[str] = None,
+        limit: Optional[int] = None,
+        return_meta: bool = False,
+    ) -> Any:
         """
         Fetch currently admitted patients (not yet discharged or settled).
         Identified where his_bl_sy.cysj IS NULL, or by active clinical fee activity without settlement.
+        When limit is set, probes limit+1 rows so callers know accurately whether truncation occurred.
         """
         conn = self.get_connection()
         cur = conn.cursor(as_dict=True)
         try:
-            top_clause = f"TOP ({int(limit)})" if limit else ""
+            probe_limit = (int(limit) + 1) if limit is not None else None
+            top_clause = f"TOP ({probe_limit})" if probe_limit else ""
             sql = f"""
             SELECT DISTINCT {top_clause}
                 sy.lsh AS zyh,
@@ -627,7 +634,18 @@ class HISReader:
 
             sql += " ORDER BY sy.rysj DESC"
             cur.execute(sql, tuple(params))
-            return cur.fetchall()
+            rows = cur.fetchall()
+            is_truncated = False
+            if limit is not None and len(rows) > int(limit):
+                rows = rows[:int(limit)]
+                is_truncated = True
+            if return_meta:
+                return rows, {
+                    "scan_limit": int(limit) if limit is not None else None,
+                    "total_scanned": len(rows),
+                    "is_truncated": is_truncated,
+                }
+            return rows
         finally:
             conn.close()
 

@@ -171,7 +171,29 @@ class InpatientScanner:
         else:
             active_limit = 50 if limit is None else limit
             month_meta["scan_limit"] = active_limit
-            active_inpatients = self.his_reader.get_active_inpatients(department=department, limit=active_limit)
+            try:
+                active_res = self.his_reader.get_active_inpatients(
+                    department=department,
+                    limit=active_limit,
+                    return_meta=True,
+                )
+            except TypeError:
+                active_res = self.his_reader.get_active_inpatients(
+                    department=department,
+                    limit=active_limit,
+                )
+            if isinstance(active_res, tuple) and len(active_res) == 2:
+                active_inpatients, act_meta = active_res
+                month_meta["is_truncated"] = bool((act_meta or {}).get("is_truncated"))
+                if act_meta and "scan_limit" in act_meta:
+                    month_meta["scan_limit"] = act_meta["scan_limit"]
+            else:
+                active_inpatients = list(active_res or [])
+                if active_limit is not None and len(active_inpatients) > active_limit:
+                    active_inpatients = active_inpatients[:active_limit]
+                    month_meta["is_truncated"] = True
+                else:
+                    month_meta["is_truncated"] = False
             patients_to_scan.extend(active_inpatients)
 
             # Strictly decouple: Only include settled cases when explicitly requested (e.g. for replay/backtesting)

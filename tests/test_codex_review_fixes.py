@@ -475,12 +475,12 @@ def test_monthly_alerts_scope_sql_filter_offline():
         res_m = asyncio.run(main_mod.get_inpatient_alerts(dept=None, scope="month", year_month="2026-11", operator={"sub": "admin", "role": "ADMIN", "dept": ""}))
         assert res_m["scope"] == "month"
         assert res_m["year_month"] == "2026-11"
-        assert any("batch_id LIKE %s" in s and p == ("MONTH_202611_%",) for s, p in executed)
+        assert any("batch_id LIKE" in s and p and p[0] == "MONTH_202611_%" for s, p in executed)
 
         executed.clear()
         res_a = asyncio.run(main_mod.get_inpatient_alerts(dept=None, scope="active", operator={"sub": "admin", "role": "ADMIN", "dept": ""}))
         assert res_a["scope"] == "active"
-        assert any("NOT LIKE 'MONTH_%'" in s for s, _ in executed)
+        assert any("batch_id NOT LIKE" in s for s, _ in executed)
 
 
 def test_auth_attend_001_split_inferred_vs_authoritative_offline():
@@ -1045,3 +1045,286 @@ def test_month_total_001_batch_truncation_persistence_and_csv_offline():
         assert c_cap.headers.get("X-DIP-Is-Truncated") == "true"
         assert c_cap.headers.get("X-DIP-Scan-Limit") == "200"
         assert "截断(上限200/已扫200例)" in c_cap.body.decode("utf-8")
+
+
+def test_month_total_001_active_probe_100_vs_101_and_unknown_legacy_offline():
+    from db.his_reader import HISReader
+    from tools.inpatient_scanner import InpatientScanner
+
+    def _make_pat(i):
+        return {
+            "zyh": f"ACT_PROBE_{i:03d}",
+            "patient_name": f"P{i}",
+            "gender": "男",
+            "age": 50,
+            "current_dept_id": "1",
+            "current_dept": "消化内科",
+            "current_bed": "01床",
+            "admission_time": datetime(2026, 11, 20, 8, 0, 0),
+            "current_stay_days": 2,
+            "auth_attending_doctor_id": "100",
+            "attending_doctor_id": "100",
+            "attending_doctor": "医生",
+            "admission_diag_code": "K63.500",
+            "admission_diag_name": "结肠息肉",
+            "ssmc1": None, "ssmc2": None, "ssmc3": None,
+            "ylzffs": "1", "insurance_type": "自费",
+        }
+
+    for count_in_db, expected_len, expected_trunc in [(100, 100, False), (101, 100, True)]:
+        class _ActCur:
+            def __init__(self, n=count_in_db):
+                self._n = n
+
+            def execute(self, sql, params=None):
+                assert "TOP (101)" in str(sql)
+
+            def fetchall(self):
+                return [_make_pat(i) for i in range(1, self._n + 1)]
+
+        class _ActConn:
+            def cursor(self, as_dict=True):
+                return _ActCur()
+
+            def close(self):
+                pass
+
+        reader = HISReader()
+        with patch.object(reader, "get_connection", return_value=_ActConn()), \
+             patch.object(reader, "get_active_patient_fee", return_value={"total_fee": Decimal("100.00"), "has_activity": True}):
+            scanner = InpatientScanner()
+            scanner.his_reader = reader
+            with patch("tools.inpatient_scanner.get_local_db_connection", return_value=(MagicMock(), MagicMock())):
+                s_res = scanner.scan_and_snapshot(scope="active", limit=100)
+                assert s_res["total_scanned"] == expected_len
+                assert s_res["scan_limit"] == 100
+                assert s_res["is_truncated"] is expected_trunc
+
+    # Legacy batch with NO row in dbo.inpatient_scan_batch -> is_truncated=None ('unknown'), NOT 'false' / '全量'
+    class _LegacyNoMetaCur:
+        def __init__(self):
+            self._one = None
+            self._all = []
+
+        def execute(self, sql, params=None):
+            s = str(sql)
+            if "SELECT TOP 1 batch_id" in s:
+                self._one = {"batch_id": "BATCH_LEGACY_NO_META", "data_cutoff_time": datetime(2026, 11, 20, 8, 0, 0), "synced_at": datetime(2026, 11, 20, 8, 0, 0), "has_batch_meta": 0}
+            elif "OBJECT_ID('dbo.inpatient_scan_batch'" in s:
+                self._one = {"has_dn": 1, "has_batch_tbl": 1}
+            elif "FROM dbo.inpatient_scan_batch WHERE batch_id = %s" in s:
+                self._one = None
+            elif "FROM dbo.inpatient_dip_snapshot" in s:
+                self._all = [
+                    {
+                        "visit_id": f"LEG_{i}", "ward_name": "内科", "bed_no": "01", "dept_id": "1",
+                        "dept_name": "内科", "doctor_id": "D1", "doctor_name": "医生", "age": 50,
+                        "ins_type": "职工", "primary_icd": "M17.9", "matched_rule_id": None,
+                        "current_fee": Decimal("100.00"), "target_base": None, "fee_ratio": None,
+                        "alert_level": "PENDING", "pending_reason": "MISSING_OPERATION",
+                        "data_cutoff_time": datetime(2026, 11, 20, 8, 0, 0),
+                    }
+                    for i in range(9)
+                ]
+
+        def fetchone(self):
+            return self._one
+
+        def fetchall(self):
+            return self._all
+
+    class _LegacyConn:
+        def cursor(self, as_dict=True):
+            return _LegacyNoMetaCur()
+
+        def close(self):
+            pass
+
+    with patch.object(main_mod, "get_local_db_connection", return_value=(_LegacyNoMetaCur(), _LegacyConn())), \
+         patch.object(main_mod, "get_operator", return_value={"operator_id": "admin", "dept_scope": "", "can_export_case": True}), \
+         patch.object(main_mod, "record_audit_log"):
+        leg_json = asyncio.run(main_mod.get_inpatient_alerts(dept=None, scope="active", operator={"sub": "admin", "role": "ADMIN", "dept": ""}))
+        assert leg_json["is_truncated"] is None and leg_json["has_batch_meta"] is False and leg_json["total_scanned"] is None
+        leg_csv = asyncio.run(main_mod.export_inpatient_alerts_csv(dept=None, level=None, scope="active", operator={"sub": "admin", "role": "ADMIN", "dept": ""}))
+        assert leg_csv.headers.get("X-DIP-Is-Truncated") == "unknown"
+        assert "未知(旧批次无完整度元数据)" in leg_csv.body.decode("utf-8")
+
+
+def test_snap_empty_001_one_row_then_zero_row_batch_offline():
+    import sqlite3
+
+    # Build an in-memory SQLite mirror of inpatient_scan_batch + inpatient_dip_snapshot
+    # verifying both active and month select the newer 0-row batch over the older 1-row batch.
+    sconn = sqlite3.connect(":memory:")
+    sconn.row_factory = sqlite3.Row
+    sconn.execute("CREATE TABLE batches (batch_id TEXT, scope TEXT, year_month TEXT, scan_limit INTEGER, total_scanned INTEGER, is_truncated INTEGER, data_cutoff_time TEXT, synced_at TEXT)")
+    sconn.execute("CREATE TABLE snaps (batch_id TEXT, visit_id TEXT, ward_name TEXT, bed_no TEXT, dept_id TEXT, dept_name TEXT, doctor_id TEXT, doctor_name TEXT, age INTEGER, ins_type TEXT, primary_icd TEXT, matched_rule_id INTEGER, current_fee REAL, target_base REAL, fee_ratio REAL, alert_level TEXT, pending_reason TEXT, data_cutoff_time TEXT, synced_at TEXT)")
+
+    # Batch 1 (1 row) -> Batch 2 (0 rows, newer) for BOTH active and month
+    sconn.executemany(
+        "INSERT INTO batches VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            ("BATCH_OLD_1ROW", "active", None, 50, 1, 0, "2026-11-28 08:00:00", "2026-11-28 08:00:00"),
+            ("BATCH_NEW_0ROW", "active", None, 50, 0, 0, "2026-11-28 09:00:00", "2026-11-28 09:00:00"),
+            ("MONTH_202611_OLD_1ROW", "month", "2026-11", None, 1, 0, "2026-11-28 08:00:00", "2026-11-28 08:00:00"),
+            ("MONTH_202611_NEW_0ROW", "month", "2026-11", None, 0, 0, "2026-11-28 09:00:00", "2026-11-28 09:00:00"),
+        ],
+    )
+    sconn.executemany(
+        "INSERT INTO snaps VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            ("BATCH_OLD_1ROW", "ZY_ACT_1", "内科", "01", "1", "内科", "100", "医生", 50, "职工", "M17.9", None, 100.0, None, None, "PENDING", "TEST", "2026-11-28 08:00:00", "2026-11-28 08:00:00"),
+            ("MONTH_202611_OLD_1ROW", "ZY_MON_1", "内科", "01", "1", "内科", "100", "医生", 50, "职工", "M17.9", None, 100.0, None, None, "PENDING", "TEST", "2026-11-28 08:00:00", "2026-11-28 08:00:00"),
+        ],
+    )
+
+    class _EmptyCur:
+        def __init__(self):
+            self._one = None
+            self._all = []
+
+        def execute(self, sql, params=None):
+            s = str(sql)
+            if "SELECT TOP 1 batch_id" in s:
+                pat, excl, sc, ym = params[0], params[1], params[2], params[3]
+                row = sconn.execute(
+                    """
+                    SELECT batch_id, data_cutoff_time, synced_at, scope, year_month, scan_limit, total_scanned, is_truncated, has_batch_meta
+                    FROM (
+                        SELECT batch_id, data_cutoff_time, synced_at, scope, year_month, scan_limit, total_scanned, is_truncated, 1 AS has_batch_meta
+                        FROM batches
+                        WHERE batch_id LIKE ? AND scope = ? AND (? IS NULL OR year_month = ?)
+                        UNION ALL
+                        SELECT batch_id, MAX(data_cutoff_time), MAX(synced_at), NULL, NULL, NULL, NULL, NULL, 0
+                        FROM snaps
+                        WHERE batch_id LIKE ? AND (? = '' OR batch_id NOT LIKE ?)
+                          AND NOT EXISTS (SELECT 1 FROM batches b WHERE b.batch_id = snaps.batch_id)
+                        GROUP BY batch_id
+                    )
+                    ORDER BY synced_at DESC LIMIT 1
+                    """,
+                    (pat, sc, ym, ym, pat, excl, excl),
+                ).fetchone()
+                self._one = dict(row) if row else None
+                if self._one and isinstance(self._one.get("synced_at"), str):
+                    self._one["synced_at"] = datetime.fromisoformat(self._one["synced_at"])
+                    self._one["data_cutoff_time"] = datetime.fromisoformat(self._one["data_cutoff_time"])
+            elif "OBJECT_ID('dbo.inpatient_scan_batch'" in s:
+                self._one = {"has_dn": 1, "has_batch_tbl": 1}
+            elif "FROM dbo.inpatient_dip_snapshot" in s:
+                bid = params[0]
+                self._all = [dict(r) for r in sconn.execute("SELECT * FROM snaps WHERE batch_id = ?", (bid,)).fetchall()]
+
+        def fetchone(self):
+            return self._one
+
+        def fetchall(self):
+            return self._all
+
+    class _EmptyConn:
+        def cursor(self, as_dict=True):
+            return _EmptyCur()
+
+        def close(self):
+            pass
+
+    with patch.object(main_mod, "get_local_db_connection", side_effect=lambda as_dict=True: (_EmptyCur(), _EmptyConn())), \
+         patch.object(main_mod, "get_operator", return_value={"operator_id": "admin", "dept_scope": "", "can_export_case": True}), \
+         patch.object(main_mod, "record_audit_log"):
+        for sc_name, ym_arg, exp_bid in [("active", None, "BATCH_NEW_0ROW"), ("month", "2026-11", "MONTH_202611_NEW_0ROW")]:
+            res = asyncio.run(main_mod.get_inpatient_alerts(dept=None, scope=sc_name, year_month=ym_arg, operator={"sub": "admin", "role": "ADMIN", "dept": ""}))
+            assert res["batch_id"] == exp_bid
+            assert res["total"] == 0 and res["total_scanned"] == 0 and res["items"] == []
+            csv_r = asyncio.run(main_mod.export_inpatient_alerts_csv(dept=None, level=None, scope=sc_name, year_month=ym_arg, operator={"sub": "admin", "role": "ADMIN", "dept": ""}))
+            assert csv_r.headers.get("X-DIP-Batch-Id") == exp_bid
+            assert csv_r.headers.get("X-DIP-Total-Scanned") == "0"
+    sconn.close()
+
+
+def test_snap_count_001_dept_head_cannot_see_hospital_total_offline():
+    snaps = [
+        {"visit_id": "D1_P1", "ward_name": "一科", "bed_no": "01", "dept_id": "101", "dept_name": "消化内科", "doctor_id": "1", "doctor_name": "A", "age": 50, "ins_type": "居民", "primary_icd": "K63.500", "matched_rule_id": 101, "current_fee": Decimal("1000.00"), "target_base": Decimal("2161.32"), "fee_ratio": Decimal("0.46"), "alert_level": "GREEN", "pending_reason": None, "data_cutoff_time": datetime(2026, 11, 28, 9, 0, 0)},
+        {"visit_id": "D1_P2", "ward_name": "一科", "bed_no": "02", "dept_id": "101", "dept_name": "消化内科", "doctor_id": "1", "doctor_name": "A", "age": 50, "ins_type": "居民", "primary_icd": "K63.500", "matched_rule_id": 101, "current_fee": Decimal("1200.00"), "target_base": Decimal("2161.32"), "fee_ratio": Decimal("0.55"), "alert_level": "GREEN", "pending_reason": None, "data_cutoff_time": datetime(2026, 11, 28, 9, 0, 0)},
+        {"visit_id": "D2_P1", "ward_name": "二科", "bed_no": "03", "dept_id": "102", "dept_name": "中医科", "doctor_id": "2", "doctor_name": "B", "age": 68, "ins_type": "职工", "primary_icd": "M17.9", "matched_rule_id": 85, "current_fee": Decimal("2500.00"), "target_base": Decimal("2790.90"), "fee_ratio": Decimal("0.89"), "alert_level": "GREEN", "pending_reason": None, "data_cutoff_time": datetime(2026, 11, 28, 9, 0, 0)},
+        {"visit_id": "D2_P2", "ward_name": "二科", "bed_no": "04", "dept_id": "102", "dept_name": "中医科", "doctor_id": "2", "doctor_name": "B", "age": 68, "ins_type": "职工", "primary_icd": "M17.9", "matched_rule_id": 85, "current_fee": Decimal("2600.00"), "target_base": Decimal("2790.90"), "fee_ratio": Decimal("0.93"), "alert_level": "YELLOW", "pending_reason": None, "data_cutoff_time": datetime(2026, 11, 28, 9, 0, 0)},
+        {"visit_id": "D2_P3", "ward_name": "二科", "bed_no": "05", "dept_id": "102", "dept_name": "中医科", "doctor_id": "2", "doctor_name": "B", "age": 68, "ins_type": "职工", "primary_icd": "M17.9", "matched_rule_id": 85, "current_fee": Decimal("3200.00"), "target_base": Decimal("2790.90"), "fee_ratio": Decimal("1.14"), "alert_level": "RED", "pending_reason": None, "data_cutoff_time": datetime(2026, 11, 28, 9, 0, 0)},
+    ]
+
+    class _CntCur:
+        def __init__(self):
+            self._one = None
+            self._all = []
+
+        def execute(self, sql, params=None):
+            s = str(sql)
+            if "SELECT TOP 1 batch_id" in s:
+                self._one = {"batch_id": "MONTH_202611_BOTH", "data_cutoff_time": datetime(2026, 11, 28, 9, 0, 0), "synced_at": datetime(2026, 11, 28, 9, 0, 0), "scope": "month", "year_month": "2026-11", "scan_limit": None, "total_scanned": 5, "is_truncated": 0, "has_batch_meta": 1}
+            elif "OBJECT_ID('dbo.inpatient_scan_batch'" in s:
+                self._one = {"has_dn": 1, "has_batch_tbl": 1}
+            elif "FROM dbo.inpatient_dip_snapshot" in s:
+                if "AND dept_id IN" in s:
+                    allowed = set(params[1:])
+                    self._all = [r for r in snaps if r["dept_id"] in allowed]
+                else:
+                    self._all = list(snaps)
+
+        def fetchone(self):
+            return self._one
+
+        def fetchall(self):
+            return self._all
+
+    class _CntConn:
+        def close(self):
+            pass
+
+    operators = {
+        "dh101": {"operator_id": "dh101", "role_type": "DEPT_HEAD", "dept_scope": "101", "can_export_case": True},
+        "admin": {"operator_id": "admin", "role_type": "ADMIN", "dept_scope": "", "can_export_case": True},
+    }
+    with patch.object(main_mod, "get_local_db_connection", side_effect=lambda as_dict=True: (_CntCur(), _CntConn())), \
+         patch.object(main_mod, "get_operator", side_effect=lambda o: operators.get(o)), \
+         patch.object(main_mod, "get_authorized_dept_ids", return_value={"101"}), \
+         patch.object(main_mod, "record_audit_log"):
+        dh_json = asyncio.run(main_mod.get_inpatient_alerts(dept=None, scope="month", year_month="2026-11", operator={"sub": "dh101", "role": "DEPT_HEAD", "dept": "101"}))
+        assert dh_json["authorized_scope"] == "DEPARTMENT"
+        assert dh_json["total"] == 2 and dh_json["total_scanned"] == 2
+        assert len(dh_json["items"]) == 2
+        dh_csv = asyncio.run(main_mod.export_inpatient_alerts_csv(dept=None, level=None, scope="month", year_month="2026-11", operator={"sub": "dh101", "role": "DEPT_HEAD", "dept": "101"}))
+        dh_body = dh_csv.body.decode("utf-8")
+        assert dh_csv.headers.get("X-DIP-Total-Scanned") == "2"
+        assert dh_csv.headers.get("X-DIP-Authorized-Scope") == "DEPARTMENT"
+        assert "本科可见2例(全批完整)" in dh_body
+        assert "共5例" not in dh_body and "D2_" not in dh_body
+
+        adm_json = asyncio.run(main_mod.get_inpatient_alerts(dept=None, scope="month", year_month="2026-11", operator={"sub": "admin", "role": "ADMIN", "dept": ""}))
+        assert adm_json["authorized_scope"] == "HOSPITAL"
+        assert adm_json["total"] == 5 and adm_json["total_scanned"] == 5
+        adm_csv = asyncio.run(main_mod.export_inpatient_alerts_csv(dept=None, level=None, scope="month", year_month="2026-11", operator={"sub": "admin", "role": "ADMIN", "dept": ""}))
+        assert adm_csv.headers.get("X-DIP-Total-Scanned") == "5"
+        assert "全量(共5例)" in adm_csv.body.decode("utf-8")
+
+
+def test_deploy_key_001_compose_volume_resolution_and_isolation():
+    """DEPLOY-KEY-001: Compose target volume resolves per project, blocks mismatch, and stays isolated from API."""
+    import subprocess
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    assert not os.path.exists("/etc/wireguard")
+
+    compose_path = os.path.join(repo_root, "docker-compose.yml")
+    if os.path.exists(compose_path):
+        compose_txt = open(compose_path, "r", encoding="utf-8").read()
+        assert "wireguard_config:/etc/wireguard" in compose_txt
+        api_block = compose_txt.split("\n  wg:")[0]
+        assert "wireguard_config" not in api_block
+
+    script_path = os.path.join(repo_root, "wireguard", "migrate_to_volume.sh")
+    if os.path.exists(script_path):
+        proc = subprocess.run(
+            ["sh", script_path, "-f", compose_path, "-p", "proj_alpha", "--volume", "wrong_volume_name", "--verify-only"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+        assert proc.returncode != 0
+        assert "mismatch" in (proc.stderr + proc.stdout).lower()

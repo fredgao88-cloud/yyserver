@@ -467,21 +467,36 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
 
     cursor, conn = get_local_db_connection(as_dict=True)
     try:
-        if scope_val == "month":
-            ym_prefix = f"MONTH_{target_ym.replace('-', '')}_%"
-            cursor.execute("""
+        # SNAP-EMPTY-001：优先从 dbo.inpatient_scan_batch 按范围/月份选取最新已完成批次（支持 0 例最新批次覆盖旧批次），
+        # 并通过 NOT EXISTS 兼容无批次元数据的历史遗留明细批次（has_batch_meta=0 -> is_truncated=None 未知）。
+        pat_filter = f"MONTH_{target_ym.replace('-', '')}_%" if scope_val == "month" else "%"
+        excl_filter = "" if scope_val == "month" else "MONTH_%"
+        cursor.execute("""
+        IF OBJECT_ID(N'dbo.inpatient_scan_batch', N'U') IS NOT NULL
+            EXEC sp_executesql
+                N'SELECT TOP 1 batch_id, data_cutoff_time, synced_at, scope, year_month, scan_limit, total_scanned, is_truncated, CAST(has_batch_meta AS BIT) AS has_batch_meta
+                  FROM (
+                      SELECT batch_id, data_cutoff_time, synced_at, scope, year_month, scan_limit, total_scanned, is_truncated, 1 AS has_batch_meta
+                      FROM dbo.inpatient_scan_batch
+                      WHERE batch_id LIKE @pat AND scope = @sc AND (@ym IS NULL OR year_month = @ym)
+                      UNION ALL
+                      SELECT batch_id, MAX(data_cutoff_time) AS data_cutoff_time, MAX(synced_at) AS synced_at,
+                             CAST(NULL AS NVARCHAR(16)) AS scope, CAST(NULL AS NVARCHAR(7)) AS year_month,
+                             CAST(NULL AS INT) AS scan_limit, CAST(NULL AS INT) AS total_scanned, CAST(NULL AS BIT) AS is_truncated, 0 AS has_batch_meta
+                      FROM dbo.inpatient_dip_snapshot
+                      WHERE batch_id LIKE @pat AND (@excl = N'''' OR batch_id NOT LIKE @excl)
+                        AND NOT EXISTS (SELECT 1 FROM dbo.inpatient_scan_batch b WHERE b.batch_id = dbo.inpatient_dip_snapshot.batch_id)
+                      GROUP BY batch_id
+                  ) combined
+                  ORDER BY synced_at DESC',
+                N'@pat NVARCHAR(80), @excl NVARCHAR(80), @sc NVARCHAR(16), @ym NVARCHAR(7)',
+                @pat = %s, @excl = %s, @sc = %s, @ym = %s
+        ELSE
             SELECT TOP 1 batch_id, data_cutoff_time, synced_at
             FROM dbo.inpatient_dip_snapshot
-            WHERE batch_id LIKE %s
+            WHERE batch_id LIKE %s AND (%s = '' OR batch_id NOT LIKE %s)
             ORDER BY synced_at DESC
-            """, (ym_prefix,))
-        else:
-            cursor.execute("""
-            SELECT TOP 1 batch_id, data_cutoff_time, synced_at
-            FROM dbo.inpatient_dip_snapshot
-            WHERE batch_id NOT LIKE 'MONTH_%'
-            ORDER BY synced_at DESC
-            """)
+        """, (pat_filter, excl_filter, scope_val, target_ym, pat_filter, excl_filter, excl_filter))
         latest_batch = cursor.fetchone()
 
         if not latest_batch:
@@ -490,6 +505,11 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
                 "scope": scope_val,
                 "year_month": target_ym,
                 "total": 0,
+                "total_scanned": None if role != ROLE_DEPT_HEAD else 0,
+                "scan_limit": None,
+                "is_truncated": None,
+                "has_batch_meta": False,
+                "authorized_scope": "DEPARTMENT" if role == ROLE_DEPT_HEAD else "HOSPITAL",
                 "batch_id": None,
                 "batch_time": None,
                 "is_stale": True,
@@ -520,7 +540,9 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
         dn_row = cursor.fetchone() or {}
         doc_name_col = ", doctor_name" if dn_row.get("has_dn") is not None else ""
         batch_meta: Dict[str, Any] = {}
-        if dn_row.get("has_batch_tbl") is not None:
+        if latest_batch.get("has_batch_meta"):
+            batch_meta = latest_batch
+        elif dn_row.get("has_batch_tbl") is not None:
             cursor.execute(
                 "SELECT scope, year_month, scan_limit, total_scanned, is_truncated "
                 "FROM dbo.inpatient_scan_batch WHERE batch_id = %s",
@@ -604,18 +626,30 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
                 "ratio_percent": float(ratio_dec) if ratio_dec is not None else None
             })
 
-        meta_total_scanned = batch_meta.get("total_scanned")
-        meta_scan_limit = batch_meta.get("scan_limit")
-        meta_is_truncated = bool(batch_meta.get("is_truncated")) if batch_meta else False
+        has_meta = bool(batch_meta)
+        meta_total_scanned = batch_meta.get("total_scanned") if has_meta else None
+        meta_scan_limit = batch_meta.get("scan_limit") if has_meta else None
+        # MONTH-TOTAL-001：明确区分 False（完整）、True（截断）、None（旧批次无元数据时未知）
+        meta_is_truncated: Optional[bool] = (bool(batch_meta.get("is_truncated")) if has_meta else None)
+
+        # SNAP-COUNT-001：仅管理员/医保办接收全院扫描总数 total_scanned；科室主任仅接收本科授权可见数，严禁泄漏全院计数
+        if role == ROLE_DEPT_HEAD:
+            exposed_total_scanned: Optional[int] = len(items)
+            authorized_scope = "DEPARTMENT"
+        else:
+            exposed_total_scanned = int(meta_total_scanned) if meta_total_scanned is not None else None
+            authorized_scope = "HOSPITAL"
+
         return {
             "is_demo_baseline": False,
             "scope": scope_val,
             "year_month": target_ym,
             "total": len(items),
-            "total_scanned": int(meta_total_scanned) if meta_total_scanned is not None else len(items),
+            "total_scanned": exposed_total_scanned,
             "scan_limit": int(meta_scan_limit) if meta_scan_limit is not None else None,
             "is_truncated": meta_is_truncated,
-            "has_batch_meta": bool(batch_meta),
+            "has_batch_meta": has_meta,
+            "authorized_scope": authorized_scope,
             "batch_id": batch_id,
             "batch_time": cutoff_time.strftime("%Y-%m-%d %H:%M:%S") if cutoff_time else None,
             "is_stale": is_stale,
@@ -901,13 +935,35 @@ async def export_inpatient_alerts_csv(
 
     total_scanned = alerts_data.get("total_scanned")
     scan_limit = alerts_data.get("scan_limit")
-    is_truncated = bool(alerts_data.get("is_truncated"))
-    if is_truncated:
-        scope_desc = f"截断(上限{scan_limit}/已扫{total_scanned}例)"
-    elif total_scanned is not None:
-        scope_desc = f"全量(共{total_scanned}例)"
+    is_truncated = alerts_data.get("is_truncated")
+    auth_scope = alerts_data.get("authorized_scope") or ("DEPARTMENT" if operator.get("role") == ROLE_DEPT_HEAD else "HOSPITAL")
+
+    if auth_scope == "DEPARTMENT":
+        visible_n = len(items)
+        if is_truncated is True:
+            scope_desc = f"本科可见{visible_n}例(全批受上限{scan_limit}截断)"
+        elif is_truncated is False:
+            scope_desc = f"本科可见{visible_n}例(全批完整)"
+        else:
+            scope_desc = f"本科可见{visible_n}例(完整度未知)"
+        header_total = str(visible_n)
     else:
-        scope_desc = "全量"
+        if is_truncated is True:
+            scope_desc = f"截断(上限{scan_limit}/已扫{total_scanned}例)"
+        elif is_truncated is False and total_scanned is not None:
+            scope_desc = f"全量(共{total_scanned}例)"
+        elif is_truncated is False:
+            scope_desc = "全量"
+        else:
+            scope_desc = "未知(旧批次无完整度元数据)"
+        header_total = str(total_scanned) if total_scanned is not None else ""
+
+    if is_truncated is True:
+        header_truncated = "true"
+    elif is_truncated is False:
+        header_truncated = "false"
+    else:
+        header_truncated = "unknown"
 
     headers = ["住院号", "科室", "床号", "医生工号", "医生姓名", "主诊断", "参保类型", "当前费用(元)", "DIP基准(元)", "占比(%)", "灯号", "状态", "扫描范围口径"]
     rows = [
@@ -933,9 +989,10 @@ async def export_inpatient_alerts_csv(
             "X-DIP-Batch-Id": alerts_data.get("batch_id") or "",
             "X-DIP-Scope": alerts_data.get("scope") or scope_val,
             "X-DIP-Year-Month": alerts_data.get("year_month") or "",
-            "X-DIP-Total-Scanned": str(total_scanned if total_scanned is not None else len(items)),
+            "X-DIP-Authorized-Scope": auth_scope,
+            "X-DIP-Total-Scanned": header_total,
             "X-DIP-Scan-Limit": str(scan_limit) if scan_limit is not None else "",
-            "X-DIP-Is-Truncated": "true" if is_truncated else "false",
+            "X-DIP-Is-Truncated": header_truncated,
         },
     )
 

@@ -27,6 +27,7 @@ const report = ref<InpatientAlertsResponse | null>(null);
 
 const canScan = computed(() => authStore.userInfo.roles.some(r => ['ADMIN', 'INSURANCE_OFFICER'].includes(r)));
 const canExport = computed(() => Boolean(authStore.userInfo.canExportCase));
+const isDeptOnlyScope = computed(() => report.value?.authorized_scope === 'DEPARTMENT');
 
 const scopeOptions = [
   { label: '本月全部患者（含出院结算）', value: 'month' },
@@ -200,17 +201,24 @@ onMounted(loadData);
       <div class="mt-10px text-12px text-#64748b">
         当前批次：{{ report?.batch_id || '-' }} | 数据截止时间：{{ report?.batch_time || '-' }}
         <span v-if="report?.scope === 'month' && report?.year_month"> | 统计月份：{{ report.year_month }}</span>
-        <span v-if="report?.is_truncated" class="text-#d97706">
-          | 受上限 {{ report.scan_limit }} 截断（已扫 {{ report.total_scanned }} 例，非全量）
+        <span v-if="report?.is_truncated === true" class="text-#d97706">
+          | 受上限 {{ report.scan_limit }} 截断（{{ isDeptOnlyScope ? `本科可见 ${counts.total}` : `已扫 ${report.total_scanned}` }} 例，非全量）
         </span>
-        <span v-else-if="report?.has_batch_meta || (report?.scope === 'month' && report?.batch_id)">
-          | 全量已扫 {{ report?.total_scanned ?? counts.total }} 例（未截断）
+        <span v-else-if="report?.is_truncated === false">
+          | {{ isDeptOnlyScope ? `本科可见 ${counts.total} 例（全批完整未截断）` : `全量已扫 ${report?.total_scanned ?? counts.total} 例（未截断）` }}
+        </span>
+        <span v-else-if="report?.batch_id" class="text-#64748b">
+          | 完整度未知（历史批次无完整度元数据，当前展示 {{ counts.total }} 例）
         </span>
       </div>
     </NCard>
 
-    <NAlert v-if="report?.is_truncated" type="warning" title="扫描批次受上限截断提醒">
-      当前批次受扫描上限 {{ report.scan_limit }} 截断（已扫 {{ report.total_scanned }} 例，可能存在未纳入的病例），请点击「刷新本月全量巡检」获取完整清单。
+    <NAlert v-if="report?.is_truncated === true" type="warning" title="扫描批次受上限截断提醒">
+      当前批次受扫描上限 {{ report.scan_limit }} 截断（{{ isDeptOnlyScope ? `本科当前可见 ${counts.total} 例` : `已扫 ${report.total_scanned} 例` }}，可能存在未纳入的病例）。
+    </NAlert>
+
+    <NAlert v-else-if="report?.batch_id && report?.is_truncated == null" type="info" title="历史批次完整度说明">
+      当前展示的是缺少批次元数据的历史快照批次，无法确认扫描当时是否全量覆盖或受上限截断；建议由医保办/管理员重新触发一次全量扫描。
     </NAlert>
 
     <NAlert v-if="report?.is_stale && report?.stale_warning" type="warning" title="快照数据过期提醒">
@@ -218,7 +226,7 @@ onMounted(loadData);
     </NAlert>
 
     <NGrid cols="2 s:3 m:6" responsive="screen" :x-gap="12" :y-gap="12">
-      <NGi><NCard :bordered="false" class="card-wrapper"><NStatistic :label="filterScope === 'month' ? '本月总人数' : '在院总人数'" :value="counts.total" /></NCard></NGi>
+      <NGi><NCard :bordered="false" class="card-wrapper"><NStatistic :label="isDeptOnlyScope ? '本科人数' : (filterScope === 'month' ? '本月总人数' : '在院总人数')" :value="counts.total" /></NCard></NGi>
       <NGi><NCard :bordered="false" class="card-wrapper"><NStatistic label="红灯超标"><span class="text-#dc2626 font-bold">{{ counts.red }}</span></NStatistic></NCard></NGi>
       <NGi><NCard :bordered="false" class="card-wrapper"><NStatistic label="黄灯观察"><span class="text-#d97706 font-bold">{{ counts.yellow }}</span></NStatistic></NCard></NGi>
       <NGi><NCard :bordered="false" class="card-wrapper"><NStatistic label="绿灯正常"><span class="text-#16a34a font-bold">{{ counts.green }}</span></NStatistic></NCard></NGi>
