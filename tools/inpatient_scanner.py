@@ -107,7 +107,7 @@ class InpatientScanner:
         self,
         batch_id: Optional[str] = None,
         department: Optional[str] = None,
-        limit: int = 50,
+        limit: Optional[int] = None,
         include_recent_settled: bool = False,
         notify_dingtalk: bool = False,
         scope: str = "active",
@@ -115,8 +115,8 @@ class InpatientScanner:
     ) -> Dict[str, Any]:
         """
         Executes a scan over inpatient cases and saves snapshots into dbo.inpatient_dip_snapshot.
-        - scope='active' (default): evaluates active un-discharged patients (unless include_recent_settled=True).
-        - scope='month': evaluates all patients in the target month (active + discharged/settled in month),
+        - scope='active' (default): evaluates active un-discharged patients (default limit=50).
+        - scope='month': evaluates all patients overlapping target year_month (full pagination when limit is None),
           writing into a distinct MONTH_YYYYMM_* batch so active-only snapshots stay strictly isolated.
         """
         now_bj = datetime.now(BEIJING_TZ)
@@ -124,10 +124,11 @@ class InpatientScanner:
         if scope_val not in ("active", "month"):
             raise ValueError(f"Unsupported scan scope: {scope}")
 
+        target_ym = (year_month or now_bj.strftime("%Y-%m")).strip()
         if not batch_id:
             if scope_val == "month":
-                ym = (year_month or now_bj.strftime("%Y-%m")).strip().replace("-", "")
-                batch_id = f"MONTH_{ym}_{now_bj.strftime('%Y%m%d_%H%M%S')}"
+                ym_compact = target_ym.replace("-", "")
+                batch_id = f"MONTH_{ym_compact}_{now_bj.strftime('%Y%m%d_%H%M%S')}"
             else:
                 batch_id = f"BATCH_{now_bj.strftime('%Y%m%d_%H%M%S')}"
 
@@ -135,22 +136,47 @@ class InpatientScanner:
 
         # 1. Fetch patients to evaluate
         patients_to_scan = []
+        month_meta: Dict[str, Any] = {
+            "year_month": target_ym if scope_val == "month" else None,
+            "scan_limit": limit,
+            "is_truncated": False,
+        }
         if scope_val == "month":
-            monthly_limit = limit if limit and limit > 50 else 200
-            patients_to_scan.extend(
-                self.his_reader.get_monthly_inpatients(
-                    year_month=year_month,
+            try:
+                monthly_res = self.his_reader.get_monthly_inpatients(
+                    year_month=target_ym,
                     department=department,
-                    limit=monthly_limit,
+                    limit=limit,
+                    return_meta=True,
                 )
-            )
+            except TypeError:
+                monthly_res = self.his_reader.get_monthly_inpatients(
+                    year_month=target_ym,
+                    department=department,
+                    limit=limit,
+                )
+            if isinstance(monthly_res, tuple) and len(monthly_res) == 2:
+                monthly_rows, raw_meta = monthly_res
+                month_meta.update(raw_meta or {})
+            else:
+                monthly_rows = list(monthly_res or [])
+            seen_zyh = set()
+            for r in monthly_rows:
+                zyh_val = r.get("zyh")
+                if zyh_val and zyh_val in seen_zyh:
+                    continue
+                if zyh_val:
+                    seen_zyh.add(zyh_val)
+                patients_to_scan.append(r)
         else:
-            active_inpatients = self.his_reader.get_active_inpatients(department=department, limit=limit)
+            active_limit = 50 if limit is None else limit
+            month_meta["scan_limit"] = active_limit
+            active_inpatients = self.his_reader.get_active_inpatients(department=department, limit=active_limit)
             patients_to_scan.extend(active_inpatients)
 
             # Strictly decouple: Only include settled cases when explicitly requested (e.g. for replay/backtesting)
             if include_recent_settled:
-                settled_cases = self.his_reader.get_settled_cases(limit=limit, department=department)
+                settled_cases = self.his_reader.get_settled_cases(limit=active_limit, department=department)
                 for sc in settled_cases:
                     # Avoid duplicate scan if patient already active
                     if not any(p['zyh'] == sc['lsh'] for p in patients_to_scan):
@@ -418,6 +444,10 @@ class InpatientScanner:
                 entry = dept_counts.setdefault(dname, {'RED': 0, 'YELLOW': 0})
                 entry[lvl] += 1
         summary['dept_alert_counts'] = dept_counts
+        summary['scope'] = scope_val
+        summary['year_month'] = month_meta.get('year_month')
+        summary['scan_limit'] = month_meta.get('scan_limit')
+        summary['is_truncated'] = bool(month_meta.get('is_truncated'))
         summary['snapshots'] = evaluated_snapshots
 
         if notify_dingtalk:

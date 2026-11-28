@@ -454,11 +454,11 @@ def test_icd_subcode_merge_and_billed_op_inference_offline():
 
 
 def test_monthly_alerts_scope_sql_filter_offline():
-    executed_sqls = []
+    executed = []
 
     class _ScopeCur:
-        def execute(self, sql, *args, **kwargs):
-            executed_sqls.append(str(sql))
+        def execute(self, sql, params=None):
+            executed.append((str(sql), params))
 
         def fetchone(self):
             return {"batch_id": "MONTH_202611_20261128_090000", "data_cutoff_time": datetime(2026, 11, 28, 9, 0, 0), "synced_at": datetime(2026, 11, 28, 9, 0, 0)}
@@ -472,11 +472,357 @@ def test_monthly_alerts_scope_sql_filter_offline():
 
     with patch.object(main_mod, "get_local_db_connection", return_value=(_ScopeCur(), _ScopeConn())), \
          patch.object(main_mod, "get_operator", return_value={"operator_id": "admin", "dept_scope": ""}):
-        res_m = asyncio.run(main_mod.get_inpatient_alerts(dept=None, scope="month", operator={"sub": "admin", "role": "ADMIN", "dept": ""}))
+        res_m = asyncio.run(main_mod.get_inpatient_alerts(dept=None, scope="month", year_month="2026-11", operator={"sub": "admin", "role": "ADMIN", "dept": ""}))
         assert res_m["scope"] == "month"
-        assert any("LIKE 'MONTH_%'" in s and "NOT LIKE 'MONTH_%'" not in s for s in executed_sqls)
+        assert res_m["year_month"] == "2026-11"
+        assert any("batch_id LIKE %s" in s and p == ("MONTH_202611_%",) for s, p in executed)
 
-        executed_sqls.clear()
+        executed.clear()
         res_a = asyncio.run(main_mod.get_inpatient_alerts(dept=None, scope="active", operator={"sub": "admin", "role": "ADMIN", "dept": ""}))
         assert res_a["scope"] == "active"
-        assert any("NOT LIKE 'MONTH_%'" in s for s in executed_sqls)
+        assert any("NOT LIKE 'MONTH_%'" in s for s, _ in executed)
+
+
+def test_auth_attend_001_split_inferred_vs_authoritative_offline():
+    from db.his_reader import HISReader
+    from agent.tool_dispatcher import dispatch_tool_call
+
+    class _ProbeCur:
+        def __init__(self):
+            self.sqls = []
+
+        def execute(self, sql, params=None):
+            self.sqls.append(str(sql))
+
+        def fetchone(self):
+            return None
+
+    class _ProbeConn:
+        def __init__(self, cur):
+            self._c = cur
+
+        def cursor(self, as_dict=False):
+            return self._c
+
+        def close(self):
+            pass
+
+    reader = HISReader()
+    cur = _ProbeCur()
+    with patch.object(reader, "get_connection", return_value=_ProbeConn(cur)):
+        reader.get_patient_realtime_admission("zy_probe")
+    rt_sql = cur.sqls[0]
+    assert "auth_attending_doctor_id" in rt_sql
+    assert "order_doc" not in rt_sql
+    assert "his_zycz" not in rt_sql and "his_bl_yzzycf" not in rt_sql and "his_zycfmain" not in rt_sql
+
+    operators = {
+        "DOC_CONSULT": {"operator_id": "DOC_CONSULT", "role_type": "DOCTOR", "doctor_id": "DOC_CONSULT", "status": "ACTIVE"},
+        "DOC_A": {"operator_id": "DOC_A", "role_type": "DOCTOR", "doctor_id": "DOC_A", "status": "ACTIVE"},
+        "DOC_B": {"operator_id": "DOC_B", "role_type": "DOCTOR", "doctor_id": "DOC_B", "status": "ACTIVE"},
+    }
+    admissions = {
+        "PAT_CONSULT_ONLY": {
+            "zyh": "PAT_CONSULT_ONLY",
+            "auth_attending_doctor_id": None,
+            "attending_doctor_id": "DOC_CONSULT",
+            "attending_doctor_source": "ORDER_INFERRED",
+            "current_dept_id": "4",
+        },
+        "PAT_NO_DOC": {
+            "zyh": "PAT_NO_DOC",
+            "auth_attending_doctor_id": None,
+            "attending_doctor_id": None,
+            "attending_doctor_source": None,
+            "current_dept_id": "4",
+        },
+        "PAT_AUTHORITATIVE": {
+            "zyh": "PAT_AUTHORITATIVE",
+            "auth_attending_doctor_id": "DOC_A",
+            "attending_doctor_id": "DOC_A",
+            "attending_doctor_source": "SY_ZYYSBM",
+            "current_dept_id": "4",
+        },
+    }
+
+    class _AdmReader:
+        def get_patient_realtime_admission(self, pid):
+            return admissions.get(pid)
+
+    with patch.object(main_mod, "HISReader", return_value=_AdmReader()), \
+         patch.object(main_mod, "get_operator", side_effect=lambda o: operators.get(o)), \
+         patch.object(main_mod, "record_audit_log"):
+
+        # 1) Consultation / proxy order inferred only -> 403
+        for pid, sub_id in [("PAT_CONSULT_ONLY", "DOC_CONSULT"), ("PAT_NO_DOC", "DOC_A")]:
+            req = main_mod.CheckPatientDipRequest(patient_id=pid, disease="M17.9", current_cost=-1.0, age=68, ins_type="职工", operation="保守治疗")
+            try:
+                asyncio.run(main_mod.check_patient_dip(req, operator={"sub": sub_id, "role": "DOCTOR", "dept": "中医科"}))
+                raise AssertionError(f"Expected 403 for {pid} / {sub_id}")
+            except HTTPException as exc:
+                assert exc.status_code == 403
+
+        # 3) Authoritative attending relation -> Permitted
+        req_auth = main_mod.CheckPatientDipRequest(patient_id="PAT_AUTHORITATIVE", disease="M17.9", current_cost=-1.0, age=68, ins_type="职工", operation="保守治疗")
+        ok_res = asyncio.run(main_mod.check_patient_dip(req_auth, operator={"sub": "DOC_A", "role": "DOCTOR", "dept": "中医科"}))
+        assert ok_res["pending_reason"] == "NEGATIVE_FEE_UNRECONCILED"
+
+        # 4) Handover DOC_A -> DOC_B: DOC_B permitted, DOC_A immediately 403
+        admissions["PAT_AUTHORITATIVE"]["auth_attending_doctor_id"] = "DOC_B"
+        admissions["PAT_AUTHORITATIVE"]["attending_doctor_id"] = "DOC_B"
+        ok_b = asyncio.run(main_mod.check_patient_dip(req_auth, operator={"sub": "DOC_B", "role": "DOCTOR", "dept": "中医科"}))
+        assert ok_b["pending_reason"] == "NEGATIVE_FEE_UNRECONCILED"
+        try:
+            asyncio.run(main_mod.check_patient_dip(req_auth, operator={"sub": "DOC_A", "role": "DOCTOR", "dept": "中医科"}))
+            raise AssertionError("Old attending doctor must lose access immediately after handover")
+        except HTTPException as exc:
+            assert exc.status_code == 403
+
+    # Verify tool_dispatcher path enforces the same rule
+    import agent.tool_dispatcher as td_mod
+    with patch.object(td_mod, "HISReader", return_value=_AdmReader()), \
+         patch.object(td_mod, "get_operator", side_effect=lambda o: operators.get(o)):
+        tc = {"name": "check_patient_dip", "arguments": {"patient_id": "PAT_CONSULT_ONLY", "disease": "M17.9", "current_cost": "100", "ins_type": "职工"}}
+        td_deny = dispatch_tool_call(tc, {"authenticated": True, "sub": "DOC_CONSULT", "role": "DOCTOR", "dept": "中医科"})
+        assert td_deny["tool_executed"] is False and td_deny["data"]["status"] == "FORBIDDEN"
+
+
+def test_deploy_key_001_wireguard_isolation_offline():
+    root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    dockerignore = open(os.path.join(root_dir, ".dockerignore"), "r", encoding="utf-8").read()
+    compose = open(os.path.join(root_dir, "docker-compose.yml"), "r", encoding="utf-8").read()
+    assert "wireguard/" in dockerignore
+    assert "nginx/ssl/" in dockerignore
+    assert ".:/opt/hospital-agent" not in compose
+    assert "./wireguard/config:/etc/wireguard" not in compose
+    assert "wireguard_config:/etc/wireguard" in compose
+
+
+def test_month_scope_001_interval_overlap_and_month_batch_selection():
+    import sqlite3
+    from db.his_reader import HISReader
+
+    # 1. Verify HISReader SQL uses overlap predicate & validated year_month
+    reader = HISReader()
+    sql_seen = []
+
+    class _MoCur:
+        def execute(self, sql, params=None):
+            sql_seen.append((str(sql), params))
+
+        def fetchall(self):
+            return []
+
+    class _MoConn:
+        def close(self):
+            pass
+
+    with patch.object(reader, "get_connection", return_value=_MoConn()):
+        _c = _MoCur()
+        _MoConn.cursor = lambda self, as_dict=True: _c
+        rows, meta = reader.get_monthly_inpatients(year_month="2026-11", limit=None, return_meta=True)
+        assert rows == [] and meta["year_month"] == "2026-11" and meta["is_truncated"] is False
+        q, p = sql_seen[0]
+        assert "COALESCE(sy.rysj, gh.ghrq) < %s" in q
+        assert "OR COALESCE(sy.cysj, jz_sum.latest_jzrq) >= %s" in q
+        assert p[:2] == ("2026-12-01", "2026-11-01")
+
+    # 2. Verify interval overlap semantics in real in-memory SQLite across all 4 boundary cases
+    sconn = sqlite3.connect(":memory:")
+    sconn.execute("CREATE TABLE stays (lsh TEXT, rysj TEXT, cysj TEXT, jzrq TEXT)")
+    sconn.executemany(
+        "INSERT INTO stays VALUES (?, ?, ?, ?)",
+        [
+            ("OCT_STILL_ACTIVE_IN_NOV", "2026-10-15 08:00:00", None, None),
+            ("NOV_DISCHARGED", "2026-11-02 09:00:00", "2026-11-10 10:00:00", "2026-11-10 11:00:00"),
+            ("OCT_DISCHARGED", "2026-10-05 08:00:00", "2026-10-25 12:00:00", "2026-10-25 12:30:00"),
+            ("CROSS_YEAR", "2025-12-20 08:00:00", "2026-01-05 09:00:00", "2026-01-05 09:30:00"),
+        ],
+    )
+    overlap_sql = """
+        SELECT lsh FROM stays
+        WHERE rysj < ?
+          AND ((cysj IS NULL AND jzrq IS NULL) OR COALESCE(cysj, jzrq) >= ?)
+    """
+    nov_hits = {r[0] for r in sconn.execute(overlap_sql, ("2026-12-01", "2026-11-01")).fetchall()}
+    dec_hits = {r[0] for r in sconn.execute(overlap_sql, ("2026-01-01", "2025-12-01")).fetchall()}
+    jan_hits = {r[0] for r in sconn.execute(overlap_sql, ("2026-02-01", "2026-01-01")).fetchall()}
+    assert nov_hits == {"OCT_STILL_ACTIVE_IN_NOV", "NOV_DISCHARGED"}
+    assert "CROSS_YEAR" in dec_hits and "CROSS_YEAR" in jan_hits
+    sconn.close()
+
+    # 3. Verify target-month batch isolation even after backfilling an older month later
+    snapshots = [
+        {"batch_id": "MONTH_202611_20261128_090000", "synced_at": datetime(2026, 11, 28, 9, 0, 0), "data_cutoff_time": datetime(2026, 11, 28, 9, 0, 0), "visit_id": "V_NOV"},
+        {"batch_id": "MONTH_202610_20261128_100000", "synced_at": datetime(2026, 11, 28, 10, 0, 0), "data_cutoff_time": datetime(2026, 11, 28, 10, 0, 0), "visit_id": "V_OCT"},
+    ]
+
+    class _MonthBatchCur:
+        def __init__(self):
+            self._one = None
+            self._all = []
+
+        def execute(self, sql, params=None):
+            s = str(sql)
+            if "SELECT TOP 1 batch_id" in s:
+                prefix = str((params or ["%"])[0]).rstrip("%")
+                matches = [x for x in snapshots if x["batch_id"].startswith(prefix)]
+                matches.sort(key=lambda x: x["synced_at"], reverse=True)
+                self._one = matches[0] if matches else None
+            elif "COL_LENGTH" in s:
+                self._one = {"has_dn": 1}
+            elif "FROM dbo.inpatient_dip_snapshot" in s:
+                bid = params[0]
+                self._all = [
+                    {
+                        "visit_id": x["visit_id"], "ward_name": "内科", "bed_no": "已结算", "dept_id": "1",
+                        "dept_name": "内科", "doctor_id": "D1", "doctor_name": "医生", "age": 50,
+                        "ins_type": "居民", "primary_icd": "K63.500", "matched_rule_id": None,
+                        "current_fee": Decimal("100.00"), "target_base": None, "fee_ratio": None,
+                        "alert_level": "PENDING", "pending_reason": "NOT_FOUND", "data_cutoff_time": x["data_cutoff_time"],
+                    }
+                    for x in snapshots if x["batch_id"] == bid
+                ]
+
+        def fetchone(self):
+            return self._one
+
+        def fetchall(self):
+            return self._all
+
+    class _MonthBatchConn:
+        def close(self):
+            pass
+
+    with patch.object(main_mod, "get_local_db_connection", return_value=(_MonthBatchCur(), _MonthBatchConn())), \
+         patch.object(main_mod, "get_operator", return_value={"operator_id": "admin", "dept_scope": "", "can_export_case": True}), \
+         patch.object(main_mod, "record_audit_log"):
+        res_nov = asyncio.run(main_mod.get_inpatient_alerts(dept=None, scope="month", year_month="2026-11", operator={"sub": "admin", "role": "ADMIN", "dept": ""}))
+        assert res_nov["batch_id"].startswith("MONTH_202611_")
+        assert [x["zyh"] for x in res_nov["items"]] == ["V_NOV"]
+        csv_nov = asyncio.run(main_mod.export_inpatient_alerts_csv(dept=None, level=None, scope="month", year_month="2026-11", operator={"sub": "admin", "role": "ADMIN", "dept": ""}))
+        assert b"V_NOV" in csv_nov.body and b"V_OCT" not in csv_nov.body
+
+
+def test_month_total_001_pagination_201_cases_and_truncation_flag():
+    from db.his_reader import HISReader
+    from tools.inpatient_scanner import InpatientScanner
+
+    synthetic_rows = [
+        {
+            "zyh": f"SYNTH_201_{i:03d}",
+            "patient_name": f"P{i}",
+            "gender": "男",
+            "age": 50,
+            "current_dept_id": "1",
+            "current_dept": "消化内科",
+            "current_bed": "01床",
+            "admission_time": datetime(2026, 11, 1, 8, 0, 0),
+            "discharge_time": None,
+            "current_stay_days": 2,
+            "auth_attending_doctor_id": "100",
+            "attending_doctor_id": "100",
+            "attending_doctor": "医生",
+            "admission_diag_code": "K63.500",
+            "admission_diag_name": "结肠息肉",
+            "ssmc1": None, "ssmc2": None, "ssmc3": None,
+            "ylzffs": "1", "insurance_type": "自费",
+            "settled_total_amount": Decimal("100.00"), "is_settled": 1,
+        }
+        for i in range(1, 202)
+    ]
+    # Add duplicate zyh to verify deduplication
+    synthetic_rows.insert(10, dict(synthetic_rows[0]))
+
+    class _PagedCur:
+        def __init__(self):
+            self._batch = []
+
+        def execute(self, sql, params=None):
+            offset, fetch_cnt = int(params[-2]), int(params[-1])
+            self._batch = [dict(r) for r in synthetic_rows[offset : offset + fetch_cnt]]
+
+        def fetchall(self):
+            return self._batch
+
+    class _PagedConn:
+        def cursor(self, as_dict=True):
+            return _PagedCur()
+
+        def close(self):
+            pass
+
+    reader = HISReader()
+    with patch.object(reader, "get_connection", return_value=_PagedConn()):
+        rows_full, meta_full = reader.get_monthly_inpatients(year_month="2026-11", limit=None, page_size=200, return_meta=True)
+        assert len(rows_full) == 201 and meta_full["is_truncated"] is False
+
+        rows_cap, meta_cap = reader.get_monthly_inpatients(year_month="2026-11", limit=50, page_size=200, return_meta=True)
+        assert len(rows_cap) == 50 and meta_cap["is_truncated"] is True and meta_cap["scan_limit"] == 50
+
+        scanner = InpatientScanner()
+        scanner.his_reader = reader
+        with patch("tools.inpatient_scanner.get_local_db_connection", return_value=(MagicMock(), MagicMock())):
+            scan_res = scanner.scan_and_snapshot(scope="month", year_month="2026-11", limit=None)
+            assert scan_res["total_scanned"] == 201
+            assert scan_res["is_truncated"] is False
+
+
+def test_dip_icd_001_unified_extraction_and_matching_offline():
+    from tools import dip_calculator as dip_calc
+    from agent.llm_router import parse_local_intent
+    from agent.tool_dispatcher import extract_tool_call
+
+    assert dip_calc.extract_icd_code("诊断编码 K63.500") == "K63.500"
+    assert dip_calc.extract_icd_code("诊断编码M17.9，保守治疗") == "M17.9"
+    assert dip_calc.extract_icd_code("诊断K63.500 电子结肠镜检查") == "K63.500"
+
+    sample_rules = [
+        {
+            "rule_id": 85, "rule_version": "2026_SAMPLE_V1", "department": "中医科",
+            "dip_group_name": "未特指的膝关节病:核心病种-保守治疗&年龄分类(年龄辅助目录-66岁及以上)",
+            "icd_code": "M17.9", "icd_name": "未特指的膝关节病", "op_code": None,
+            "op_name": "核心病种-保守治疗", "aux_detail": "年龄辅助目录-66岁及以上",
+            "billing_unit": "PER_CASE", "dip_score": Decimal("620.2000"),
+            "resident_point": Decimal("7.0000"), "employee_point": Decimal("7.5000"),
+            "hosp_coef": Decimal("0.6000"), "low_threshold": Decimal("0.9000"),
+            "high_threshold": Decimal("1.1000"), "resident_base": Decimal("2604.8400"),
+            "employee_base": Decimal("2790.9000"),
+        },
+        {
+            "rule_id": 101, "rule_version": "2026_SAMPLE_V1", "department": "消化内科",
+            "dip_group_name": "结肠息肉:电子结肠镜检查", "icd_code": "K63.5",
+            "icd_name": "结肠息肉", "op_code": None, "op_name": "电子结肠镜检查",
+            "aux_detail": "", "billing_unit": "PER_CASE", "dip_score": Decimal("514.6000"),
+            "resident_point": Decimal("7.0000"), "employee_point": Decimal("7.5000"),
+            "hosp_coef": Decimal("0.6000"), "low_threshold": Decimal("0.9000"),
+            "high_threshold": Decimal("1.1000"), "resident_base": Decimal("2161.3200"),
+            "employee_base": Decimal("2315.7000"),
+        },
+        {
+            "rule_id": 102, "rule_version": "2026_SAMPLE_V1", "department": "消化内科",
+            "dip_group_name": "结肠息肉:核心病种-保守治疗", "icd_code": "K63.5",
+            "icd_name": "结肠息肉", "op_code": None, "op_name": "核心病种-保守治疗",
+            "aux_detail": "", "billing_unit": "PER_CASE", "dip_score": Decimal("357.0000"),
+            "resident_point": Decimal("7.0000"), "employee_point": Decimal("7.5000"),
+            "hosp_coef": Decimal("0.6000"), "low_threshold": Decimal("0.9000"),
+            "high_threshold": Decimal("1.1000"), "resident_base": Decimal("1499.4000"),
+            "employee_base": Decimal("1606.5000"),
+        },
+    ]
+
+    with patch.object(dip_calc, "get_loaded_rules", return_value=sample_rules):
+        r_adj = parse_local_intent("68岁，职工医保，诊断编码M17.9，保守治疗")
+        r_spc = parse_local_intent("68岁，职工医保，诊断编码 M17.9，保守治疗")
+        assert r_adj["data"]["rule_id"] == r_spc["data"]["rule_id"] == 85
+
+        r_ext_chat = parse_local_intent("53岁，居民医保，诊断编码 K63.500，已完成电子结肠镜检查")
+        r_ext_struct = dip_calc.match_dip_rule(disease="K63.500", age=53, ins_type="居民", op_keyword="电子结肠镜检查")
+        assert r_ext_chat["data"]["rule_id"] == r_ext_struct["rule_id"] == 101
+
+        r_amb_chat = parse_local_intent("53岁，居民医保，诊断编码 K63.500")
+        assert r_amb_chat["data"]["status"] == "PENDING"
+        assert r_amb_chat["data"]["pending_reason"] == "MISSING_OPERATION"
+
+        tc = extract_tool_call("帮我判灯住院号 zy2026112704，诊断编码K63.500，已完成电子结肠镜检查，当前费用 1309 元，居民医保")
+        assert tc["arguments"]["disease"] == "K63.500"

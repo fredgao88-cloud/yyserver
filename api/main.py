@@ -36,7 +36,7 @@ from tools.reconciliation_reporter import run_settled_reconciliation_report
 from db.local_db import record_audit_log, get_local_db_connection
 from db.his_reader import HISReader
 from auth.rbac import (
-    get_authorized_dept_ids,
+    get_authorized_dept_ids, resolve_authoritative_attending_doctor_id,
     authenticate, issue_token, operator_from_optional_token, require_roles,
     ensure_auth_schema, TOKEN_TTL_MINUTES, PATIENT_QUERY_ROLES, ALERTS_ROLES,
     ROLE_DOCTOR, ROLE_DEPT_HEAD, ROLE_INSURANCE, ROLE_ADMIN, ALL_ROLES,
@@ -113,7 +113,7 @@ class DipRuleReviewRequest(BaseModel):
     target_status: str = Field(..., description="APPROVED 或 ARCHIVED")
 
 class ManualScanRequest(BaseModel):
-    limit: int = Field(50, ge=1, le=500, description="扫描在院患者上限")
+    limit: Optional[int] = Field(None, ge=1, le=5000, description="扫描上限（scope=month 缺省为全量无截断，scope=active 缺省 50）")
     notify_dingtalk: bool = Field(False, description="是否同步推送钉钉脱敏汇总")
     scope: str = Field("active", description="扫描范围：active（仅在院）/ month（本月全部患者）")
     year_month: Optional[str] = Field(None, description="目标年月 YYYY-MM（仅 scope=month 有效）")
@@ -239,7 +239,7 @@ async def check_patient_dip(req: CheckPatientDipRequest, operator: Dict[str, Any
             )
 
         if role == ROLE_DOCTOR:
-            cur_doc_id = (adm.get("attending_doctor_id") or "").strip()
+            cur_doc_id = resolve_authoritative_attending_doctor_id(adm)
             op_rec = get_operator(operator["sub"])
             if not op_rec or op_rec.get("status") != "ACTIVE":
                 # AUTH-SCOPE-001：操作员账号不存在或已停用，一律拒绝，绝不回退登录名
@@ -433,21 +433,30 @@ async def check_patient_dip(req: CheckPatientDipRequest, operator: Dict[str, Any
 @app.get("/api/inpatient/alerts", summary="在院及本月患者预警列表看板接口")
 async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="科室筛选，如 中医科"),
                                scope: str = Query("active", description="统计范围：active（仅在院）/ month（本月全部患者）"),
+                               year_month: Optional[str] = Query(None, description="目标月份 YYYY-MM（仅 scope=month 生效，默认当月）"),
                                operator: Dict[str, Any] = Depends(require_roles(*ALERTS_ROLES))):
     """
     获取患者红黄绿灯控费预警清单（穿透读取 dbo.inpatient_dip_snapshot 最新批次）。
     - scope='active'（默认）：仅返回在院未出院患者快照（batch_id NOT LIKE 'MONTH_%'）。
-    - scope='month'：返回本月全部患者快照（含本月已出院结算患者，batch_id LIKE 'MONTH_%'）。
+    - scope='month'：严格按目标月份选取最新完成批次（MONTH_{YYYYMM}_%），避免补扫历史月覆盖当月。
     患者级接口：强制有效令牌，仅科室主任、医保办与管理员角色可访问。
     支持按角色实施科室范围 (dept_scope) 行级数据隔离及快照过期检测。
     """
     from datetime import datetime, timedelta, timezone
+    _DB_TZ = timezone(timedelta(hours=8))
     role = operator.get("role")
     op_info = get_operator(operator["sub"])
     user_dept = operator.get("dept") or (op_info.get("dept_scope") if op_info else "")
     scope_val = (scope.strip().lower() if isinstance(scope, str) else "active") or "active"
     if scope_val not in ("active", "month"):
         raise HTTPException(status_code=400, detail="scope 仅支持 active 或 month")
+
+    ym_raw = year_month.strip() if isinstance(year_month, str) and year_month.strip() else None
+    target_ym = None
+    if scope_val == "month":
+        target_ym = ym_raw or datetime.now(_DB_TZ).strftime("%Y-%m")
+        if not re.match(r"^\d{4}-(0[1-9]|1[0-2])$", target_ym):
+            raise HTTPException(status_code=400, detail="year_month 仅支持 YYYY-MM 格式")
 
     # 行级权限过滤：科室主任仅允许查看本科室数据
     effective_dept = dept
@@ -458,19 +467,28 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
 
     cursor, conn = get_local_db_connection(as_dict=True)
     try:
-        batch_filter_sql = "WHERE batch_id LIKE 'MONTH_%'" if scope_val == "month" else "WHERE batch_id NOT LIKE 'MONTH_%'"
-        cursor.execute(f"""
-        SELECT TOP 1 batch_id, data_cutoff_time, synced_at
-        FROM dbo.inpatient_dip_snapshot
-        {batch_filter_sql}
-        ORDER BY synced_at DESC
-        """)
+        if scope_val == "month":
+            ym_prefix = f"MONTH_{target_ym.replace('-', '')}_%"
+            cursor.execute("""
+            SELECT TOP 1 batch_id, data_cutoff_time, synced_at
+            FROM dbo.inpatient_dip_snapshot
+            WHERE batch_id LIKE %s
+            ORDER BY synced_at DESC
+            """, (ym_prefix,))
+        else:
+            cursor.execute("""
+            SELECT TOP 1 batch_id, data_cutoff_time, synced_at
+            FROM dbo.inpatient_dip_snapshot
+            WHERE batch_id NOT LIKE 'MONTH_%'
+            ORDER BY synced_at DESC
+            """)
         latest_batch = cursor.fetchone()
 
         if not latest_batch:
             return {
                 "is_demo_baseline": False,
                 "scope": scope_val,
+                "year_month": target_ym,
                 "total": 0,
                 "batch_id": None,
                 "batch_time": None,
@@ -484,7 +502,6 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
         synced_at = latest_batch["synced_at"]
 
         # SNAP-TIME-001：统一转换为 UTC 再比较（无偏移数据库时间明确按东八区 UTC+8 解析）
-        _DB_TZ = timezone(timedelta(hours=8))
         now_utc = datetime.now(timezone.utc)
         is_stale = False
         stale_warning = None
@@ -579,6 +596,7 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
         return {
             "is_demo_baseline": False,
             "scope": scope_val,
+            "year_month": target_ym,
             "total": len(items),
             "batch_id": batch_id,
             "batch_time": cutoff_time.strftime("%Y-%m-%d %H:%M:%S") if cutoff_time else None,
@@ -786,6 +804,10 @@ async def api_trigger_manual_scan(
         "batch_id": res.get("batch_id"),
         "rule_version": res.get("rule_version"),
         "data_cutoff_time": res.get("data_cutoff_time"),
+        "scope": res.get("scope", scope_val),
+        "year_month": res.get("year_month"),
+        "scan_limit": res.get("scan_limit"),
+        "is_truncated": bool(res.get("is_truncated")),
         "total_scanned": res.get("total_scanned", 0),
         "GREEN": res.get("GREEN", 0),
         "YELLOW": res.get("YELLOW", 0),
@@ -832,6 +854,7 @@ async def export_inpatient_alerts_csv(
     dept: Optional[str] = Query(None),
     level: Optional[str] = Query(None),
     scope: str = Query("active"),
+    year_month: Optional[str] = Query(None),
     operator: Dict[str, Any] = Depends(require_roles(*ALERTS_ROLES)),
 ):
     op_rec = get_operator(operator["sub"])
@@ -842,7 +865,7 @@ async def export_inpatient_alerts_csv(
         )
         raise HTTPException(status_code=403, detail="权限不足：当前账号未开通病例明细导出权限 (can_export_case=0)")
 
-    alerts_data = await get_inpatient_alerts(dept=dept, scope=scope, operator=operator)
+    alerts_data = await get_inpatient_alerts(dept=dept, scope=scope, year_month=year_month, operator=operator)
     items = alerts_data.get("items") or []
     if level:
         lvl_u = level.strip().upper()

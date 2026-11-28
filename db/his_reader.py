@@ -364,20 +364,53 @@ class HISReader:
         finally:
             conn.close()
 
-    # 共享管床医生解析 SQL 片段：
-    # 1) 若病案首页 his_bl_sy.zyysbm 非空，仅当其在 dbo.his_ry (ybysdm / gjgbm_ybysdm) 唯一匹配时映射为标准 ryid，否则保留原始编码（防重码歧义误配）；
-    # 2) 若病案首页尚未填写 (zyysbm 为空)，优先读取住院登记/床位主表 dbo.his_gh (ysid / gdfysid / zzysid) 关联 his_ry；
-    # 3) 若 his_gh 仍为空，兜底从在院临床 his_zycz、中药医嘱 his_bl_yzzycf、住院处方 his_zycfmain 聚合有效医生 (his_ry.isys = 1) 的主力开单 ryid。
-    _ATTENDING_DOC_SELECT = """
-                CASE
+    # AUTH-ATTEND-001：拆分权威管床授权医生 (_AUTH_ATTENDING_DOC_SELECT) 与看板展示用推断医生 (_ATTENDING_DOC_SELECT)：
+    # 1) 权威来源仅采信：病案首页 his_bl_sy.zyysbm（唯一映射 ryid 或原始医保码）与住院登记/床位主表 his_gh (ysid / gdfysid / zzysid)；
+    # 2) order_doc 仅按开单频次做看板展示兜底 (attending_doctor_source='ORDER_INFERRED')，绝不写入 auth_attending_doctor_id，
+    #    也不在实时穿透鉴权接口 get_patient_realtime_admission 中返回或作为授权依据。
+    _AUTH_ATTENDING_DOC_ID_EXPR = """CASE
                     WHEN NULLIF(LTRIM(RTRIM(sy.zyysbm)), '') IS NOT NULL
                         THEN COALESCE(CAST(COALESCE(ry_yb.ryid, ry_gj.ryid) AS VARCHAR(32)), NULLIF(LTRIM(RTRIM(sy.zyysbm)), ''))
                     WHEN r_gh.ryid IS NOT NULL
                         THEN CAST(r_gh.ryid AS VARCHAR(32))
                     WHEN COALESCE(NULLIF(gh.ysid, 0), NULLIF(gh.gdfysid, 0), NULLIF(gh.zzysid, 0)) IS NOT NULL
                         THEN CAST(COALESCE(NULLIF(gh.ysid, 0), NULLIF(gh.gdfysid, 0), NULLIF(gh.zzysid, 0)) AS VARCHAR(32))
-                    ELSE CAST(order_doc.ryid AS VARCHAR(32))
-                END AS attending_doctor_id,
+                    ELSE NULL
+                END"""
+
+    _AUTH_ATTENDING_DOC_SELECT = f"""
+                {_AUTH_ATTENDING_DOC_ID_EXPR} AS auth_attending_doctor_id,
+                {_AUTH_ATTENDING_DOC_ID_EXPR} AS attending_doctor_id,
+                CASE
+                    WHEN NULLIF(LTRIM(RTRIM(sy.zyysbm)), '') IS NOT NULL THEN 'SY_ZYYSBM'
+                    WHEN r_gh.ryid IS NOT NULL OR COALESCE(NULLIF(gh.ysid, 0), NULLIF(gh.gdfysid, 0), NULLIF(gh.zzysid, 0)) IS NOT NULL THEN 'HIS_GH'
+                    ELSE NULL
+                END AS attending_doctor_source,
+                COALESCE(
+                    NULLIF(LTRIM(RTRIM(sy.zyysname)), ''),
+                    NULLIF(LTRIM(RTRIM(COALESCE(ry_yb.ryname, ry_gj.ryname))), ''),
+                    CASE
+                        WHEN NULLIF(LTRIM(RTRIM(sy.zyysbm)), '') IS NULL
+                            THEN COALESCE(
+                                NULLIF(LTRIM(RTRIM(r_gh.ryname)), ''),
+                                NULLIF(LTRIM(RTRIM(gh.ysname)), ''),
+                                NULLIF(LTRIM(RTRIM(gh.zzysname)), '')
+                            )
+                    END
+                ) AS attending_doctor,"""
+
+    _ATTENDING_DOC_SELECT = f"""
+                {_AUTH_ATTENDING_DOC_ID_EXPR} AS auth_attending_doctor_id,
+                COALESCE(
+                    {_AUTH_ATTENDING_DOC_ID_EXPR},
+                    CAST(order_doc.ryid AS VARCHAR(32))
+                ) AS attending_doctor_id,
+                CASE
+                    WHEN NULLIF(LTRIM(RTRIM(sy.zyysbm)), '') IS NOT NULL THEN 'SY_ZYYSBM'
+                    WHEN r_gh.ryid IS NOT NULL OR COALESCE(NULLIF(gh.ysid, 0), NULLIF(gh.gdfysid, 0), NULLIF(gh.zzysid, 0)) IS NOT NULL THEN 'HIS_GH'
+                    WHEN order_doc.ryid IS NOT NULL THEN 'ORDER_INFERRED'
+                    ELSE NULL
+                END AS attending_doctor_source,
                 COALESCE(
                     NULLIF(LTRIM(RTRIM(sy.zyysname)), ''),
                     NULLIF(LTRIM(RTRIM(COALESCE(ry_yb.ryname, ry_gj.ryname))), ''),
@@ -447,7 +480,7 @@ class HISReader:
                     END
                 ) AS insurance_type"""
 
-    _ATTENDING_DOC_JOINS = """
+    _AUTH_ATTENDING_DOC_JOINS = """
             LEFT JOIN (
                 SELECT LTRIM(RTRIM(ybysdm)) AS ybysdm_key, MAX(ryid) AS ryid, MAX(LTRIM(RTRIM(ISNULL(ryname, '')))) AS ryname
                 FROM dbo.his_ry
@@ -482,7 +515,9 @@ class HISReader:
             ) yb1101
             LEFT JOIN dbo.his_ry r_gh
                 ON COALESCE(NULLIF(gh.ysid, 0), NULLIF(gh.gdfysid, 0), NULLIF(gh.zzysid, 0)) = r_gh.ryid
-               AND r_gh.isys = 1
+               AND r_gh.isys = 1"""
+
+    _ATTENDING_DOC_JOINS = _AUTH_ATTENDING_DOC_JOINS + """
             OUTER APPLY (
                 SELECT TOP 1 r.ryid, LTRIM(RTRIM(ISNULL(r.ryname, ''))) AS ryname
                 FROM (
@@ -618,18 +653,25 @@ class HISReader:
         self,
         year_month: Optional[str] = None,
         department: Optional[str] = None,
-        limit: int = 200,
-    ) -> List[Dict[str, Any]]:
+        limit: Optional[int] = None,
+        page_size: int = 200,
+        return_meta: bool = False,
+    ) -> Any:
         """
-        查询指定月份（默认当月）全部住院患者（包含当前在院未出院患者 + 本月已出院/已结算病例）。
-        费用与诊断严格区分口径：
-        - 已结算患者使用 his_zyjz (iszf=0, amoney>0) 汇总净结算金额 (_pre_settled_amount) 并优先取 cydj/首页出院主诊断；
-        - 仍在院患者不混入结算单金额，交由 InpatientScanner 调用 get_active_patient_fee 聚合实时明细。
+        MONTH-SCOPE-001 & MONTH-TOTAL-001：
+        查询与目标月份（默认当月）存在住院区间重叠的全部住院患者（含跨月持续在院及当月出院/结算患者）。
+        - 区间重叠判定：入院时间 < 下月初，且（仍在院未结 OR 出院/最近结算时间 >= 本月初）；
+        - limit=None 时按稳定排序分页全量拉取并按 zyh 去重，不静默截断；
+        - 若显式传入 limit，探测是否存在更多记录并返回 is_truncated 标记。
         """
+        import re as _re
         from datetime import datetime, timezone, timedelta
         bj_now = datetime.now(timezone(timedelta(hours=8)))
         ym = (year_month or bj_now.strftime("%Y-%m")).strip()
-        year_i, month_i = [int(x) for x in ym.split("-", 1)]
+        m_ym = _re.match(r'^(\d{4})-(0[1-9]|1[0-2])$', ym)
+        if not m_ym:
+            raise ValueError(f"year_month 格式非法（期望 YYYY-MM）: {ym}")
+        year_i, month_i = int(m_ym.group(1)), int(m_ym.group(2))
         start_str = f"{year_i:04d}-{month_i:02d}-01"
         if month_i == 12:
             end_str = f"{year_i + 1:04d}-01-01"
@@ -639,9 +681,8 @@ class HISReader:
         conn = self.get_connection()
         cur = conn.cursor(as_dict=True)
         try:
-            top_clause = f"TOP ({int(limit)})" if limit else ""
-            sql = f"""
-            SELECT {top_clause}
+            base_sql = f"""
+            SELECT
                 sy.lsh AS zyh,
                 sy.xm AS patient_name,
                 sy.xb AS gender,
@@ -709,31 +750,71 @@ class HISReader:
                 WHERE zk.iszk = 1
             ) zk_latest ON sy.lsh = zk_latest.lsh AND zk_latest.rn = 1
             {self._ATTENDING_DOC_JOINS}
-            WHERE (
-                (sy.rysj >= %s AND sy.rysj < %s)
-                OR (sy.cysj >= %s AND sy.cysj < %s)
-                OR (jz_sum.latest_jzrq >= %s AND jz_sum.latest_jzrq < %s)
-            )
+            WHERE COALESCE(sy.rysj, gh.ghrq) < %s
+              AND (
+                  (sy.cysj IS NULL AND jz_sum.latest_jzrq IS NULL)
+                  OR COALESCE(sy.cysj, jz_sum.latest_jzrq) >= %s
+              )
             """
-            params: List[Any] = [start_str, end_str, start_str, end_str, start_str, end_str]
+            base_params: List[Any] = [end_str, start_str]
             if department:
-                sql += f" AND ({self._DEPT_EXPR} = %s OR {self._DEPT_EXPR} LIKE %s)"
-                params.extend([department, f"%{department}%"])
-            sql += " ORDER BY COALESCE(sy.rysj, gh.ghrq) DESC"
-            cur.execute(sql, tuple(params))
-            rows = cur.fetchall()
-            for r in rows:
-                if r.get("is_settled") and r.get("settled_total_amount") is not None:
-                    r["_pre_settled_amount"] = r["settled_total_amount"]
-                    r["_is_settled"] = True
-            return rows
+                base_sql += f" AND ({self._DEPT_EXPR} = %s OR {self._DEPT_EXPR} LIKE %s)"
+                base_params.extend([department, f"%{department}%"])
+            base_sql += " ORDER BY COALESCE(sy.rysj, gh.ghrq) DESC, sy.lsh ASC OFFSET %s ROWS FETCH NEXT %s ROWS ONLY"
+
+            deduped: List[Dict[str, Any]] = []
+            seen_zyh = set()
+            is_truncated = False
+            chunk_size = max(1, int(page_size or 200))
+            offset = 0
+
+            while True:
+                if limit is not None and len(deduped) >= int(limit):
+                    fetch_count = chunk_size
+                elif limit is not None:
+                    remaining = int(limit) - len(deduped)
+                    fetch_count = min(chunk_size, remaining + 1)
+                else:
+                    fetch_count = chunk_size
+
+                cur.execute(base_sql, tuple(base_params + [offset, fetch_count]))
+                batch = cur.fetchall()
+                if not batch:
+                    break
+
+                for r in batch:
+                    zyh_val = r.get("zyh")
+                    if zyh_val and zyh_val in seen_zyh:
+                        continue
+                    if limit is not None and len(deduped) >= int(limit):
+                        is_truncated = True
+                        break
+                    if zyh_val:
+                        seen_zyh.add(zyh_val)
+                    if r.get("is_settled") and r.get("settled_total_amount") is not None:
+                        r["_pre_settled_amount"] = r["settled_total_amount"]
+                        r["_is_settled"] = True
+                    deduped.append(r)
+
+                if is_truncated or len(batch) < fetch_count:
+                    break
+                offset += len(batch)
+
+            if return_meta:
+                return deduped, {
+                    "year_month": ym,
+                    "total_scanned": len(deduped),
+                    "scan_limit": int(limit) if limit is not None else None,
+                    "is_truncated": is_truncated,
+                }
+            return deduped
         finally:
             conn.close()
 
     def get_patient_realtime_admission(self, lsh: str) -> Optional[Dict[str, Any]]:
         """
         实时穿透 HIS 查询患者当前在院信息（管床医生、最新转科换床与科室）。
-        严禁使用 15 分钟快照授权，用于 DOCTOR 角色实时管床鉴权。
+        严禁使用 15 分钟快照授权及开单频次推断医生，严格用于 DOCTOR / DEPT_HEAD 实时鉴权。
         """
         if not lsh:
             return None
@@ -750,7 +831,7 @@ class HISReader:
                 {self._DEPT_BED_SELECT}
                 sy.rysj AS admission_time,
                 sy.cysj AS discharge_time,
-                {self._ATTENDING_DOC_SELECT}
+                {self._AUTH_ATTENDING_DOC_SELECT}
                 sy.kszrbm AS dept_director_id,
                 sy.kszrname AS dept_director,
                 {self._CLINICAL_DIAG_SELECT}
@@ -767,7 +848,7 @@ class HISReader:
                 LEFT JOIN dbo.his_bf bf ON zk.xbfid = bf.bfid
                 WHERE zk.iszk = 1
             ) zk_latest ON sy.lsh = zk_latest.lsh AND zk_latest.rn = 1
-            {self._ATTENDING_DOC_JOINS}
+            {self._AUTH_ATTENDING_DOC_JOINS}
             WHERE sy.lsh = %s AND sy.cysj IS NULL AND jz.lsh IS NULL
             ORDER BY sy.rysj DESC
             """

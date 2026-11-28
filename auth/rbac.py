@@ -455,6 +455,22 @@ def operator_from_optional_token(authorization: Optional[str]) -> Dict[str, Any]
 
 # ----------------- 运维 CLI -----------------
 
+def resolve_authoritative_attending_doctor_id(adm: Optional[Dict[str, Any]]) -> str:
+    """
+    AUTH-ATTEND-001：提取具备权威管床授权效力的医生工号。
+    - 严禁采信基于医嘱开单频次推断的医生 (attending_doctor_source == 'ORDER_INFERRED')；
+    - 若在院记录显式带有 'auth_attending_doctor_id' 字段，只采信该权威字段（即使为 None 也不回退展示用推断字段）；
+    - 否则兼容传统只返回权威 'attending_doctor_id' 的调用结构。
+    """
+    if not adm:
+        return ""
+    src = str(adm.get("attending_doctor_source") or "").strip().upper()
+    if src == "ORDER_INFERRED":
+        return ""
+    if "auth_attending_doctor_id" in adm:
+        return str(adm.get("auth_attending_doctor_id") or "").strip()
+    return str(adm.get("attending_doctor_id") or "").strip()
+
 def _cli() -> None:
     parser = argparse.ArgumentParser(description="院内 Agent 操作员账号管理（本地运维工具）")
     sub = parser.add_subparsers(dest="cmd", required=True)

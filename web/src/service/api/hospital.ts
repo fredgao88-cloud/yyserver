@@ -149,6 +149,7 @@ export interface InpatientAlertItem {
 export interface InpatientAlertsResponse {
   is_demo_baseline: boolean;
   scope?: 'active' | 'month';
+  year_month?: string | null;
   total: number;
   batch_id: string | null;
   batch_time: string | null;
@@ -157,21 +158,33 @@ export interface InpatientAlertsResponse {
   items: InpatientAlertItem[];
 }
 
-export function fetchInpatientAlerts(dept?: string, scope: 'active' | 'month' = 'month') {
+export function fetchInpatientAlerts(dept?: string, scope: 'active' | 'month' = 'month', yearMonth?: string) {
   const qs = new URLSearchParams();
   if (dept) qs.set('dept', dept);
   if (scope) qs.set('scope', scope);
+  if (scope === 'month' && yearMonth) qs.set('year_month', yearMonth);
   const query = qs.toString() ? `?${qs.toString()}` : '';
   return hospitalRequest<InpatientAlertsResponse>(`/api/inpatient/alerts${query}`);
 }
 
-export function triggerManualScan(limit = 50, notifyDingtalk = false, scope: 'active' | 'month' = 'active') {
+export function triggerManualScan(
+  limit?: number,
+  notifyDingtalk = false,
+  scope: 'active' | 'month' = 'active',
+  yearMonth?: string
+) {
+  const body: Record<string, any> = { notify_dingtalk: notifyDingtalk, scope };
+  if (typeof limit === 'number' && limit > 0) body.limit = limit;
+  if (scope === 'month' && yearMonth) body.year_month = yearMonth;
   return hospitalRequest<{
     success: boolean;
     batch_id: string;
     rule_version: string;
     data_cutoff_time: string;
     total_scanned: number;
+    scan_limit?: number | null;
+    is_truncated?: boolean;
+    year_month?: string | null;
     GREEN: number;
     YELLOW: number;
     RED: number;
@@ -179,7 +192,7 @@ export function triggerManualScan(limit = 50, notifyDingtalk = false, scope: 'ac
     NOT_APPLICABLE: number;
   }>('/api/admin/trigger-scan', {
     method: 'POST',
-    body: JSON.stringify({ limit, notify_dingtalk: notifyDingtalk, scope })
+    body: JSON.stringify(body)
   });
 }
 

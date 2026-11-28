@@ -11,7 +11,12 @@
 import re
 from decimal import Decimal
 from typing import Dict, Any, Optional
-from tools.dip_calculator import match_dip_rule, evaluate_traffic_light, normalize_insurance_type
+from tools.dip_calculator import (
+    extract_icd_code,
+    match_dip_rule,
+    evaluate_traffic_light,
+    normalize_insurance_type,
+)
 
 def extract_operation_keyword(text_clean: str):
     """
@@ -255,10 +260,10 @@ def parse_local_intent(text: str, channel: str = "web") -> Dict[str, Any]:
     disease = None
     has_explicit_icd = False
     
-    # 优先提取 ICD 编码 (如 M17.9, K63.5, I10.x, M53.1)
-    icd_regex = re.search(r'\b([A-Z]\d{2}(?:\.[0-9a-zA-Z]{1,2})?)\b', text_clean, re.I)
-    if icd_regex:
-        disease = icd_regex.group(1).upper()
+    # 优先提取完整 ICD 编码（共用 dip_calculator.extract_icd_code：支持中文紧邻及 6 位扩展码 K63.500）
+    icd_code_hit = extract_icd_code(text_clean)
+    if icd_code_hit:
+        disease = icd_code_hit
         has_explicit_icd = True
     else:
         # 常见疾病名称

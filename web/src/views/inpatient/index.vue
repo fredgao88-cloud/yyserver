@@ -17,9 +17,13 @@ const authStore = useAuthStore();
 const loading = ref(false);
 const scanning = ref(false);
 const filterScope = ref<'month' | 'active'>('month');
+const filterYearMonth = ref<string>(
+  `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, '0')}`
+);
 const filterDept = ref('');
 const filterLevel = ref<string | null>(null);
 const notifyDingtalk = ref(false);
+const scanTruncated = ref(false);
 const report = ref<InpatientAlertsResponse | null>(null);
 
 const canScan = computed(() => authStore.userInfo.roles.some(r => ['ADMIN', 'INSURANCE_OFFICER'].includes(r)));
@@ -106,7 +110,8 @@ async function loadData() {
   const mySeq = ++inpReqSeq;
   loading.value = true;
   try {
-    const res = await fetchInpatientAlerts(filterDept.value.trim() || undefined, filterScope.value);
+    const ym = filterScope.value === 'month' ? filterYearMonth.value.trim() || undefined : undefined;
+    const res = await fetchInpatientAlerts(filterDept.value.trim() || undefined, filterScope.value, ym);
     if (mySeq !== inpReqSeq) return;
     report.value = res;
   } catch (err: any) {
@@ -124,10 +129,13 @@ async function loadData() {
 async function handleTriggerScan() {
   scanning.value = true;
   try {
-    const scanLimit = filterScope.value === 'month' ? 200 : 100;
-    const res = await triggerManualScan(scanLimit, notifyDingtalk.value, filterScope.value);
+    const ym = filterScope.value === 'month' ? filterYearMonth.value.trim() || undefined : undefined;
+    // 月度全量扫描不设硬截断上限；在院实时扫描使用默认全量或 100
+    const scanLimit = filterScope.value === 'month' ? undefined : 100;
+    const res = await triggerManualScan(scanLimit, notifyDingtalk.value, filterScope.value, ym);
+    scanTruncated.value = Boolean(res.is_truncated);
     window.$message?.success(
-      `巡检完成（${res.batch_id}）：共 ${res.total_scanned} 例，红灯 ${res.RED} / 黄灯 ${res.YELLOW} / 绿灯 ${res.GREEN} / 待定 ${res.PENDING}`
+      `巡检完成（${res.batch_id}）：共 ${res.total_scanned} 例${res.is_truncated ? `（受上限 ${res.scan_limit} 截断）` : ''}，红灯 ${res.RED} / 黄灯 ${res.YELLOW} / 绿灯 ${res.GREEN} / 待定 ${res.PENDING}`
     );
     await loadData();
   } catch (err: any) {
@@ -142,6 +150,9 @@ async function handleTriggerScan() {
 async function handleExport() {
   const qs = new URLSearchParams();
   qs.set('scope', filterScope.value);
+  if (filterScope.value === 'month' && filterYearMonth.value.trim()) {
+    qs.set('year_month', filterYearMonth.value.trim());
+  }
   if (filterDept.value.trim()) qs.set('dept', filterDept.value.trim());
   if (filterLevel.value) qs.set('level', filterLevel.value);
   const queryStr = qs.toString() ? `?${qs.toString()}` : '';
@@ -169,6 +180,13 @@ onMounted(loadData);
             style="width: 230px"
             @update:value="loadData"
           />
+          <NInput
+            v-if="filterScope === 'month'"
+            v-model:value="filterYearMonth"
+            placeholder="YYYY-MM"
+            style="width: 115px"
+            @keyup.enter="loadData"
+          />
           <NInput v-model:value="filterDept" placeholder="科室名称或科室 ID" clearable style="width: 180px" @keyup.enter="loadData" />
           <NSelect v-model:value="filterLevel" :options="levelOptions" placeholder="灯号筛选" clearable style="width: 160px" />
           <NButton type="primary" :loading="loading" @click="loadData">查询刷新</NButton>
@@ -183,6 +201,8 @@ onMounted(loadData);
       </div>
       <div class="mt-10px text-12px text-#64748b">
         当前批次：{{ report?.batch_id || '-' }} | 数据截止时间：{{ report?.batch_time || '-' }}
+        <span v-if="report?.scope === 'month' && report?.year_month"> | 统计月份：{{ report.year_month }}（全量 {{ counts.total }} 例）</span>
+        <span v-if="scanTruncated" class="text-#d97706"> | 注意：上次触发扫描受上限截断</span>
       </div>
     </NCard>
 

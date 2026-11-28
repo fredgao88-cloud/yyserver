@@ -4,6 +4,7 @@
 .env.*
 !.env.example
 nginx/ssl/
+wireguard/
 *.pem
 *.key
 *.crt
@@ -13,4 +14,6 @@ __pycache__
 *.pyo
 .pytest_cache
 .venv*
+web/node_modules/
+web/dist/
 tests/

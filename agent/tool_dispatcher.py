@@ -20,6 +20,7 @@ from auth.rbac import (
     ROLE_DOCTOR,
     get_authorized_dept_ids,
     get_operator,
+    resolve_authoritative_attending_doctor_id,
     role_permitted,
 )
 from db.his_reader import HISReader
@@ -27,6 +28,7 @@ from db.local_db import get_local_db_connection
 from tools.analytics_reporter import get_doctor_performance_report
 from tools.dip_calculator import (
     evaluate_traffic_light,
+    extract_icd_code,
     match_dip_rule,
     normalize_insurance_type,
 )
@@ -78,7 +80,7 @@ def extract_tool_call(text: str, channel: str = "web") -> Optional[Dict[str, Any
     has_light_intent = bool(re.search(r'(判灯|控费分析|是否超标|超标了吗|红黄绿灯)', text_clean))
 
     if cost_m and (pid_m or has_light_intent):
-        icd_m = re.search(r'\b([A-Z]\d{2}(?:\.\d{1,2})?)\b', text_clean, re.I)
+        icd_code_hit = extract_icd_code(text_clean)
         age_m = re.search(r'(\d+)\s*岁', text_clean)
         bed_m = re.search(r'(\d+)\s*(?:天|床日)', text_clean)
         norm_ins = normalize_insurance_type(text_clean)
@@ -90,7 +92,7 @@ def extract_tool_call(text: str, channel: str = "web") -> Optional[Dict[str, Any
             "name": "check_patient_dip",
             "arguments": {
                 "patient_id": pid_m.group(1) if pid_m else None,
-                "disease": icd_m.group(1).upper() if icd_m else text_clean,
+                "disease": icd_code_hit if icd_code_hit else text_clean,
                 "current_cost": cost_m.group(1),
                 "age": int(age_m.group(1)) if age_m else None,
                 "ins_type": ins_type,
@@ -194,7 +196,7 @@ def dispatch_tool_call(tool_call: Dict[str, Any], operator: Dict[str, Any]) -> D
             }
         cursor, conn = get_local_db_connection(as_dict=True)
         try:
-            cursor.execute("SELECT TOP 1 batch_id, data_cutoff_time FROM dbo.inpatient_dip_snapshot ORDER BY synced_at DESC")
+            cursor.execute("SELECT TOP 1 batch_id, data_cutoff_time FROM dbo.inpatient_dip_snapshot WHERE batch_id NOT LIKE 'MONTH_%' ORDER BY synced_at DESC")
             latest = cursor.fetchone()
             if not latest:
                 return {
@@ -263,7 +265,8 @@ def dispatch_tool_call(tool_call: Dict[str, Any], operator: Dict[str, Any]) -> D
                 op_rec = get_operator(sub)
                 mapped = (op_rec.get("doctor_id") or "").strip() if op_rec and op_rec.get("status") == "ACTIVE" else ""
                 valid_ids = {mapped} if mapped else ({(op_rec.get("operator_id") or "").strip()} if op_rec and op_rec.get("status") == "ACTIVE" else set())
-                if not ((adm.get("attending_doctor_id") or "").strip() in valid_ids):
+                cur_doc_id = resolve_authoritative_attending_doctor_id(adm)
+                if not (cur_doc_id and cur_doc_id in valid_ids):
                     return {
                         "intent": "tool_call_denied",
                         "tool_executed": False,

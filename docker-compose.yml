@@ -18,7 +18,15 @@ services:
       - LOCAL_DB_NAME=${LOCAL_DB_NAME:-his_agent_db}
       - HIS_FREETDS_SECTION=${HIS_FREETDS_SECTION:-hisdb_proxy}
     volumes:
-      - .:/opt/hospital-agent
+      - ./api:/opt/hospital-agent/api
+      - ./agent:/opt/hospital-agent/agent
+      - ./auth:/opt/hospital-agent/auth
+      - ./db:/opt/hospital-agent/db
+      - ./tools:/opt/hospital-agent/tools
+      - ./sql:/opt/hospital-agent/sql
+      - ./tests:/opt/hospital-agent/tests
+      - ./data:/opt/hospital-agent/data
+      - ./freetds.conf:/opt/hospital-agent/freetds.conf:ro
 
   nginx:
     image: nginx:alpine
@@ -58,9 +66,12 @@ services:
       - WG_ENDPOINT_PORT=${WG_ENDPOINT_PORT:-51820}
       - WG_WORKBENCH_IP=${WG_WORKBENCH_IP:-192.168.1.100}
     volumes:
-      - ./wireguard/config:/etc/wireguard
+      - wireguard_config:/etc/wireguard
     depends_on:
       - nginx
+
+volumes:
+  wireguard_config:
 
 networks:
   hospital_internal:

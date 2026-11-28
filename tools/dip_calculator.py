@@ -24,6 +24,22 @@ def get_loaded_rules(rule_version: str = "2026_SAMPLE_V1", force_reload: bool = 
         _RULES_CACHE[rule_version] = rules
     return _RULES_CACHE[rule_version]
 
+
+def extract_icd_code(text: str) -> Optional[str]:
+    """
+    DIP-ICD-001：统一自然语言与结构化入口的 ICD 编码提取逻辑。
+    1) 使用非 ASCII 字母数字边界替代 \\b，支持中文紧邻（如“诊断编码M17.9”、“诊断K63.500”）；
+    2) 先完整保留扩展编码（如 K63.500、I10.x00、R12.x00x002），不提前截断，
+       后续交由 match_dip_rule 优先精确匹配、无命中时再按统一规则归并至 4 位/3 位核心码。
+    """
+    if not text:
+        return None
+    m = re.search(
+        r'(?:^|(?<![A-Za-z0-9]))([A-Za-z]\d{2}(?:\.[0-9A-Za-z]{1,8})?)(?![A-Za-z0-9])',
+        str(text),
+    )
+    return m.group(1).upper() if m else None
+
 # ----------------------------------------------------
 # 统一医保别名定义 (肯定匹配与否定匹配共用同一套底表)
 # ----------------------------------------------------
