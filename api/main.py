@@ -19,6 +19,7 @@ import os
 import logging
 import re
 import threading
+from urllib.parse import quote
 
 # 确保能加载项目内部模块
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -434,11 +435,14 @@ async def check_patient_dip(req: CheckPatientDipRequest, operator: Dict[str, Any
 async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="科室筛选，如 中医科"),
                                scope: str = Query("active", description="统计范围：active（仅在院）/ month（本月全部患者）"),
                                year_month: Optional[str] = Query(None, description="目标月份 YYYY-MM（仅 scope=month 生效，默认当月）"),
+                               scan_dept: Optional[str] = Query(None, description="显式指定按单科扫描批次查看（默认仅选全院批次）"),
+                               batch_id: Optional[str] = Query(None, description="显式指定查询的批号"),
                                operator: Dict[str, Any] = Depends(require_roles(*ALERTS_ROLES))):
     """
     获取患者红黄绿灯控费预警清单（穿透读取 dbo.inpatient_dip_snapshot 最新批次）。
     - scope='active'（默认）：仅返回在院未出院患者快照（batch_id NOT LIKE 'MONTH_%'）。
     - scope='month'：严格按目标月份选取最新完成批次（MONTH_{YYYYMM}_%），避免补扫历史月覆盖当月。
+    - SNAP-DEPT-BATCH-001：默认仅选取全院范围扫描批次（scan_dept IS NULL），单科 --dept 扫描不会覆盖全院看板。
     患者级接口：强制有效令牌，仅科室主任、医保办与管理员角色可访问。
     支持按角色实施科室范围 (dept_scope) 行级数据隔离及快照过期检测。
     """
@@ -452,6 +456,8 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
         raise HTTPException(status_code=400, detail="scope 仅支持 active 或 month")
 
     ym_raw = year_month.strip() if isinstance(year_month, str) and year_month.strip() else None
+    req_scan_dept = scan_dept.strip() if isinstance(scan_dept, str) and scan_dept.strip() else None
+    req_batch_id = batch_id.strip() if isinstance(batch_id, str) and batch_id.strip() else None
     target_ym = None
     if scope_val == "month":
         target_ym = ym_raw or datetime.now(_DB_TZ).strftime("%Y-%m")
@@ -467,8 +473,9 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
 
     cursor, conn = get_local_db_connection(as_dict=True)
     try:
-        # SNAP-EMPTY-001：优先从 dbo.inpatient_scan_batch 按范围/月份选取最新已完成批次（支持 0 例最新批次覆盖旧批次），
-        # 并通过 NOT EXISTS 兼容无批次元数据的历史遗留明细批次（has_batch_meta=0 -> is_truncated=None 未知）。
+        # SNAP-EMPTY-001 & SNAP-DEPT-BATCH-001：
+        # 默认（未显式指定 scan_dept / batch_id 时）仅选取全院批次（scan_dept IS NULL），防止单科 --dept 扫描覆盖全院看板；
+        # 并通过 NOT EXISTS 兼容无批次元数据的历史遗留明细批次（has_batch_meta=0 -> 完整度/范围均未知）。
         pat_filter = f"MONTH_{target_ym.replace('-', '')}_%" if scope_val == "month" else "%"
         excl_filter = "" if scope_val == "month" else "MONTH_%"
         cursor.execute("""
@@ -479,41 +486,57 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
                 THEN N'probe_version'
                 ELSE N'CAST(NULL AS INT) AS probe_version'
             END;
+            DECLARE @sd_expr NVARCHAR(128) = CASE
+                WHEN COL_LENGTH('dbo.inpatient_scan_batch', 'scan_dept') IS NOT NULL
+                THEN N'scan_dept'
+                ELSE N'CAST(NULL AS NVARCHAR(100)) AS scan_dept'
+            END;
+            DECLARE @sd_where NVARCHAR(512) = CASE
+                WHEN COL_LENGTH('dbo.inpatient_scan_batch', 'scan_dept') IS NOT NULL
+                THEN N'((@req_bid IS NOT NULL AND batch_id = @req_bid) OR (@req_bid IS NULL AND @req_sd IS NOT NULL AND batch_id LIKE @pat AND scope = @sc AND (@ym IS NULL OR year_month = @ym) AND scan_dept = @req_sd) OR (@req_bid IS NULL AND @req_sd IS NULL AND batch_id LIKE @pat AND scope = @sc AND (@ym IS NULL OR year_month = @ym) AND scan_dept IS NULL))'
+                ELSE N'((@req_bid IS NOT NULL AND batch_id = @req_bid) OR (@req_bid IS NULL AND @req_sd IS NULL AND batch_id LIKE @pat AND scope = @sc AND (@ym IS NULL OR year_month = @ym)))'
+            END;
+            DECLARE @legacy_where NVARCHAR(512) = N'((@req_bid IS NOT NULL AND batch_id = @req_bid) OR (@req_bid IS NULL AND @req_sd IS NULL AND batch_id LIKE @pat AND (@excl = N'''' OR batch_id NOT LIKE @excl)))';
             DECLARE @ord_expr NVARCHAR(128) = CASE
                 WHEN COL_LENGTH('dbo.inpatient_scan_batch', 'seq_id') IS NOT NULL
                 THEN N'synced_at DESC, seq_id DESC'
                 ELSE N'synced_at DESC'
             END;
             DECLARE @dyn_sql NVARCHAR(MAX) = N'
-                SELECT TOP 1 batch_id, data_cutoff_time, synced_at, scope, year_month, scan_limit, total_scanned, is_truncated, probe_version, CAST(has_batch_meta AS BIT) AS has_batch_meta
+                SELECT TOP 1 batch_id, data_cutoff_time, synced_at, scope, year_month, scan_dept, scan_limit, total_scanned, is_truncated, probe_version, CAST(has_batch_meta AS BIT) AS has_batch_meta
                 FROM (
-                    SELECT batch_id, data_cutoff_time, synced_at, scope, year_month, scan_limit, total_scanned, is_truncated, ' + @pv_expr + N',
+                    SELECT batch_id, data_cutoff_time, synced_at, scope, year_month, ' + @sd_expr + N', scan_limit, total_scanned, is_truncated, ' + @pv_expr + N',
                            ' + CASE WHEN COL_LENGTH('dbo.inpatient_scan_batch', 'seq_id') IS NOT NULL THEN N'seq_id' ELSE N'CAST(0 AS BIGINT) AS seq_id' END + N',
                            1 AS has_batch_meta
                     FROM dbo.inpatient_scan_batch
-                    WHERE batch_id LIKE @pat AND scope = @sc AND (@ym IS NULL OR year_month = @ym)
+                    WHERE ' + @sd_where + N'
                     UNION ALL
                     SELECT batch_id, MAX(data_cutoff_time) AS data_cutoff_time, MAX(synced_at) AS synced_at,
                            CAST(NULL AS NVARCHAR(16)) AS scope, CAST(NULL AS NVARCHAR(7)) AS year_month,
+                           CAST(NULL AS NVARCHAR(100)) AS scan_dept,
                            CAST(NULL AS INT) AS scan_limit, CAST(NULL AS INT) AS total_scanned, CAST(NULL AS BIT) AS is_truncated,
                            CAST(NULL AS INT) AS probe_version, CAST(0 AS BIGINT) AS seq_id, 0 AS has_batch_meta
                     FROM dbo.inpatient_dip_snapshot
-                    WHERE batch_id LIKE @pat AND (@excl = N'''' OR batch_id NOT LIKE @excl)
+                    WHERE ' + @legacy_where + N'
                       AND NOT EXISTS (SELECT 1 FROM dbo.inpatient_scan_batch b WHERE b.batch_id = dbo.inpatient_dip_snapshot.batch_id)
                     GROUP BY batch_id
                 ) combined
                 ORDER BY ' + @ord_expr;
             EXEC sp_executesql
                 @dyn_sql,
-                N'@pat NVARCHAR(80), @excl NVARCHAR(80), @sc NVARCHAR(16), @ym NVARCHAR(7)',
-                @pat = %s, @excl = %s, @sc = %s, @ym = %s
+                N'@pat NVARCHAR(80), @excl NVARCHAR(80), @sc NVARCHAR(16), @ym NVARCHAR(7), @req_sd NVARCHAR(100), @req_bid NVARCHAR(64)',
+                @pat = %s, @excl = %s, @sc = %s, @ym = %s, @req_sd = %s, @req_bid = %s
         END
         ELSE
             SELECT TOP 1 batch_id, data_cutoff_time, synced_at
             FROM dbo.inpatient_dip_snapshot
-            WHERE batch_id LIKE %s AND (%s = '' OR batch_id NOT LIKE %s)
+            WHERE (%s IS NOT NULL AND batch_id = %s)
+               OR (%s IS NULL AND %s IS NULL AND batch_id LIKE %s AND (%s = '' OR batch_id NOT LIKE %s))
             ORDER BY synced_at DESC
-        """, (pat_filter, excl_filter, scope_val, target_ym, pat_filter, excl_filter, excl_filter))
+        """, (
+            pat_filter, excl_filter, scope_val, target_ym, req_scan_dept, req_batch_id,
+            req_batch_id, req_batch_id, req_batch_id, req_scan_dept, pat_filter, excl_filter, excl_filter,
+        ))
         latest_batch = cursor.fetchone()
 
         if not latest_batch:
@@ -521,6 +544,9 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
                 "is_demo_baseline": False,
                 "scope": scope_val,
                 "year_month": target_ym,
+                "scan_dept": req_scan_dept,
+                "coverage_scope": "DEPARTMENT_SCAN" if req_scan_dept else "UNKNOWN",
+                "coverage_warning": None,
                 "total": 0,
                 "total_scanned": None if role != ROLE_DEPT_HEAD else 0,
                 "scan_limit": None,
@@ -553,7 +579,8 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
         cursor.execute(
             "SELECT COL_LENGTH('dbo.inpatient_dip_snapshot', 'doctor_name') AS has_dn, "
             "OBJECT_ID('dbo.inpatient_scan_batch', 'U') AS has_batch_tbl, "
-            "COL_LENGTH('dbo.inpatient_scan_batch', 'probe_version') AS has_pv"
+            "COL_LENGTH('dbo.inpatient_scan_batch', 'probe_version') AS has_pv, "
+            "COL_LENGTH('dbo.inpatient_scan_batch', 'scan_dept') AS has_sd"
         )
         dn_row = cursor.fetchone() or {}
         doc_name_col = ", doctor_name" if dn_row.get("has_dn") is not None else ""
@@ -562,8 +589,9 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
             batch_meta = latest_batch
         elif dn_row.get("has_batch_tbl") is not None:
             pv_col = ", probe_version" if dn_row.get("has_pv") is not None else ", CAST(NULL AS INT) AS probe_version"
+            sd_col = ", scan_dept" if dn_row.get("has_sd") is not None else ", CAST(NULL AS NVARCHAR(100)) AS scan_dept"
             cursor.execute(
-                f"SELECT scope, year_month, scan_limit, total_scanned, is_truncated{pv_col} "
+                f"SELECT scope, year_month, scan_limit, total_scanned, is_truncated{pv_col}{sd_col} "
                 "FROM dbo.inpatient_scan_batch WHERE batch_id = %s",
                 (batch_id,),
             )
@@ -666,6 +694,21 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
         else:
             meta_is_truncated = False
 
+        # SNAP-DEPT-BATCH-001：明确区分全院覆盖（HOSPITAL）、单科扫描（DEPARTMENT_SCAN）、历史未知覆盖（UNKNOWN）
+        raw_scan_dept = ((batch_meta.get("scan_dept") or "").strip() or None) if has_meta else None
+        if not has_meta:
+            coverage_scope = "UNKNOWN"
+            coverage_warning = "历史批次缺少扫描覆盖范围元数据，无法确认扫描当时为全院或单科覆盖"
+        elif raw_scan_dept:
+            coverage_scope = "DEPARTMENT_SCAN"
+            coverage_warning = f"当前展示单科扫描批次（仅覆盖「{raw_scan_dept}」，非全院数据）"
+        elif raw_probe_ver is not None and int(raw_probe_ver) >= 3:
+            coverage_scope = "HOSPITAL"
+            coverage_warning = None
+        else:
+            coverage_scope = "UNKNOWN"
+            coverage_warning = "历史批次缺少扫描科室范围记录，无法确认扫描当时是否覆盖全院"
+
         # SNAP-COUNT-001：仅管理员/医保办接收全院扫描总数 total_scanned；科室主任仅接收本科授权可见数，严禁泄漏全院计数
         if role == ROLE_DEPT_HEAD:
             exposed_total_scanned: Optional[int] = len(items)
@@ -678,6 +721,9 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
             "is_demo_baseline": False,
             "scope": scope_val,
             "year_month": target_ym,
+            "scan_dept": raw_scan_dept,
+            "coverage_scope": coverage_scope,
+            "coverage_warning": coverage_warning,
             "total": len(items),
             "total_scanned": exposed_total_scanned,
             "scan_limit": int(meta_scan_limit) if meta_scan_limit is not None else None,
@@ -949,6 +995,8 @@ async def export_inpatient_alerts_csv(
     level: Optional[str] = Query(None),
     scope: str = Query("active"),
     year_month: Optional[str] = Query(None),
+    scan_dept: Optional[str] = Query(None),
+    batch_id: Optional[str] = Query(None),
     operator: Dict[str, Any] = Depends(require_roles(*ALERTS_ROLES)),
 ):
     op_rec = get_operator(operator["sub"])
@@ -961,7 +1009,14 @@ async def export_inpatient_alerts_csv(
 
     scope_val = scope if isinstance(scope, str) else "active"
     ym_val = year_month if isinstance(year_month, str) else None
-    alerts_data = await get_inpatient_alerts(dept=dept, scope=scope_val, year_month=ym_val, operator=operator)
+    sd_val = scan_dept if isinstance(scan_dept, str) and scan_dept.strip() else None
+    bid_val = batch_id if isinstance(batch_id, str) and batch_id.strip() else None
+    extra_args: Dict[str, Any] = {}
+    if sd_val is not None:
+        extra_args["scan_dept"] = sd_val
+    if bid_val is not None:
+        extra_args["batch_id"] = bid_val
+    alerts_data = await get_inpatient_alerts(dept=dept, scope=scope_val, year_month=ym_val, operator=operator, **extra_args)
     items = alerts_data.get("items") or []
     if level:
         lvl_u = level.strip().upper()
@@ -970,24 +1025,36 @@ async def export_inpatient_alerts_csv(
     total_scanned = alerts_data.get("total_scanned")
     scan_limit = alerts_data.get("scan_limit")
     is_truncated = alerts_data.get("is_truncated")
+    scan_dept_res = alerts_data.get("scan_dept")
+    cov_scope = alerts_data.get("coverage_scope") or ("DEPARTMENT_SCAN" if scan_dept_res else "UNKNOWN")
     auth_scope = alerts_data.get("authorized_scope") or ("DEPARTMENT" if operator.get("role") == ROLE_DEPT_HEAD else "HOSPITAL")
 
     if auth_scope == "DEPARTMENT":
         visible_n = len(items)
+        dept_tag = f"/单科扫描[{scan_dept_res}]" if scan_dept_res else ""
         if is_truncated is True:
-            scope_desc = f"本科可见{visible_n}例(全批受上限{scan_limit}截断)"
+            scope_desc = f"本科可见{visible_n}例(全批受上限{scan_limit}截断{dept_tag})"
         elif is_truncated is False:
-            scope_desc = f"本科可见{visible_n}例(全批完整)"
+            scope_desc = f"本科可见{visible_n}例(全批完整{dept_tag})"
         else:
-            scope_desc = f"本科可见{visible_n}例(完整度未知)"
+            scope_desc = f"本科可见{visible_n}例(完整度未知{dept_tag})"
         header_total = str(visible_n)
-    else:
+    elif cov_scope == "DEPARTMENT_SCAN" and scan_dept_res:
         if is_truncated is True:
-            scope_desc = f"截断(上限{scan_limit}/已扫{total_scanned}例)"
+            scope_desc = f"单科扫描[{scan_dept_res}](上限{scan_limit}/已扫{total_scanned}例)"
         elif is_truncated is False and total_scanned is not None:
-            scope_desc = f"全量(共{total_scanned}例)"
+            scope_desc = f"单科扫描[{scan_dept_res}](共{total_scanned}例)"
+        else:
+            scope_desc = f"单科扫描[{scan_dept_res}]"
+        header_total = str(total_scanned) if total_scanned is not None else ""
+    else:
+        cov_suffix = "[覆盖范围未知]" if cov_scope == "UNKNOWN" else ""
+        if is_truncated is True:
+            scope_desc = f"截断(上限{scan_limit}/已扫{total_scanned}例){cov_suffix}"
+        elif is_truncated is False and total_scanned is not None:
+            scope_desc = f"全量(共{total_scanned}例){cov_suffix}"
         elif is_truncated is False:
-            scope_desc = "全量"
+            scope_desc = f"全量{cov_suffix}"
         else:
             scope_desc = "未知(旧批次无完整度元数据)"
         header_total = str(total_scanned) if total_scanned is not None else ""
@@ -1024,6 +1091,8 @@ async def export_inpatient_alerts_csv(
             "X-DIP-Scope": alerts_data.get("scope") or scope_val,
             "X-DIP-Year-Month": alerts_data.get("year_month") or "",
             "X-DIP-Authorized-Scope": auth_scope,
+            "X-DIP-Coverage-Scope": cov_scope,
+            "X-DIP-Scan-Dept": quote(scan_dept_res, safe="") if scan_dept_res else "",
             "X-DIP-Total-Scanned": header_total,
             "X-DIP-Scan-Limit": str(scan_limit) if scan_limit is not None else "",
             "X-DIP-Is-Truncated": header_truncated,

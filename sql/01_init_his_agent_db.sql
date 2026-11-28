@@ -107,6 +107,7 @@ BEGIN
         seq_id           BIGINT IDENTITY(1, 1) NOT NULL,
         scope            NVARCHAR(16)  NOT NULL,
         year_month       NVARCHAR(7)   NULL,
+        scan_dept        NVARCHAR(100) NULL,
         rule_version     NVARCHAR(50)  NOT NULL,
         scan_limit       INT           NULL,
         total_scanned    INT           NOT NULL,
@@ -127,6 +128,12 @@ GO
 IF OBJECT_ID(N'dbo.inpatient_scan_batch', N'U') IS NOT NULL AND COL_LENGTH('dbo.inpatient_scan_batch', 'seq_id') IS NULL
 BEGIN
     ALTER TABLE dbo.inpatient_scan_batch ADD seq_id BIGINT IDENTITY(1, 1) NOT NULL;
+END
+GO
+
+IF OBJECT_ID(N'dbo.inpatient_scan_batch', N'U') IS NOT NULL AND COL_LENGTH('dbo.inpatient_scan_batch', 'scan_dept') IS NULL
+BEGIN
+    ALTER TABLE dbo.inpatient_scan_batch ADD scan_dept NVARCHAR(100) NULL;
 END
 GO
 

@@ -1347,10 +1347,27 @@ def test_deploy_key_001_compose_volume_resolution_and_isolation():
         assert proc_bad_cfg.returncode != 0
         assert "abort" in (proc_bad_cfg.stderr + proc_bad_cfg.stdout).lower()
 
+        # 3) --verify-only combined with --rollback must be rejected BEFORE creating dirs/containers
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            sentinel = os.path.join(td, "keep.conf")
+            open(sentinel, "w", encoding="utf-8").write("ORIGINAL")
+            proc_mutex = subprocess.run(
+                ["sh", script_path, "--verify-only", "--rollback", "--target-dir", td, "-f", compose_path],
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+            )
+            assert proc_mutex.returncode != 0
+            assert "mutually exclusive" in (proc_mutex.stderr + proc_mutex.stdout).lower()
+            assert open(sentinel, "r", encoding="utf-8").read() == "ORIGINAL"
+            assert not os.path.exists(os.path.join(td, "clients"))
+
     if os.path.exists(doc_path):
         doc_txt = open(doc_path, "r", encoding="utf-8").read()
         assert "docker compose -f docker-compose.yml -p my_proj up -d --force-recreate api wg nginx" in doc_txt
         assert "-f docker-compose.yml -p my_proj" in doc_txt
+        assert "--verify-only" in doc_txt and "--rollback" in doc_txt
 
 
 def test_snap_batch_id_001_same_second_collision_and_explicit_retry_offline():
@@ -1371,9 +1388,13 @@ def test_snap_batch_id_001_same_second_collision_and_explicit_retry_offline():
     sconn.execute(
         "CREATE TABLE batches ("
         "seq_id INTEGER PRIMARY KEY AUTOINCREMENT, "
-        "batch_id TEXT UNIQUE, scope TEXT, year_month TEXT, rule_version TEXT, scan_limit INT, "
+        "batch_id TEXT UNIQUE, scope TEXT, year_month TEXT, scan_dept TEXT, rule_version TEXT, scan_limit INT, "
         "total_scanned INT, is_truncated INT, probe_version INT, data_cutoff_time DATETIME, synced_at DATETIME)"
     )
+
+    scanner_src = open(os.path.abspath(scanner_mod.__file__), "r", encoding="utf-8").read()
+    assert "sys.sp_getapplock" in scanner_src
+    assert "@LockOwner = N'Transaction'" in scanner_src
 
     class _FakeScanCur:
         def __init__(self, as_dict=False):
@@ -1387,12 +1408,15 @@ def test_snap_batch_id_001_same_second_collision_and_explicit_retry_offline():
             self._all = []
             if "ALTER TABLE" in s or "CREATE TABLE dbo.inpatient_scan_batch" in s:
                 return
-            if s.startswith("SELECT TOP 1 1 FROM dbo.inpatient_scan_batch WHERE batch_id"):
+            if "sp_getapplock" in s:
+                self._one = (0,) if not self.as_dict else {"lock_rc": 0}
+                return
+            if s.startswith("SELECT TOP 1 1 AS dup_hit FROM dbo.inpatient_scan_batch WHERE batch_id"):
                 r = sconn.execute("SELECT 1 FROM batches WHERE batch_id = ?", (params[0],)).fetchone()
-                self._one = (1,) if r else None
-            elif s.startswith("SELECT TOP 1 1 FROM dbo.inpatient_dip_snapshot WHERE batch_id"):
+                self._one = {"dup_hit": 1} if r else None
+            elif s.startswith("SELECT TOP 1 1 AS dup_hit FROM dbo.inpatient_dip_snapshot WHERE batch_id"):
                 r = sconn.execute("SELECT 1 FROM snaps WHERE batch_id = ?", (params[0],)).fetchone()
-                self._one = (1,) if r else None
+                self._one = {"dup_hit": 1} if r else None
             elif s.startswith("DELETE FROM dbo.inpatient_dip_snapshot WHERE batch_id"):
                 sconn.execute("DELETE FROM snaps WHERE batch_id = ?", (params[0],))
             elif "MERGE dbo.inpatient_dip_snapshot" in s:
@@ -1408,24 +1432,39 @@ def test_snap_batch_id_001_same_second_collision_and_explicit_retry_offline():
             elif "MERGE dbo.inpatient_scan_batch" in s:
                 bid = params[0]
                 sconn.execute(
-                    "INSERT OR REPLACE INTO batches (batch_id, scope, year_month, rule_version, scan_limit, total_scanned, is_truncated, probe_version, data_cutoff_time, synced_at) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
-                    (bid, params[1], params[2], params[3], params[4], params[5], params[6], params[7], params[8], "2026-11-28 17:45:00"),
+                    "INSERT OR REPLACE INTO batches (batch_id, scope, year_month, scan_dept, rule_version, scan_limit, total_scanned, is_truncated, probe_version, data_cutoff_time, synced_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (bid, params[1], params[2], params[3], params[4], params[5], params[6], params[7], params[8], params[9], "2026-11-28 17:45:00"),
                 )
             elif "OBJECT_ID(N'dbo.inpatient_scan_batch'" in s:
                 pat, excl, sc, ym = params[0].replace("%", "*"), params[1], params[2], params[3]
-                row = sconn.execute(
-                    "SELECT batch_id, data_cutoff_time, synced_at, scope, year_month, scan_limit, total_scanned, is_truncated, probe_version, 1 AS has_batch_meta "
-                    "FROM batches WHERE scope = ? AND (? IS NULL OR year_month = ?) ORDER BY synced_at DESC, seq_id DESC LIMIT 1",
-                    (sc, ym, ym),
-                ).fetchone()
+                req_sd = params[4] if len(params) > 4 else None
+                req_bid = params[5] if len(params) > 5 else None
+                if req_bid is not None:
+                    row = sconn.execute(
+                        "SELECT batch_id, data_cutoff_time, synced_at, scope, year_month, scan_dept, scan_limit, total_scanned, is_truncated, probe_version, 1 AS has_batch_meta "
+                        "FROM batches WHERE batch_id = ? LIMIT 1",
+                        (req_bid,),
+                    ).fetchone()
+                elif req_sd is not None:
+                    row = sconn.execute(
+                        "SELECT batch_id, data_cutoff_time, synced_at, scope, year_month, scan_dept, scan_limit, total_scanned, is_truncated, probe_version, 1 AS has_batch_meta "
+                        "FROM batches WHERE scope = ? AND (? IS NULL OR year_month = ?) AND scan_dept = ? ORDER BY synced_at DESC, seq_id DESC LIMIT 1",
+                        (sc, ym, ym, req_sd),
+                    ).fetchone()
+                else:
+                    row = sconn.execute(
+                        "SELECT batch_id, data_cutoff_time, synced_at, scope, year_month, scan_dept, scan_limit, total_scanned, is_truncated, probe_version, 1 AS has_batch_meta "
+                        "FROM batches WHERE scope = ? AND (? IS NULL OR year_month = ?) AND scan_dept IS NULL ORDER BY synced_at DESC, seq_id DESC LIMIT 1",
+                        (sc, ym, ym),
+                    ).fetchone()
                 if row:
                     d = dict(row)
                     d["data_cutoff_time"] = datetime(2026, 11, 28, 17, 45, 0)
                     d["synced_at"] = datetime(2026, 11, 28, 17, 45, 0)
                     self._one = d
             elif "COL_LENGTH('dbo.inpatient_dip_snapshot', 'doctor_name')" in s:
-                self._one = {"has_dn": 1, "has_batch_tbl": 1, "has_pv": 1}
+                self._one = {"has_dn": 1, "has_batch_tbl": 1, "has_pv": 1, "has_sd": 1}
             elif "FROM dbo.inpatient_dip_snapshot WHERE batch_id" in s:
                 rows = sconn.execute("SELECT * FROM snaps WHERE batch_id = ?", (params[0],)).fetchall()
                 self._all = [dict(r) for r in rows]
@@ -1548,7 +1587,7 @@ def test_month_total_001_legacy_full_limit_vs_verified_and_compat_reader_offline
          patch.object(scanner_mod, "query_approved_dip_rules", return_value=[]):
         res_101 = scanner.scan_and_snapshot(scope="active", limit=100)
     assert legacy_101.seen_limits == [101]
-    assert res_101["scan_limit"] == 100 and res_101["total_scanned"] == 100 and res_101["is_truncated"] is True and res_101["probe_version"] == 2
+    assert res_101["scan_limit"] == 100 and res_101["total_scanned"] == 100 and res_101["is_truncated"] is True and res_101["probe_version"] >= 2
 
     # 2) API/CSV distinction between unverified legacy 100/100/false -> Unknown vs probe_version=2 100/100/false -> Complete vs 100/100/true -> Truncated
     scenarios = [
@@ -1611,3 +1650,171 @@ def test_month_total_001_legacy_full_limit_vs_verified_and_compat_reader_offline
         assert "report?.is_truncated === false" in vue_txt
         assert "report?.is_truncated == null" in vue_txt
         assert "完整度未知" in vue_txt
+
+
+def test_snap_dept_batch_001_dept_scan_does_not_overwrite_hospital_board_offline():
+    """SNAP-DEPT-BATCH-001: Hospital scan (5 cases: Dept A 2 + Dept B 3) stays active after --dept A (2 cases); dept scan identifiable."""
+    import sqlite3
+    import tools.inpatient_scanner as scanner_mod
+
+    sconn = sqlite3.connect(":memory:")
+    sconn.row_factory = sqlite3.Row
+    sconn.execute(
+        "CREATE TABLE snaps ("
+        "batch_id TEXT, visit_id TEXT, ward_name TEXT, bed_no TEXT, dept_id TEXT, dept_name TEXT, "
+        "doctor_id TEXT, doctor_name TEXT, age INT, ins_type TEXT, primary_icd TEXT, matched_rule_id INT, "
+        "rule_version TEXT, current_fee REAL, target_base REAL, fee_ratio REAL, alert_level TEXT, "
+        "pending_reason TEXT, discharge_review INT, data_cutoff_time DATETIME, synced_at DATETIME, "
+        "PRIMARY KEY (batch_id, visit_id))"
+    )
+    sconn.execute(
+        "CREATE TABLE batches ("
+        "seq_id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "batch_id TEXT UNIQUE, scope TEXT, year_month TEXT, scan_dept TEXT, rule_version TEXT, scan_limit INT, "
+        "total_scanned INT, is_truncated INT, probe_version INT, data_cutoff_time DATETIME, synced_at DATETIME)"
+    )
+
+    class _DeptIsoCur:
+        def __init__(self, as_dict=False):
+            self.as_dict = as_dict
+            self._one = None
+            self._all = []
+
+        def execute(self, sql, params=()):
+            s = " ".join(sql.split())
+            self._one = None
+            self._all = []
+            if "ALTER TABLE" in s or "CREATE TABLE dbo.inpatient_scan_batch" in s:
+                return
+            if "sp_getapplock" in s:
+                self._one = (0,) if not self.as_dict else {"lock_rc": 0}
+                return
+            if "MERGE dbo.inpatient_dip_snapshot" in s:
+                sconn.execute(
+                    "INSERT OR REPLACE INTO snaps VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (params[0], params[1], params[2], params[3], params[4], params[5], params[6], params[7], params[8],
+                     params[9], params[10], params[11], params[12], float(params[13]),
+                     float(params[14]) if params[14] is not None else None,
+                     float(params[15]) if params[15] is not None else None,
+                     params[16], params[17], params[18], params[19], datetime(2026, 11, 28, 17, 55, 0)),
+                )
+            elif "MERGE dbo.inpatient_scan_batch" in s:
+                sconn.execute(
+                    "INSERT OR REPLACE INTO batches (batch_id, scope, year_month, scan_dept, rule_version, scan_limit, total_scanned, is_truncated, probe_version, data_cutoff_time, synced_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (params[0], params[1], params[2], params[3], params[4], params[5], params[6], params[7], params[8], params[9], "2026-11-28 17:55:00"),
+                )
+            elif "OBJECT_ID(N'dbo.inpatient_scan_batch'" in s:
+                sc, ym, req_sd, req_bid = params[2], params[3], params[4], params[5]
+                if req_bid is not None:
+                    row = sconn.execute(
+                        "SELECT batch_id, data_cutoff_time, synced_at, scope, year_month, scan_dept, scan_limit, total_scanned, is_truncated, probe_version, 1 AS has_batch_meta "
+                        "FROM batches WHERE batch_id = ? LIMIT 1",
+                        (req_bid,),
+                    ).fetchone()
+                elif req_sd is not None:
+                    row = sconn.execute(
+                        "SELECT batch_id, data_cutoff_time, synced_at, scope, year_month, scan_dept, scan_limit, total_scanned, is_truncated, probe_version, 1 AS has_batch_meta "
+                        "FROM batches WHERE scope = ? AND (? IS NULL OR year_month = ?) AND scan_dept = ? ORDER BY synced_at DESC, seq_id DESC LIMIT 1",
+                        (sc, ym, ym, req_sd),
+                    ).fetchone()
+                else:
+                    row = sconn.execute(
+                        "SELECT batch_id, data_cutoff_time, synced_at, scope, year_month, scan_dept, scan_limit, total_scanned, is_truncated, probe_version, 1 AS has_batch_meta "
+                        "FROM batches WHERE scope = ? AND (? IS NULL OR year_month = ?) AND scan_dept IS NULL ORDER BY synced_at DESC, seq_id DESC LIMIT 1",
+                        (sc, ym, ym),
+                    ).fetchone()
+                if row:
+                    d = dict(row)
+                    d["data_cutoff_time"] = datetime(2026, 11, 28, 17, 55, 0)
+                    d["synced_at"] = datetime(2026, 11, 28, 17, 55, 0)
+                    self._one = d
+            elif "COL_LENGTH('dbo.inpatient_dip_snapshot', 'doctor_name')" in s:
+                self._one = {"has_dn": 1, "has_batch_tbl": 1, "has_pv": 1, "has_sd": 1}
+            elif "FROM dbo.inpatient_dip_snapshot WHERE batch_id" in s:
+                rows = sconn.execute("SELECT * FROM snaps WHERE batch_id = ?", (params[0],)).fetchall()
+                self._all = [dict(r) for r in rows]
+
+        def fetchone(self):
+            return self._one
+
+        def fetchall(self):
+            return self._all
+
+    class _DeptIsoConn:
+        def cursor(self, as_dict=True):
+            return _DeptIsoCur(as_dict=as_dict)
+        def commit(self):
+            sconn.commit()
+        def rollback(self):
+            sconn.rollback()
+        def close(self):
+            pass
+
+    all_patients = [
+        {"zyh": "A_1", "patient_name": "A1", "current_dept": "甲科", "current_dept_id": "101", "current_bed": "1",
+         "attending_doctor_id": "D1", "attending_doctor": "王", "age": "50", "ylzffs": "01", "insurance_type": "职工",
+         "admission_diag_code": "M17.9", "admission_diag_name": "膝关节病", "ssmc1": "保守治疗"},
+        {"zyh": "A_2", "patient_name": "A2", "current_dept": "甲科", "current_dept_id": "101", "current_bed": "2",
+         "attending_doctor_id": "D1", "attending_doctor": "王", "age": "50", "ylzffs": "01", "insurance_type": "职工",
+         "admission_diag_code": "M17.9", "admission_diag_name": "膝关节病", "ssmc1": "保守治疗"},
+        {"zyh": "B_1", "patient_name": "B1", "current_dept": "乙科", "current_dept_id": "102", "current_bed": "3",
+         "attending_doctor_id": "D2", "attending_doctor": "李", "age": "50", "ylzffs": "01", "insurance_type": "职工",
+         "admission_diag_code": "M17.9", "admission_diag_name": "膝关节病", "ssmc1": "保守治疗"},
+        {"zyh": "B_2", "patient_name": "B2", "current_dept": "乙科", "current_dept_id": "102", "current_bed": "4",
+         "attending_doctor_id": "D2", "attending_doctor": "李", "age": "50", "ylzffs": "01", "insurance_type": "职工",
+         "admission_diag_code": "M17.9", "admission_diag_name": "膝关节病", "ssmc1": "保守治疗"},
+        {"zyh": "B_3", "patient_name": "B3", "current_dept": "乙科", "current_dept_id": "102", "current_bed": "5",
+         "attending_doctor_id": "D2", "attending_doctor": "李", "age": "50", "ylzffs": "01", "insurance_type": "职工",
+         "admission_diag_code": "M17.9", "admission_diag_name": "膝关节病", "ssmc1": "保守治疗"},
+    ]
+
+    class _DeptHISReader:
+        def get_active_inpatients(self, department=None, limit=None, return_meta=False):
+            rows = [r for r in all_patients if not department or r["current_dept"] == department]
+            meta = {"scan_limit": limit, "total_scanned": len(rows), "is_truncated": False}
+            return (rows, meta) if return_meta else rows
+        def get_active_patient_fee(self, lsh, cutoff_time=None):
+            return {"total_fee": Decimal("1200.00"), "has_activity": True}
+
+    scanner = scanner_mod.InpatientScanner(rule_version="2026_SAMPLE_V1")
+    scanner.his_reader = _DeptHISReader()
+
+    with patch.object(scanner_mod, "get_local_db_connection", side_effect=lambda as_dict=False: (_DeptIsoCur(as_dict=as_dict), _DeptIsoConn())), \
+         patch.object(main_mod, "get_local_db_connection", side_effect=lambda as_dict=True: (_DeptIsoCur(as_dict=as_dict), _DeptIsoConn())), \
+         patch.object(main_mod, "get_operator", return_value={"operator_id": "admin", "role_type": "ADMIN", "dept_scope": "", "can_export_case": True}), \
+         patch.object(main_mod, "record_audit_log"), \
+         patch.object(scanner_mod, "query_approved_dip_rules", return_value=[]):
+        # 1) Full hospital scan (5 cases) followed by --dept 甲科 scan (2 cases)
+        hosp_res = scanner.scan_and_snapshot(scope="active")
+        dept_res = scanner.scan_and_snapshot(scope="active", department="甲科")
+        assert hosp_res["scan_dept"] is None and hosp_res["total_scanned"] == 5
+        assert dept_res["scan_dept"] == "甲科" and dept_res["total_scanned"] == 2
+
+        # 2) Normal hospital-wide query and CSV STILL point to full 5-case hospital batch
+        hosp_json = asyncio.run(main_mod.get_inpatient_alerts(dept=None, scope="active", operator={"sub": "admin", "role": "ADMIN", "dept": ""}))
+        assert hosp_json["batch_id"] == hosp_res["batch_id"]
+        assert hosp_json["total"] == 5 and hosp_json["coverage_scope"] == "HOSPITAL" and hosp_json["scan_dept"] is None
+        hosp_csv = asyncio.run(main_mod.export_inpatient_alerts_csv(dept=None, level=None, scope="active", operator={"sub": "admin", "role": "ADMIN", "dept": ""}))
+        assert hosp_csv.headers.get("X-DIP-Coverage-Scope") == "HOSPITAL"
+        assert "全量(共5例)" in hosp_csv.body.decode("utf-8")
+
+        # 3) Querying single-dept batch by scan_dept / batch_id returns 2-case 甲科 batch marked DEPARTMENT_SCAN (never '全量')
+        dept_json = asyncio.run(main_mod.get_inpatient_alerts(dept=None, scope="active", scan_dept="甲科", operator={"sub": "admin", "role": "ADMIN", "dept": ""}))
+        assert dept_json["batch_id"] == dept_res["batch_id"]
+        assert dept_json["total"] == 2 and dept_json["coverage_scope"] == "DEPARTMENT_SCAN" and dept_json["scan_dept"] == "甲科"
+        dept_csv = asyncio.run(main_mod.export_inpatient_alerts_csv(dept=None, level=None, scope="active", scan_dept="甲科", operator={"sub": "admin", "role": "ADMIN", "dept": ""}))
+        dept_csv_txt = dept_csv.body.decode("utf-8")
+        from urllib.parse import unquote
+        assert dept_csv.headers.get("X-DIP-Coverage-Scope") == "DEPARTMENT_SCAN"
+        assert unquote(dept_csv.headers.get("X-DIP-Scan-Dept") or "") == "甲科"
+        assert "单科扫描[甲科](共2例)" in dept_csv_txt
+        assert "全量" not in dept_csv_txt
+
+        # 4) Old historical batch created before scan_dept tracking (probe_version=2, scan_dept=None) reports coverage_scope='UNKNOWN' with warning
+        sconn.execute(
+            "INSERT INTO batches (batch_id, scope, year_month, scan_dept, rule_version, scan_limit, total_scanned, is_truncated, probe_version, data_cutoff_time, synced_at) "
+            "VALUES ('OLD_COV_UNKNOWN', 'active', NULL, NULL, '2026_SAMPLE_V1', 50, 5, 0, 2, '2026-11-28 10:00:00', '2026-11-28 10:00:00')"
+        )
+        old_json = asyncio.run(main_mod.get_inpatient_alerts(dept=None, scope="active", batch_id="OLD_COV_UNKNOWN", operator={"sub": "admin", "role": "ADMIN", "dept": ""}))
+        assert old_json["coverage_scope"] == "UNKNOWN" and old_json["coverage_warning"]

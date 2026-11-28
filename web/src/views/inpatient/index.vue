@@ -201,6 +201,12 @@ onMounted(loadData);
       <div class="mt-10px text-12px text-#64748b">
         当前批次：{{ report?.batch_id || '-' }} | 数据截止时间：{{ report?.batch_time || '-' }}
         <span v-if="report?.scope === 'month' && report?.year_month"> | 统计月份：{{ report.year_month }}</span>
+        <span v-if="report?.coverage_scope === 'DEPARTMENT_SCAN' && report?.scan_dept" class="text-#d97706">
+          | 单科扫描：{{ report.scan_dept }}（非全院）
+        </span>
+        <span v-else-if="report?.coverage_scope === 'UNKNOWN' && report?.batch_id" class="text-#64748b">
+          | 历史批次覆盖范围未知
+        </span>
         <span v-if="report?.is_truncated === true" class="text-#d97706">
           | 受上限 {{ report.scan_limit }} 截断（{{ isDeptOnlyScope ? `本科可见 ${counts.total}` : `已扫 ${report.total_scanned}` }} 例，非全量）
         </span>
@@ -219,6 +225,10 @@ onMounted(loadData);
 
     <NAlert v-else-if="report?.batch_id && report?.is_truncated == null" type="info" title="批次完整度未知说明">
       当前展示的批次缺少有效完整度探针元数据（历史旧批或旧版满额未校验批次），无法确认是否全量覆盖或受上限截断；建议由医保办/管理员重新触发一次扫描。
+    </NAlert>
+
+    <NAlert v-if="report?.coverage_warning" type="info" title="扫描覆盖范围提示">
+      {{ report.coverage_warning }}
     </NAlert>
 
     <NAlert v-if="report?.is_stale && report?.stale_warning" type="warning" title="快照数据过期提醒">

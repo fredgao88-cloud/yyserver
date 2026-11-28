@@ -38,6 +38,11 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+if [ "${VERIFY_ONLY}" = "1" ] && [ "${ROLLBACK}" = "1" ]; then
+  echo "ERROR: --verify-only and --rollback are mutually exclusive; aborting without modifying any files or volumes." >&2
+  exit 2
+fi
+
 resolve_compose_volume() {
   if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
     echo "ERROR: docker compose CLI is required to resolve effective WireGuard target volume safely; refusing to guess." >&2

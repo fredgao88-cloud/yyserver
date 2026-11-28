@@ -41,6 +41,8 @@
 
 ## 2. 回退步骤
 
+> `--verify-only`（只读校验）与 `--rollback`（回退写入）严格互斥；同时传入会直接报错退出，不会创建或修改任何文件与卷。
+
 如升级后需紧急回退至旧版宿主目录（同样保持 `-f` 与 `-p` 一致）：
 ```bash
 sudo sh wireguard/migrate_to_volume.sh --rollback --target-dir ./wireguard/config --compose-file docker-compose.yml

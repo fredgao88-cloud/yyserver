@@ -150,6 +150,9 @@ export interface InpatientAlertsResponse {
   is_demo_baseline: boolean;
   scope?: 'active' | 'month';
   year_month?: string | null;
+  scan_dept?: string | null;
+  coverage_scope?: 'HOSPITAL' | 'DEPARTMENT_SCAN' | 'UNKNOWN';
+  coverage_warning?: string | null;
   total: number;
   total_scanned?: number | null;
   scan_limit?: number | null;

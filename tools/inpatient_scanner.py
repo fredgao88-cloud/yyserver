@@ -144,14 +144,16 @@ class InpatientScanner:
             batch_id = str(batch_id).strip()
 
         data_cutoff_time = now_bj.strftime("%Y-%m-%d %H:%M:%S")
+        dept_val = (department or "").strip() or None
 
         # 1. Fetch patients to evaluate
         patients_to_scan = []
         month_meta: Dict[str, Any] = {
             "year_month": target_ym if scope_val == "month" else None,
+            "scan_dept": dept_val,
             "scan_limit": limit,
             "is_truncated": False,
-            "probe_version": 2,
+            "probe_version": 3,
         }
         if scope_val == "month":
             try:
@@ -274,6 +276,7 @@ class InpatientScanner:
                 "seq_id BIGINT IDENTITY(1,1) NOT NULL, "
                 "scope NVARCHAR(16) NOT NULL, "
                 "year_month NVARCHAR(7) NULL, "
+                "scan_dept NVARCHAR(100) NULL, "
                 "rule_version NVARCHAR(50) NOT NULL, "
                 "scan_limit INT NULL, "
                 "total_scanned INT NOT NULL, "
@@ -293,15 +296,41 @@ class InpatientScanner:
                 "AND COL_LENGTH('dbo.inpatient_scan_batch', 'seq_id') IS NULL "
                 "ALTER TABLE dbo.inpatient_scan_batch ADD seq_id BIGINT IDENTITY(1,1) NOT NULL;"
             )
+            local_cur.execute(
+                "IF OBJECT_ID(N'dbo.inpatient_scan_batch', N'U') IS NOT NULL "
+                "AND COL_LENGTH('dbo.inpatient_scan_batch', 'scan_dept') IS NULL "
+                "ALTER TABLE dbo.inpatient_scan_batch ADD scan_dept NVARCHAR(100) NULL;"
+            )
+            # 先提交幂等表结构自愈，避免后续按批次持锁事务阻塞在架构锁上
+            local_conn.commit()
+
+            # SNAP-BATCH-ID-001：写明细前按 batch_id 申请 SQL Server 事务级排他应用锁，
+            # 串行化跨进程/跨连接并发竞争，确保 error 模式严格仅一例成功、replace 模式摘要与明细严格同批。
+            local_cur.execute(
+                "IF OBJECT_ID(N'sys.sp_getapplock', N'P') IS NOT NULL "
+                "BEGIN "
+                "    DECLARE @lock_rc INT; "
+                "    EXEC @lock_rc = sys.sp_getapplock "
+                "        @Resource = %s, @LockMode = N'Exclusive', @LockOwner = N'Transaction', @LockTimeout = 30000; "
+                "    SELECT @lock_rc AS lock_rc; "
+                "END",
+                (f"dip_batch:{batch_id}",),
+            )
+            lock_row = local_cur.fetchone()
+            if lock_row is not None:
+                lock_rc = lock_row.get("lock_rc") if isinstance(lock_row, dict) else lock_row[0]
+                if lock_rc is not None and int(lock_rc) < 0:
+                    raise RuntimeError(f"EVENT=SCAN_BATCH_LOCK_FAILED batch={batch_id} rc={lock_rc}")
+
             if explicit_batch_id:
                 if if_exists == "error":
                     local_cur.execute(
-                        "SELECT TOP 1 1 FROM dbo.inpatient_scan_batch WHERE batch_id = %s",
+                        "SELECT TOP 1 1 AS dup_hit FROM dbo.inpatient_scan_batch WHERE batch_id = %s",
                         (batch_id,),
                     )
                     meta_dup = local_cur.fetchone()
                     local_cur.execute(
-                        "SELECT TOP 1 1 FROM dbo.inpatient_dip_snapshot WHERE batch_id = %s",
+                        "SELECT TOP 1 1 AS dup_hit FROM dbo.inpatient_dip_snapshot WHERE batch_id = %s",
                         (batch_id,),
                     )
                     snap_dup = local_cur.fetchone()
@@ -514,6 +543,7 @@ class InpatientScanner:
                 UPDATE SET
                     scope = %s,
                     year_month = %s,
+                    scan_dept = %s,
                     rule_version = %s,
                     scan_limit = %s,
                     total_scanned = %s,
@@ -522,19 +552,20 @@ class InpatientScanner:
                     data_cutoff_time = %s,
                     synced_at = SYSDATETIME()
             WHEN NOT MATCHED THEN
-                INSERT (batch_id, scope, year_month, rule_version, scan_limit, total_scanned, is_truncated, probe_version, data_cutoff_time, synced_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, SYSDATETIME());
+                INSERT (batch_id, scope, year_month, scan_dept, rule_version, scan_limit, total_scanned, is_truncated, probe_version, data_cutoff_time, synced_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, SYSDATETIME());
             """
             is_trunc_bit = 1 if month_meta.get('is_truncated') else 0
             ym_val = month_meta.get('year_month')
+            sd_val = month_meta.get('scan_dept')
             lim_val = month_meta.get('scan_limit')
             tot_val = len(evaluated_snapshots)
-            probe_ver_val = int(month_meta.get('probe_version') or 2)
+            probe_ver_val = int(month_meta.get('probe_version') or 3)
             local_cur.execute(
                 batch_meta_sql,
                 (
-                    batch_id, scope_val, ym_val, self.rule_version, lim_val, tot_val, is_trunc_bit, probe_ver_val, data_cutoff_time,
-                    batch_id, scope_val, ym_val, self.rule_version, lim_val, tot_val, is_trunc_bit, probe_ver_val, data_cutoff_time,
+                    batch_id, scope_val, ym_val, sd_val, self.rule_version, lim_val, tot_val, is_trunc_bit, probe_ver_val, data_cutoff_time,
+                    batch_id, scope_val, ym_val, sd_val, self.rule_version, lim_val, tot_val, is_trunc_bit, probe_ver_val, data_cutoff_time,
                 ),
             )
             local_conn.commit()
@@ -569,9 +600,10 @@ class InpatientScanner:
         summary['dept_alert_counts'] = dept_counts
         summary['scope'] = scope_val
         summary['year_month'] = month_meta.get('year_month')
+        summary['scan_dept'] = month_meta.get('scan_dept')
         summary['scan_limit'] = month_meta.get('scan_limit')
         summary['is_truncated'] = bool(month_meta.get('is_truncated'))
-        summary['probe_version'] = int(month_meta.get('probe_version') or 2)
+        summary['probe_version'] = int(month_meta.get('probe_version') or 3)
         summary['snapshots'] = evaluated_snapshots
 
         if notify_dingtalk:
