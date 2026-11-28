@@ -513,9 +513,20 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
                 synced_local = synced_aware.astimezone(_DB_TZ)
                 stale_warning = f"快照数据生成于 {synced_local.strftime('%Y-%m-%d %H:%M:%S')}，已超过 24 小时未更新，请及时运行定时巡检任务"
 
-        cursor.execute("SELECT COL_LENGTH('dbo.inpatient_dip_snapshot', 'doctor_name') AS has_dn")
+        cursor.execute(
+            "SELECT COL_LENGTH('dbo.inpatient_dip_snapshot', 'doctor_name') AS has_dn, "
+            "OBJECT_ID('dbo.inpatient_scan_batch', 'U') AS has_batch_tbl"
+        )
         dn_row = cursor.fetchone() or {}
         doc_name_col = ", doctor_name" if dn_row.get("has_dn") is not None else ""
+        batch_meta: Dict[str, Any] = {}
+        if dn_row.get("has_batch_tbl") is not None:
+            cursor.execute(
+                "SELECT scope, year_month, scan_limit, total_scanned, is_truncated "
+                "FROM dbo.inpatient_scan_batch WHERE batch_id = %s",
+                (batch_id,),
+            )
+            batch_meta = cursor.fetchone() or {}
 
         sql = f"""
         SELECT visit_id, ward_name, bed_no, dept_id, dept_name, doctor_id{doc_name_col}, age,
@@ -593,11 +604,18 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
                 "ratio_percent": float(ratio_dec) if ratio_dec is not None else None
             })
 
+        meta_total_scanned = batch_meta.get("total_scanned")
+        meta_scan_limit = batch_meta.get("scan_limit")
+        meta_is_truncated = bool(batch_meta.get("is_truncated")) if batch_meta else False
         return {
             "is_demo_baseline": False,
             "scope": scope_val,
             "year_month": target_ym,
             "total": len(items),
+            "total_scanned": int(meta_total_scanned) if meta_total_scanned is not None else len(items),
+            "scan_limit": int(meta_scan_limit) if meta_scan_limit is not None else None,
+            "is_truncated": meta_is_truncated,
+            "has_batch_meta": bool(batch_meta),
             "batch_id": batch_id,
             "batch_time": cutoff_time.strftime("%Y-%m-%d %H:%M:%S") if cutoff_time else None,
             "is_stale": is_stale,
@@ -838,15 +856,23 @@ def _csv_escape_cell(v: Any) -> str:
         s = "'" + s
     return '"' + s.replace('"', '""') + '"'
 
-def _build_csv_response(filename: str, headers: List[str], rows: List[List[Any]]) -> Response:
+def _build_csv_response(
+    filename: str,
+    headers: List[str],
+    rows: List[List[Any]],
+    extra_headers: Optional[Dict[str, str]] = None,
+) -> Response:
     lines = [",".join(_csv_escape_cell(h) for h in headers)]
     for row in rows:
         lines.append(",".join(_csv_escape_cell(cell) for cell in row))
     content = "\ufeff" + "\r\n".join(lines)
+    resp_headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    if extra_headers:
+        resp_headers.update({k: str(v) for k, v in extra_headers.items() if v is not None})
     return Response(
         content=content.encode("utf-8"),
         media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers=resp_headers,
     )
 
 @app.get("/api/inpatient/alerts/export", summary="导出在院/本月控费预警 CSV（需开通 can_export_case 权限）")
@@ -865,20 +891,32 @@ async def export_inpatient_alerts_csv(
         )
         raise HTTPException(status_code=403, detail="权限不足：当前账号未开通病例明细导出权限 (can_export_case=0)")
 
-    alerts_data = await get_inpatient_alerts(dept=dept, scope=scope, year_month=year_month, operator=operator)
+    scope_val = scope if isinstance(scope, str) else "active"
+    ym_val = year_month if isinstance(year_month, str) else None
+    alerts_data = await get_inpatient_alerts(dept=dept, scope=scope_val, year_month=ym_val, operator=operator)
     items = alerts_data.get("items") or []
     if level:
         lvl_u = level.strip().upper()
         items = [x for x in items if x.get("alert_level") == lvl_u]
 
-    headers = ["住院号", "科室", "床号", "医生工号", "医生姓名", "主诊断", "参保类型", "当前费用(元)", "DIP基准(元)", "占比(%)", "灯号", "状态"]
+    total_scanned = alerts_data.get("total_scanned")
+    scan_limit = alerts_data.get("scan_limit")
+    is_truncated = bool(alerts_data.get("is_truncated"))
+    if is_truncated:
+        scope_desc = f"截断(上限{scan_limit}/已扫{total_scanned}例)"
+    elif total_scanned is not None:
+        scope_desc = f"全量(共{total_scanned}例)"
+    else:
+        scope_desc = "全量"
+
+    headers = ["住院号", "科室", "床号", "医生工号", "医生姓名", "主诊断", "参保类型", "当前费用(元)", "DIP基准(元)", "占比(%)", "灯号", "状态", "扫描范围口径"]
     rows = [
         [
             it.get("zyh"), it.get("dept_name"), it.get("bed"), it.get("doctor_id"), it.get("doctor_name") or "-",
             it.get("disease"), it.get("ins_type"),
             it.get("current_cost_str") or it.get("current_cost"),
             it.get("benchmark_str") or it.get("benchmark"),
-            it.get("ratio_percent"), it.get("alert_level"), it.get("status"),
+            it.get("ratio_percent"), it.get("alert_level"), it.get("status"), scope_desc,
         ]
         for it in items
     ]
@@ -887,7 +925,19 @@ async def export_inpatient_alerts_csv(
         action_type="EXPORT_INPATIENT_ALERTS", target_ref=f"ROWS:{len(rows)}", auth_result="PERMITTED",
         batch_id=alerts_data.get("batch_id"),
     )
-    return _build_csv_response("inpatient_alerts.csv", headers, rows)
+    return _build_csv_response(
+        "inpatient_alerts.csv",
+        headers,
+        rows,
+        extra_headers={
+            "X-DIP-Batch-Id": alerts_data.get("batch_id") or "",
+            "X-DIP-Scope": alerts_data.get("scope") or scope_val,
+            "X-DIP-Year-Month": alerts_data.get("year_month") or "",
+            "X-DIP-Total-Scanned": str(total_scanned if total_scanned is not None else len(items)),
+            "X-DIP-Scan-Limit": str(scan_limit) if scan_limit is not None else "",
+            "X-DIP-Is-Truncated": "true" if is_truncated else "false",
+        },
+    )
 
 @app.get("/api/reconciliation/settled/export", summary="导出出院决算对账 CSV（需开通 can_export_case 权限）")
 async def export_settled_reconciliation_csv(

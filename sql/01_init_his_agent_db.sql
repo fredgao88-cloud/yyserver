@@ -99,6 +99,23 @@ BEGIN
 END
 GO
 
+-- 2b. 巡检扫描批次元数据表（持久化范围、月份、扫描上限、实际人数与截断标记）
+IF OBJECT_ID(N'dbo.inpatient_scan_batch', N'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.inpatient_scan_batch (
+        batch_id         NVARCHAR(64)  PRIMARY KEY,
+        scope            NVARCHAR(16)  NOT NULL,
+        year_month       NVARCHAR(7)   NULL,
+        rule_version     NVARCHAR(50)  NOT NULL,
+        scan_limit       INT           NULL,
+        total_scanned    INT           NOT NULL,
+        is_truncated     BIT           NOT NULL DEFAULT 0,
+        data_cutoff_time DATETIME2     NOT NULL,
+        synced_at        DATETIME2     NOT NULL DEFAULT SYSDATETIME()
+    );
+END
+GO
+
 -- 3. Agent 审计日志表（默认不保存原始对话、患者自由文本与返回明细）
 IF OBJECT_ID(N'dbo.agent_audit_log', N'U') IS NULL
 BEGIN

@@ -365,16 +365,17 @@ class HISReader:
             conn.close()
 
     # AUTH-ATTEND-001：拆分权威管床授权医生 (_AUTH_ATTENDING_DOC_SELECT) 与看板展示用推断医生 (_ATTENDING_DOC_SELECT)：
-    # 1) 权威来源仅采信：病案首页 his_bl_sy.zyysbm（唯一映射 ryid 或原始医保码）与住院登记/床位主表 his_gh (ysid / gdfysid / zzysid)；
+    # 1) 权威来源仅采信唯一且在册的标准医生主键 ryid (his_ry.isys=1)：
+    #    - 病案首页 his_bl_sy.zyysbm 同时合并 ybysdm 与 gjgbm_ybysdm 候选集后统一判重 (HAVING COUNT(DISTINCT ryid) = 1)；
+    #      若跨列冲突或未映射到在册医生，权威字段严格返回 NULL，原始编码仅保留给看板展示。
+    #    - 若 sy.zyysbm 为空，仅当 his_gh (ysid / gdfysid / zzysid) 对应唯一在册医生 r_gh.ryid IS NOT NULL 时采信。
     # 2) order_doc 仅按开单频次做看板展示兜底 (attending_doctor_source='ORDER_INFERRED')，绝不写入 auth_attending_doctor_id，
     #    也不在实时穿透鉴权接口 get_patient_realtime_admission 中返回或作为授权依据。
     _AUTH_ATTENDING_DOC_ID_EXPR = """CASE
                     WHEN NULLIF(LTRIM(RTRIM(sy.zyysbm)), '') IS NOT NULL
-                        THEN COALESCE(CAST(COALESCE(ry_yb.ryid, ry_gj.ryid) AS VARCHAR(32)), NULLIF(LTRIM(RTRIM(sy.zyysbm)), ''))
+                        THEN CAST(ry_sy.ryid AS VARCHAR(32))
                     WHEN r_gh.ryid IS NOT NULL
                         THEN CAST(r_gh.ryid AS VARCHAR(32))
-                    WHEN COALESCE(NULLIF(gh.ysid, 0), NULLIF(gh.gdfysid, 0), NULLIF(gh.zzysid, 0)) IS NOT NULL
-                        THEN CAST(COALESCE(NULLIF(gh.ysid, 0), NULLIF(gh.gdfysid, 0), NULLIF(gh.zzysid, 0)) AS VARCHAR(32))
                     ELSE NULL
                 END"""
 
@@ -382,13 +383,13 @@ class HISReader:
                 {_AUTH_ATTENDING_DOC_ID_EXPR} AS auth_attending_doctor_id,
                 {_AUTH_ATTENDING_DOC_ID_EXPR} AS attending_doctor_id,
                 CASE
-                    WHEN NULLIF(LTRIM(RTRIM(sy.zyysbm)), '') IS NOT NULL THEN 'SY_ZYYSBM'
-                    WHEN r_gh.ryid IS NOT NULL OR COALESCE(NULLIF(gh.ysid, 0), NULLIF(gh.gdfysid, 0), NULLIF(gh.zzysid, 0)) IS NOT NULL THEN 'HIS_GH'
+                    WHEN NULLIF(LTRIM(RTRIM(sy.zyysbm)), '') IS NOT NULL AND ry_sy.ryid IS NOT NULL THEN 'SY_ZYYSBM'
+                    WHEN NULLIF(LTRIM(RTRIM(sy.zyysbm)), '') IS NULL AND r_gh.ryid IS NOT NULL THEN 'HIS_GH'
                     ELSE NULL
                 END AS attending_doctor_source,
                 COALESCE(
                     NULLIF(LTRIM(RTRIM(sy.zyysname)), ''),
-                    NULLIF(LTRIM(RTRIM(COALESCE(ry_yb.ryname, ry_gj.ryname))), ''),
+                    NULLIF(LTRIM(RTRIM(ry_sy.ryname)), ''),
                     CASE
                         WHEN NULLIF(LTRIM(RTRIM(sy.zyysbm)), '') IS NULL
                             THEN COALESCE(
@@ -403,17 +404,20 @@ class HISReader:
                 {_AUTH_ATTENDING_DOC_ID_EXPR} AS auth_attending_doctor_id,
                 COALESCE(
                     {_AUTH_ATTENDING_DOC_ID_EXPR},
+                    NULLIF(LTRIM(RTRIM(sy.zyysbm)), ''),
+                    CAST(COALESCE(NULLIF(gh.ysid, 0), NULLIF(gh.gdfysid, 0), NULLIF(gh.zzysid, 0)) AS VARCHAR(32)),
                     CAST(order_doc.ryid AS VARCHAR(32))
                 ) AS attending_doctor_id,
                 CASE
-                    WHEN NULLIF(LTRIM(RTRIM(sy.zyysbm)), '') IS NOT NULL THEN 'SY_ZYYSBM'
+                    WHEN NULLIF(LTRIM(RTRIM(sy.zyysbm)), '') IS NOT NULL AND ry_sy.ryid IS NOT NULL THEN 'SY_ZYYSBM'
+                    WHEN NULLIF(LTRIM(RTRIM(sy.zyysbm)), '') IS NOT NULL THEN 'SY_ZYYSBM_RAW'
                     WHEN r_gh.ryid IS NOT NULL OR COALESCE(NULLIF(gh.ysid, 0), NULLIF(gh.gdfysid, 0), NULLIF(gh.zzysid, 0)) IS NOT NULL THEN 'HIS_GH'
                     WHEN order_doc.ryid IS NOT NULL THEN 'ORDER_INFERRED'
                     ELSE NULL
                 END AS attending_doctor_source,
                 COALESCE(
                     NULLIF(LTRIM(RTRIM(sy.zyysname)), ''),
-                    NULLIF(LTRIM(RTRIM(COALESCE(ry_yb.ryname, ry_gj.ryname))), ''),
+                    NULLIF(LTRIM(RTRIM(ry_sy.ryname)), ''),
                     CASE
                         WHEN NULLIF(LTRIM(RTRIM(sy.zyysbm)), '') IS NULL
                             THEN COALESCE(
@@ -482,19 +486,22 @@ class HISReader:
 
     _AUTH_ATTENDING_DOC_JOINS = """
             LEFT JOIN (
-                SELECT LTRIM(RTRIM(ybysdm)) AS ybysdm_key, MAX(ryid) AS ryid, MAX(LTRIM(RTRIM(ISNULL(ryname, '')))) AS ryname
-                FROM dbo.his_ry
-                WHERE NULLIF(LTRIM(RTRIM(ybysdm)), '') IS NOT NULL
-                GROUP BY LTRIM(RTRIM(ybysdm))
-                HAVING COUNT(*) = 1
-            ) ry_yb ON LTRIM(RTRIM(sy.zyysbm)) = ry_yb.ybysdm_key
-            LEFT JOIN (
-                SELECT LTRIM(RTRIM(gjgbm_ybysdm)) AS gjgbm_key, MAX(ryid) AS ryid, MAX(LTRIM(RTRIM(ISNULL(ryname, '')))) AS ryname
-                FROM dbo.his_ry
-                WHERE NULLIF(LTRIM(RTRIM(gjgbm_ybysdm)), '') IS NOT NULL
-                GROUP BY LTRIM(RTRIM(gjgbm_ybysdm))
-                HAVING COUNT(*) = 1
-            ) ry_gj ON LTRIM(RTRIM(sy.zyysbm)) = ry_gj.gjgbm_key
+                SELECT
+                    code_key,
+                    MAX(ryid) AS ryid,
+                    MAX(ryname) AS ryname
+                FROM (
+                    SELECT LTRIM(RTRIM(ybysdm)) AS code_key, ryid, LTRIM(RTRIM(ISNULL(ryname, ''))) AS ryname
+                    FROM dbo.his_ry
+                    WHERE isys = 1 AND NULLIF(LTRIM(RTRIM(ybysdm)), '') IS NOT NULL
+                    UNION ALL
+                    SELECT LTRIM(RTRIM(gjgbm_ybysdm)) AS code_key, ryid, LTRIM(RTRIM(ISNULL(ryname, ''))) AS ryname
+                    FROM dbo.his_ry
+                    WHERE isys = 1 AND NULLIF(LTRIM(RTRIM(gjgbm_ybysdm)), '') IS NOT NULL
+                ) sy_doc_map
+                GROUP BY code_key
+                HAVING COUNT(DISTINCT ryid) = 1
+            ) ry_sy ON LTRIM(RTRIM(sy.zyysbm)) = ry_sy.code_key
             OUTER APPLY (
                 SELECT TOP 1
                     g.ysid, g.gdfysid, g.zzysid, g.ysname, g.zzysname,

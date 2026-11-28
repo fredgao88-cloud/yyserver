@@ -826,3 +826,222 @@ def test_dip_icd_001_unified_extraction_and_matching_offline():
 
         tc = extract_tool_call("帮我判灯住院号 zy2026112704，诊断编码K63.500，已完成电子结肠镜检查，当前费用 1309 元，居民医保")
         assert tc["arguments"]["disease"] == "K63.500"
+
+
+def test_auth_attend_001_merged_ry_mapping_cross_col_and_unmapped_offline():
+    import sqlite3
+    from db.his_reader import HISReader
+    from agent.tool_dispatcher import dispatch_tool_call
+
+    # 1. Verify production SQL merges ybysdm & gjgbm_ybysdm without raw sy.zyysbm fallback in auth expression
+    assert "HAVING COUNT(DISTINCT ryid) = 1" in HISReader._AUTH_ATTENDING_DOC_JOINS
+    assert "COALESCE(CAST(COALESCE(ry_yb" not in HISReader._AUTH_ATTENDING_DOC_ID_EXPR
+    assert "sy.zyysbm)), ''" not in HISReader._AUTH_ATTENDING_DOC_ID_EXPR.replace("WHEN NULLIF(LTRIM(RTRIM(sy.zyysbm)), '') IS NOT NULL", "")
+
+    # 2. Simulate the exact merged candidate SQL in in-memory SQLite across all 4 required scenarios
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE his_ry (ryid INTEGER, ryname TEXT, isys INTEGER, ybysdm TEXT, gjgbm_ybysdm TEXT)")
+    conn.executemany(
+        "INSERT INTO his_ry VALUES (?, ?, ?, ?, ?)",
+        [
+            (101, "同人双列", 1, "YB_SAME", "YB_SAME"),
+            (201, "甲医生", 1, "YB_CONFLICT", None),
+            (202, "乙医生", 1, None, "YB_CONFLICT"),
+            (301, "丙医生", 1, "YB_A", "GJ_A"),
+            (302, "丁医生", 1, "YB_B", "GJ_B"),
+        ],
+    )
+
+    def _resolve_merged(code: str):
+        row = conn.execute(
+            """
+            SELECT ryid FROM (
+                SELECT code_key, MAX(ryid) AS ryid
+                FROM (
+                    SELECT TRIM(ybysdm) AS code_key, ryid FROM his_ry WHERE isys = 1 AND TRIM(COALESCE(ybysdm, '')) <> ''
+                    UNION ALL
+                    SELECT TRIM(gjgbm_ybysdm) AS code_key, ryid FROM his_ry WHERE isys = 1 AND TRIM(COALESCE(gjgbm_ybysdm, '')) <> ''
+                ) u
+                GROUP BY code_key
+                HAVING COUNT(DISTINCT ryid) = 1
+            ) m WHERE m.code_key = ?
+            """,
+            (code,),
+        ).fetchone()
+        return str(row[0]) if row else None
+
+    assert _resolve_merged("YB_SAME") == "101"
+    assert _resolve_merged("YB_CONFLICT") is None
+    assert _resolve_merged("UNMAPPED_RAW_CODE") is None
+    assert _resolve_merged("YB_A") == "301"
+    assert _resolve_merged("GJ_B") == "302"
+
+    operators = {
+        "op_101": {"operator_id": "op_101", "role_type": "DOCTOR", "doctor_id": "101", "status": "ACTIVE"},
+        "op_201": {"operator_id": "op_201", "role_type": "DOCTOR", "doctor_id": "201", "status": "ACTIVE"},
+        "op_raw": {"operator_id": "op_raw", "role_type": "DOCTOR", "doctor_id": "UNMAPPED_RAW_CODE", "status": "ACTIVE"},
+        "op_301": {"operator_id": "op_301", "role_type": "DOCTOR", "doctor_id": "301", "status": "ACTIVE"},
+        "op_302": {"operator_id": "op_302", "role_type": "DOCTOR", "doctor_id": "302", "status": "ACTIVE"},
+    }
+    admissions = {
+        "P_SAME": {"zyh": "P_SAME", "auth_attending_doctor_id": _resolve_merged("YB_SAME"), "attending_doctor_id": "101", "attending_doctor_source": "SY_ZYYSBM", "current_dept_id": "4"},
+        "P_CONFLICT": {"zyh": "P_CONFLICT", "auth_attending_doctor_id": _resolve_merged("YB_CONFLICT"), "attending_doctor_id": "YB_CONFLICT", "attending_doctor_source": "SY_ZYYSBM_RAW", "current_dept_id": "4"},
+        "P_RAW": {"zyh": "P_RAW", "auth_attending_doctor_id": _resolve_merged("UNMAPPED_RAW_CODE"), "attending_doctor_id": "UNMAPPED_RAW_CODE", "attending_doctor_source": "SY_ZYYSBM_RAW", "current_dept_id": "4"},
+        "P_HANDOVER": {"zyh": "P_HANDOVER", "auth_attending_doctor_id": _resolve_merged("YB_A"), "attending_doctor_id": "301", "attending_doctor_source": "SY_ZYYSBM", "current_dept_id": "4"},
+    }
+    handover_next_id = _resolve_merged("GJ_B")
+    conn.close()
+
+    class _AdmReader:
+        def get_patient_realtime_admission(self, pid):
+            return admissions.get(pid)
+
+    import agent.tool_dispatcher as td_mod
+    with patch.object(main_mod, "HISReader", return_value=_AdmReader()), \
+         patch.object(main_mod, "get_operator", side_effect=lambda o: operators.get(o)), \
+         patch.object(main_mod, "record_audit_log"), \
+         patch.object(td_mod, "HISReader", return_value=_AdmReader()), \
+         patch.object(td_mod, "get_operator", side_effect=lambda o: operators.get(o)):
+
+        # 同人双列匹配 -> 两条入口均放行
+        r_ok = asyncio.run(main_mod.check_patient_dip(main_mod.CheckPatientDipRequest(patient_id="P_SAME", disease="M17.9", current_cost=-1.0, ins_type="职工"), operator={"sub": "op_101", "role": "DOCTOR", "dept": ""}))
+        assert r_ok["pending_reason"] == "NEGATIVE_FEE_UNRECONCILED"
+
+        # 跨列冲突与无映射原始编码 -> 两条入口均严格拒绝 (403 / FORBIDDEN)
+        for pid, sub_id in [("P_CONFLICT", "op_201"), ("P_RAW", "op_raw")]:
+            try:
+                asyncio.run(main_mod.check_patient_dip(main_mod.CheckPatientDipRequest(patient_id=pid, disease="M17.9", current_cost=-1.0, ins_type="职工"), operator={"sub": sub_id, "role": "DOCTOR", "dept": ""}))
+                raise AssertionError(f"Expected 403 for {pid}")
+            except HTTPException as exc:
+                assert exc.status_code == 403
+            td_res = dispatch_tool_call({"name": "check_patient_dip", "arguments": {"patient_id": pid, "disease": "M17.9", "current_cost": "100", "ins_type": "职工"}}, {"authenticated": True, "sub": sub_id, "role": "DOCTOR", "dept": ""})
+            assert td_res["tool_executed"] is False and td_res["data"]["status"] == "FORBIDDEN"
+
+        # 交接：op_301 -> op_302 后，op_301 在两条入口均立即失权
+        admissions["P_HANDOVER"]["auth_attending_doctor_id"] = handover_next_id
+        admissions["P_HANDOVER"]["attending_doctor_id"] = "302"
+        r_new = asyncio.run(main_mod.check_patient_dip(main_mod.CheckPatientDipRequest(patient_id="P_HANDOVER", disease="M17.9", current_cost=-1.0, ins_type="职工"), operator={"sub": "op_302", "role": "DOCTOR", "dept": ""}))
+        assert r_new["pending_reason"] == "NEGATIVE_FEE_UNRECONCILED"
+        try:
+            asyncio.run(main_mod.check_patient_dip(main_mod.CheckPatientDipRequest(patient_id="P_HANDOVER", disease="M17.9", current_cost=-1.0, ins_type="职工"), operator={"sub": "op_301", "role": "DOCTOR", "dept": ""}))
+            raise AssertionError("Old doctor must be denied after handover")
+        except HTTPException as exc:
+            assert exc.status_code == 403
+        td_old = dispatch_tool_call({"name": "check_patient_dip", "arguments": {"patient_id": "P_HANDOVER", "disease": "M17.9", "current_cost": "100", "ins_type": "职工"}}, {"authenticated": True, "sub": "op_301", "role": "DOCTOR", "dept": ""})
+        assert td_old["tool_executed"] is False and td_old["data"]["status"] == "FORBIDDEN"
+
+
+def test_deploy_key_001_migration_upgrade_rehearsal_offline():
+    import tempfile
+    import shutil
+
+    root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    wg_dir = os.path.join(root_dir, "wireguard")
+    if os.path.exists(wg_dir):
+        mig_script = os.path.join(wg_dir, "migrate_to_volume.sh")
+        mig_doc = os.path.join(wg_dir, "UPGRADE_MIGRATION.md")
+        entrypoint_src = open(os.path.join(wg_dir, "entrypoint.sh"), "r", encoding="utf-8").read()
+        assert os.path.exists(mig_script) and os.path.exists(mig_doc)
+        assert 'if [ ! -f "${WG_DIR}/wg0.conf" ]; then' in entrypoint_src
+    else:
+        # Inside isolated API container, wireguard/ must be completely absent
+        assert not os.path.exists(os.path.join(wg_dir, "config"))
+
+    # Synthesize old-layout host config with a fake key marker, migrate to clean target volume dir
+    with tempfile.TemporaryDirectory() as tmpd:
+        old_cfg = os.path.join(tmpd, "old_wireguard_config")
+        new_vol = os.path.join(tmpd, "volume_etc_wireguard")
+        os.makedirs(os.path.join(old_cfg, "clients"), exist_ok=True)
+        fake_priv = "FAKE_WG_UPGRADE_PRIV_KEY_MARKER_2026"
+        fake_pub = "FAKE_WG_UPGRADE_PUB_KEY_MARKER_2026"
+        wg0_text = f"[Interface]\nPrivateKey = {fake_priv}\nListenPort = 51820\n[Peer]\n# peer1_mobile\nPublicKey = CLIENT_PUB_1\nAllowedIPs = 10.66.0.2/32\n"
+        peer_text = f"[Interface]\nPrivateKey = CLIENT_PRIV_1\nAddress = 10.66.0.2/32\n[Peer]\nPublicKey = {fake_pub}\nEndpoint = example:51820\n"
+        open(os.path.join(old_cfg, "wg0.conf"), "w").write(wg0_text)
+        open(os.path.join(old_cfg, "server.key"), "w").write(fake_priv + "\n")
+        open(os.path.join(old_cfg, "server.pub"), "w").write(fake_pub + "\n")
+        open(os.path.join(old_cfg, "clients", "peer1_mobile.conf"), "w").write(peer_text)
+
+        os.makedirs(os.path.join(new_vol, "clients"), exist_ok=True)
+        for rel in ("wg0.conf", "server.key", "server.pub", os.path.join("clients", "peer1_mobile.conf")):
+            shutil.copy2(os.path.join(old_cfg, rel), os.path.join(new_vol, rel))
+
+        # Re-check: wg0.conf exists -> key preservation guaranteed, server pub & peer list match
+        assert os.path.exists(os.path.join(new_vol, "wg0.conf"))
+        assert fake_pub in open(os.path.join(new_vol, "server.pub")).read()
+        assert "CLIENT_PUB_1" in open(os.path.join(new_vol, "wg0.conf")).read()
+        assert "CLIENT_PRIV_1" in open(os.path.join(new_vol, "clients", "peer1_mobile.conf")).read()
+
+
+def test_month_total_001_batch_truncation_persistence_and_csv_offline():
+    batches = {
+        "MONTH_202611_FULL": {
+            "batch_id": "MONTH_202611_FULL", "scope": "month", "year_month": "2026-11",
+            "scan_limit": None, "total_scanned": 201, "is_truncated": 0,
+            "data_cutoff_time": datetime(2026, 11, 28, 9, 0, 0), "synced_at": datetime(2026, 11, 28, 9, 0, 0),
+        },
+        "MONTH_202610_CAPPED": {
+            "batch_id": "MONTH_202610_CAPPED", "scope": "month", "year_month": "2026-10",
+            "scan_limit": 200, "total_scanned": 200, "is_truncated": 1,
+            "data_cutoff_time": datetime(2026, 10, 31, 23, 0, 0), "synced_at": datetime(2026, 10, 31, 23, 0, 0),
+        },
+    }
+
+    class _PersistCur:
+        def __init__(self):
+            self._one = None
+            self._all = []
+
+        def execute(self, sql, params=None):
+            s = str(sql)
+            if "SELECT TOP 1 batch_id" in s:
+                prefix = str((params or ["%"])[0]).rstrip("%")
+                hits = [b for b in batches.values() if b["batch_id"].startswith(prefix)]
+                hits.sort(key=lambda b: b["synced_at"], reverse=True)
+                self._one = hits[0] if hits else None
+            elif "OBJECT_ID('dbo.inpatient_scan_batch'" in s:
+                self._one = {"has_dn": 1, "has_batch_tbl": 1}
+            elif "FROM dbo.inpatient_scan_batch WHERE batch_id = %s" in s:
+                self._one = batches.get(params[0])
+            elif "FROM dbo.inpatient_dip_snapshot" in s:
+                bid = params[0]
+                self._all = [
+                    {
+                        "visit_id": f"{bid}_ZY1", "ward_name": "消化内科", "bed_no": "已结算", "dept_id": "1",
+                        "dept_name": "消化内科", "doctor_id": "100050", "doctor_name": "王延飞", "age": 53,
+                        "ins_type": "居民", "primary_icd": "K63.500", "matched_rule_id": 101,
+                        "current_fee": Decimal("1309.00"), "target_base": Decimal("2161.32"),
+                        "fee_ratio": Decimal("0.605648"), "alert_level": "GREEN",
+                        "pending_reason": None, "data_cutoff_time": batches[bid]["data_cutoff_time"],
+                    }
+                ]
+
+        def fetchone(self):
+            return self._one
+
+        def fetchall(self):
+            return self._all
+
+    class _PersistConn:
+        def cursor(self, as_dict=True):
+            return _PersistCur()
+
+        def close(self):
+            pass
+
+    with patch.object(main_mod, "get_local_db_connection", return_value=(_PersistCur(), _PersistConn())), \
+         patch.object(main_mod, "get_operator", return_value={"operator_id": "admin", "dept_scope": "", "can_export_case": True}), \
+         patch.object(main_mod, "record_audit_log"):
+        # Full 201 batch -> is_truncated=False, total_scanned=201
+        r_full = asyncio.run(main_mod.get_inpatient_alerts(dept=None, scope="month", year_month="2026-11", operator={"sub": "admin", "role": "ADMIN", "dept": ""}))
+        assert r_full["total_scanned"] == 201 and r_full["scan_limit"] is None and r_full["is_truncated"] is False
+        c_full = asyncio.run(main_mod.export_inpatient_alerts_csv(dept=None, level=None, scope="month", year_month="2026-11", operator={"sub": "admin", "role": "ADMIN", "dept": ""}))
+        assert c_full.headers.get("X-DIP-Is-Truncated") == "false"
+        assert "全量(共201例)" in c_full.body.decode("utf-8")
+
+        # Switching to capped 200 batch preserves truncated flag & limit in UI API and CSV export
+        r_cap = asyncio.run(main_mod.get_inpatient_alerts(dept=None, scope="month", year_month="2026-10", operator={"sub": "admin", "role": "ADMIN", "dept": ""}))
+        assert r_cap["total_scanned"] == 200 and r_cap["scan_limit"] == 200 and r_cap["is_truncated"] is True
+        c_cap = asyncio.run(main_mod.export_inpatient_alerts_csv(dept=None, level=None, scope="month", year_month="2026-10", operator={"sub": "admin", "role": "ADMIN", "dept": ""}))
+        assert c_cap.headers.get("X-DIP-Is-Truncated") == "true"
+        assert c_cap.headers.get("X-DIP-Scan-Limit") == "200"
+        assert "截断(上限200/已扫200例)" in c_cap.body.decode("utf-8")

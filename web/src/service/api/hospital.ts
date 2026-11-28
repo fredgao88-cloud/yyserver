@@ -151,6 +151,10 @@ export interface InpatientAlertsResponse {
   scope?: 'active' | 'month';
   year_month?: string | null;
   total: number;
+  total_scanned?: number;
+  scan_limit?: number | null;
+  is_truncated?: boolean;
+  has_batch_meta?: boolean;
   batch_id: string | null;
   batch_time: string | null;
   is_stale: boolean;

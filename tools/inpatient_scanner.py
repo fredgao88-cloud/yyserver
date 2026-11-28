@@ -227,6 +227,20 @@ class InpatientScanner:
                 "AND COL_LENGTH('dbo.inpatient_dip_snapshot', 'doctor_name') IS NULL "
                 "ALTER TABLE dbo.inpatient_dip_snapshot ADD doctor_name NVARCHAR(64) NULL;"
             )
+            local_cur.execute(
+                "IF OBJECT_ID(N'dbo.inpatient_scan_batch', N'U') IS NULL "
+                "CREATE TABLE dbo.inpatient_scan_batch ("
+                "batch_id NVARCHAR(64) PRIMARY KEY, "
+                "scope NVARCHAR(16) NOT NULL, "
+                "year_month NVARCHAR(7) NULL, "
+                "rule_version NVARCHAR(50) NOT NULL, "
+                "scan_limit INT NULL, "
+                "total_scanned INT NOT NULL, "
+                "is_truncated BIT NOT NULL DEFAULT 0, "
+                "data_cutoff_time DATETIME2 NOT NULL, "
+                "synced_at DATETIME2 NOT NULL DEFAULT SYSDATETIME()"
+                ");"
+            )
             for pat in patients_to_scan:
                 zyh = pat['zyh']
                 ward_name = pat.get('current_dept') or '默认病区'
@@ -420,6 +434,35 @@ class InpatientScanner:
                     'pending_reason': pending_reason
                 })
 
+            batch_meta_sql = """
+            MERGE dbo.inpatient_scan_batch AS target
+            USING (SELECT %s AS batch_id) AS source
+            ON (target.batch_id = source.batch_id)
+            WHEN MATCHED THEN
+                UPDATE SET
+                    scope = %s,
+                    year_month = %s,
+                    rule_version = %s,
+                    scan_limit = %s,
+                    total_scanned = %s,
+                    is_truncated = %s,
+                    data_cutoff_time = %s,
+                    synced_at = SYSDATETIME()
+            WHEN NOT MATCHED THEN
+                INSERT (batch_id, scope, year_month, rule_version, scan_limit, total_scanned, is_truncated, data_cutoff_time, synced_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, SYSDATETIME());
+            """
+            is_trunc_bit = 1 if month_meta.get('is_truncated') else 0
+            ym_val = month_meta.get('year_month')
+            lim_val = month_meta.get('scan_limit')
+            tot_val = len(evaluated_snapshots)
+            local_cur.execute(
+                batch_meta_sql,
+                (
+                    batch_id, scope_val, ym_val, self.rule_version, lim_val, tot_val, is_trunc_bit, data_cutoff_time,
+                    batch_id, scope_val, ym_val, self.rule_version, lim_val, tot_val, is_trunc_bit, data_cutoff_time,
+                ),
+            )
             local_conn.commit()
             print(f"[{batch_id}] Successfully persisted {len(evaluated_snapshots)} snapshot records to local_db.")
         except Exception as scan_err:

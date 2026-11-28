@@ -117,7 +117,7 @@ def test_his_ry_mapping_and_fallback_sql():
     with patch.object(reader, "get_connection", return_value=conn_act):
         reader.get_active_inpatients(limit=10)
         act_sql = cur_act.executed[0][0]
-        assert "HAVING COUNT(*) = 1" in act_sql
+        assert "HAVING COUNT(DISTINCT ryid) = 1" in act_sql
         assert "dbo.his_gh" in act_sql and "gdfysid" in act_sql and "ks_gh.ksname" in act_sql
         assert "dbo.his_btyb_rycbxx_1101" in act_sql and "gh.jylxid" in act_sql
         assert "gh.jbbm" in act_sql and "gh.ssname" in act_sql

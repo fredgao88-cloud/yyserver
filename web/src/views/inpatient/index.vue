@@ -23,7 +23,6 @@ const filterYearMonth = ref<string>(
 const filterDept = ref('');
 const filterLevel = ref<string | null>(null);
 const notifyDingtalk = ref(false);
-const scanTruncated = ref(false);
 const report = ref<InpatientAlertsResponse | null>(null);
 
 const canScan = computed(() => authStore.userInfo.roles.some(r => ['ADMIN', 'INSURANCE_OFFICER'].includes(r)));
@@ -133,7 +132,6 @@ async function handleTriggerScan() {
     // 月度全量扫描不设硬截断上限；在院实时扫描使用默认全量或 100
     const scanLimit = filterScope.value === 'month' ? undefined : 100;
     const res = await triggerManualScan(scanLimit, notifyDingtalk.value, filterScope.value, ym);
-    scanTruncated.value = Boolean(res.is_truncated);
     window.$message?.success(
       `巡检完成（${res.batch_id}）：共 ${res.total_scanned} 例${res.is_truncated ? `（受上限 ${res.scan_limit} 截断）` : ''}，红灯 ${res.RED} / 黄灯 ${res.YELLOW} / 绿灯 ${res.GREEN} / 待定 ${res.PENDING}`
     );
@@ -201,10 +199,19 @@ onMounted(loadData);
       </div>
       <div class="mt-10px text-12px text-#64748b">
         当前批次：{{ report?.batch_id || '-' }} | 数据截止时间：{{ report?.batch_time || '-' }}
-        <span v-if="report?.scope === 'month' && report?.year_month"> | 统计月份：{{ report.year_month }}（全量 {{ counts.total }} 例）</span>
-        <span v-if="scanTruncated" class="text-#d97706"> | 注意：上次触发扫描受上限截断</span>
+        <span v-if="report?.scope === 'month' && report?.year_month"> | 统计月份：{{ report.year_month }}</span>
+        <span v-if="report?.is_truncated" class="text-#d97706">
+          | 受上限 {{ report.scan_limit }} 截断（已扫 {{ report.total_scanned }} 例，非全量）
+        </span>
+        <span v-else-if="report?.has_batch_meta || (report?.scope === 'month' && report?.batch_id)">
+          | 全量已扫 {{ report?.total_scanned ?? counts.total }} 例（未截断）
+        </span>
       </div>
     </NCard>
+
+    <NAlert v-if="report?.is_truncated" type="warning" title="扫描批次受上限截断提醒">
+      当前批次受扫描上限 {{ report.scan_limit }} 截断（已扫 {{ report.total_scanned }} 例，可能存在未纳入的病例），请点击「刷新本月全量巡检」获取完整清单。
+    </NAlert>
 
     <NAlert v-if="report?.is_stale && report?.stale_warning" type="warning" title="快照数据过期提醒">
       {{ report.stale_warning }}
