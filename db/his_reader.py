@@ -364,6 +364,175 @@ class HISReader:
         finally:
             conn.close()
 
+    # 共享管床医生解析 SQL 片段：
+    # 1) 若病案首页 his_bl_sy.zyysbm 非空，仅当其在 dbo.his_ry (ybysdm / gjgbm_ybysdm) 唯一匹配时映射为标准 ryid，否则保留原始编码（防重码歧义误配）；
+    # 2) 若病案首页尚未填写 (zyysbm 为空)，优先读取住院登记/床位主表 dbo.his_gh (ysid / gdfysid / zzysid) 关联 his_ry；
+    # 3) 若 his_gh 仍为空，兜底从在院临床 his_zycz、中药医嘱 his_bl_yzzycf、住院处方 his_zycfmain 聚合有效医生 (his_ry.isys = 1) 的主力开单 ryid。
+    _ATTENDING_DOC_SELECT = """
+                CASE
+                    WHEN NULLIF(LTRIM(RTRIM(sy.zyysbm)), '') IS NOT NULL
+                        THEN COALESCE(CAST(COALESCE(ry_yb.ryid, ry_gj.ryid) AS VARCHAR(32)), NULLIF(LTRIM(RTRIM(sy.zyysbm)), ''))
+                    WHEN r_gh.ryid IS NOT NULL
+                        THEN CAST(r_gh.ryid AS VARCHAR(32))
+                    WHEN COALESCE(NULLIF(gh.ysid, 0), NULLIF(gh.gdfysid, 0), NULLIF(gh.zzysid, 0)) IS NOT NULL
+                        THEN CAST(COALESCE(NULLIF(gh.ysid, 0), NULLIF(gh.gdfysid, 0), NULLIF(gh.zzysid, 0)) AS VARCHAR(32))
+                    ELSE CAST(order_doc.ryid AS VARCHAR(32))
+                END AS attending_doctor_id,
+                COALESCE(
+                    NULLIF(LTRIM(RTRIM(sy.zyysname)), ''),
+                    NULLIF(LTRIM(RTRIM(COALESCE(ry_yb.ryname, ry_gj.ryname))), ''),
+                    CASE
+                        WHEN NULLIF(LTRIM(RTRIM(sy.zyysbm)), '') IS NULL
+                            THEN COALESCE(
+                                NULLIF(LTRIM(RTRIM(r_gh.ryname)), ''),
+                                NULLIF(LTRIM(RTRIM(gh.ysname)), ''),
+                                NULLIF(LTRIM(RTRIM(gh.zzysname)), ''),
+                                order_doc.ryname
+                            )
+                    END
+                ) AS attending_doctor,"""
+
+    # 共享科室与床位解析 SQL 片段：
+    # 1) 转科优先 (zk_latest.xksid / xksname)，否则取住院登记主表 his_gh (ksid 关联 his_ks -> ksname) 与 his_gh.cwhname；
+    # 2) his_bl_sy 中空白占位符 '-' 视同 NULL，防止 sy.zkkb='-' 阻断兜底导致展示 '-' 与 dept_id 缺失。
+    _DEPT_EXPR = """COALESCE(
+                    NULLIF(NULLIF(LTRIM(RTRIM(zk_latest.xksname)), ''), '-'),
+                    NULLIF(NULLIF(LTRIM(RTRIM(ks_gh.ksname)), ''), '-'),
+                    NULLIF(NULLIF(LTRIM(RTRIM(gh.ksname)), ''), '-'),
+                    NULLIF(NULLIF(LTRIM(RTRIM(sy.zkkb)), ''), '-'),
+                    NULLIF(NULLIF(LTRIM(RTRIM(sy.rykb)), ''), '-')
+                )"""
+
+    _DEPT_BED_SELECT = f"""
+                COALESCE(zk_latest.xksid, NULLIF(gh.ksid, 0), NULLIF(sy.ksid, 0)) AS current_dept_id,
+                {_DEPT_EXPR} AS current_dept,
+                COALESCE(
+                    NULLIF(NULLIF(LTRIM(RTRIM(zk_latest.xbfname)), ''), '-'),
+                    NULLIF(NULLIF(LTRIM(RTRIM(gh.cwhname)), ''), '-'),
+                    NULLIF(NULLIF(LTRIM(RTRIM(sy.rybf)), ''), '-')
+                ) AS current_bed,"""
+
+    _CLINICAL_DIAG_SELECT = """
+                COALESCE(
+                    NULLIF(NULLIF(LTRIM(RTRIM(sy.ryzdbm)), ''), '-'),
+                    NULLIF(NULLIF(LTRIM(RTRIM(gh.jbbm)), ''), '-')
+                ) AS admission_diag_code,
+                COALESCE(
+                    NULLIF(NULLIF(LTRIM(RTRIM(sy.ryzd)), ''), '-'),
+                    NULLIF(NULLIF(LTRIM(RTRIM(gh.jbname)), ''), '-'),
+                    NULLIF(NULLIF(LTRIM(RTRIM(gh.lczd)), ''), '-')
+                ) AS admission_diag_name,"""
+
+    # 共享参保类型解析 SQL 片段：
+    # 1) 优先取 explicit 覆盖字段 jb.fylx；
+    # 2) 自费(jylxid=2)与公费(jylxid=3)严禁被医保卡历史险种误识别为职工/居民；
+    # 3) 国家医保 1101 实时有效参保表 his_btyb_rycbxx_1101 (310 职工 / 390 居民) 修正 his_gh.xzlxid 滞后缓存；
+    # 4) 兜底按 his_gh.jylxid=1(居民) / 4(城镇医保按 xzlxid 消歧，缺失保持歧义)。
+    _INSURANCE_TYPE_SELECT = """
+                COALESCE(
+                    NULLIF(LTRIM(RTRIM(jb.fylx)), ''),
+                    CASE
+                        WHEN gh.jylxid = 2 OR LTRIM(RTRIM(ISNULL(gh.jylxname, ''))) = '自费' THEN N'自费'
+                        WHEN gh.jylxid = 3 OR LTRIM(RTRIM(ISNULL(gh.jylxname, ''))) = '公费' THEN N'公费医疗'
+                        WHEN yb1101.insutype = '310' THEN N'职工基本医疗保险'
+                        WHEN yb1101.insutype = '390' THEN N'城乡居民基本医疗保险'
+                        WHEN gh.jylxid = 1 THEN N'居民'
+                        WHEN gh.jylxid = 4 THEN
+                            CASE
+                                WHEN LTRIM(RTRIM(ISNULL(gh.xzlxid, ''))) = '310' THEN N'职工基本医疗保险'
+                                WHEN LTRIM(RTRIM(ISNULL(gh.xzlxid, ''))) = '390' THEN N'城乡居民基本医疗保险'
+                                ELSE NULLIF(LTRIM(RTRIM(gh.jylxname)), '')
+                            END
+                        ELSE COALESCE(NULLIF(LTRIM(RTRIM(gh.xzlxname)), ''), NULLIF(LTRIM(RTRIM(gh.jylxname)), ''))
+                    END
+                ) AS insurance_type"""
+
+    _ATTENDING_DOC_JOINS = """
+            LEFT JOIN (
+                SELECT LTRIM(RTRIM(ybysdm)) AS ybysdm_key, MAX(ryid) AS ryid, MAX(LTRIM(RTRIM(ISNULL(ryname, '')))) AS ryname
+                FROM dbo.his_ry
+                WHERE NULLIF(LTRIM(RTRIM(ybysdm)), '') IS NOT NULL
+                GROUP BY LTRIM(RTRIM(ybysdm))
+                HAVING COUNT(*) = 1
+            ) ry_yb ON LTRIM(RTRIM(sy.zyysbm)) = ry_yb.ybysdm_key
+            LEFT JOIN (
+                SELECT LTRIM(RTRIM(gjgbm_ybysdm)) AS gjgbm_key, MAX(ryid) AS ryid, MAX(LTRIM(RTRIM(ISNULL(ryname, '')))) AS ryname
+                FROM dbo.his_ry
+                WHERE NULLIF(LTRIM(RTRIM(gjgbm_ybysdm)), '') IS NOT NULL
+                GROUP BY LTRIM(RTRIM(gjgbm_ybysdm))
+                HAVING COUNT(*) = 1
+            ) ry_gj ON LTRIM(RTRIM(sy.zyysbm)) = ry_gj.gjgbm_key
+            OUTER APPLY (
+                SELECT TOP 1
+                    g.ysid, g.gdfysid, g.zzysid, g.ysname, g.zzysname,
+                    g.ksid, g.ksname, g.cwhname,
+                    g.jylxid, g.jylxname, g.xzlxid, g.xzlxname, g.psn_no,
+                    g.jbbm, g.jbname, g.lczd, g.ssbm, g.ssname, g.oldyear, g.zyts, g.ghrq
+                FROM dbo.his_gh g
+                WHERE g.lsh = sy.lsh
+            ) gh
+            LEFT JOIN dbo.his_ks ks_gh ON gh.ksid = ks_gh.ksid
+            OUTER APPLY (
+                SELECT TOP 1 LTRIM(RTRIM(r1101.insutype)) AS insutype
+                FROM dbo.his_btyb_rycbxx_1101 r1101
+                WHERE NULLIF(LTRIM(RTRIM(gh.psn_no)), '') IS NOT NULL
+                  AND r1101.psn_no = gh.psn_no
+                  AND r1101.psn_insu_stas = '1'
+                ORDER BY r1101.psn_insu_date DESC
+            ) yb1101
+            LEFT JOIN dbo.his_ry r_gh
+                ON COALESCE(NULLIF(gh.ysid, 0), NULLIF(gh.gdfysid, 0), NULLIF(gh.zzysid, 0)) = r_gh.ryid
+               AND r_gh.isys = 1
+            OUTER APPLY (
+                SELECT TOP 1 r.ryid, LTRIM(RTRIM(ISNULL(r.ryname, ''))) AS ryname
+                FROM (
+                    SELECT cz.ysid AS ysid, cz.ckrq AS act_ts
+                    FROM dbo.his_zycz cz
+                    WHERE cz.lsh = sy.lsh AND cz.ysid IS NOT NULL AND ISNULL(cz.istf, 0) = 0
+                    UNION ALL
+                    SELECT yz.cfysid AS ysid, CAST(NULL AS DATETIME) AS act_ts
+                    FROM dbo.his_bl_yzzycf yz
+                    WHERE yz.lsh = sy.lsh AND yz.cfysid IS NOT NULL
+                    UNION ALL
+                    SELECT cf.ysid AS ysid, cf.cfrq AS act_ts
+                    FROM dbo.his_zycfmain cf
+                    WHERE cf.lsh = sy.lsh AND cf.ysid IS NOT NULL AND ISNULL(cf.istf, 0) = 0
+                ) ord
+                INNER JOIN dbo.his_ry r ON ord.ysid = r.ryid AND r.isys = 1
+                GROUP BY r.ryid, LTRIM(RTRIM(ISNULL(r.ryname, '')))
+                ORDER BY COUNT(*) DESC, MAX(ord.act_ts) DESC, r.ryid DESC
+            ) order_doc"""
+
+    def get_his_doctors(self, include_non_doctors: bool = False) -> List[Dict[str, Any]]:
+        """
+        从 HIS 职员字典表 dbo.his_ry（关联 dbo.his_ks）只读获取医生目录（脱敏，绝不查询身份证号、手机号、口令）。
+        以唯一主键 ryid 作为标准 doctor_id。
+        """
+        conn = self.get_connection()
+        cur = conn.cursor(as_dict=True)
+        try:
+            where_clause = "" if include_non_doctors else "WHERE r.isys = 1"
+            sql = f"""
+            SELECT
+                CAST(r.ryid AS VARCHAR(32)) AS doctor_id,
+                r.ryid AS ryid,
+                LTRIM(RTRIM(ISNULL(r.ryname, ''))) AS doctor_name,
+                LTRIM(RTRIM(ISNULL(r.zh, ''))) AS zh,
+                LTRIM(RTRIM(ISNULL(r.ybysdm, ''))) AS ybysdm,
+                LTRIM(RTRIM(ISNULL(r.gjgbm_ybysdm, ''))) AS gjgbm_ybysdm,
+                CASE WHEN r.ksid IS NOT NULL THEN CAST(r.ksid AS VARCHAR(32)) ELSE '' END AS dept_id,
+                LTRIM(RTRIM(ISNULL(ks.ksname, ''))) AS dept_name,
+                CAST(ISNULL(r.isys, 0) AS INT) AS is_doctor
+            FROM dbo.his_ry r
+            LEFT JOIN dbo.his_ks ks ON r.ksid = ks.ksid
+            {where_clause}
+            ORDER BY r.ksid ASC, r.ryid ASC
+            """
+            cur.execute(sql)
+            return cur.fetchall()
+        finally:
+            conn.close()
+
     def get_active_inpatients(self, department: Optional[str] = None, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         """
         Fetch currently admitted patients (not yet discharged or settled).
@@ -378,22 +547,23 @@ class HISReader:
                 sy.lsh AS zyh,
                 sy.xm AS patient_name,
                 sy.xb AS gender,
-                sy.years AS age,
-                COALESCE(zk_latest.xksid, sy.ksid) AS current_dept_id,
-                COALESCE(zk_latest.xksname, sy.zkkb, sy.rykb) AS current_dept,
-                COALESCE(zk_latest.xbfname, sy.rybf) AS current_bed,
+                COALESCE(NULLIF(LTRIM(RTRIM(CAST(sy.years AS VARCHAR(20)))), ''), CAST(CAST(ROUND(gh.oldyear, 0) AS INT) AS VARCHAR(20))) AS age,
+                {self._DEPT_BED_SELECT}
                 sy.rysj AS admission_time,
-                sy.zyts AS current_stay_days,
-                sy.zyysbm AS attending_doctor_id,
-                sy.zyysname AS attending_doctor,
+                COALESCE(
+                    NULLIF(NULLIF(LTRIM(RTRIM(CAST(sy.zyts AS VARCHAR(20)))), ''), '0'),
+                    CAST(NULLIF(gh.zyts, 0) AS VARCHAR(20)),
+                    CAST(CASE WHEN DATEDIFF(DAY, COALESCE(sy.rysj, gh.ghrq), GETDATE()) >= 1 THEN DATEDIFF(DAY, COALESCE(sy.rysj, gh.ghrq), GETDATE()) ELSE 1 END AS VARCHAR(20))
+                ) AS current_stay_days,
+                {self._ATTENDING_DOC_SELECT}
                 sy.kszrname AS dept_director,
-                sy.ryzdbm AS admission_diag_code,
-                sy.ryzd AS admission_diag_name,
-                sy.ssbm1, sy.ssmc1,
+                {self._CLINICAL_DIAG_SELECT}
+                COALESCE(NULLIF(NULLIF(LTRIM(RTRIM(sy.ssbm1)), ''), '-'), NULLIF(NULLIF(LTRIM(RTRIM(gh.ssbm)), ''), '-')) AS ssbm1,
+                COALESCE(NULLIF(NULLIF(LTRIM(RTRIM(sy.ssmc1)), ''), '-'), NULLIF(NULLIF(LTRIM(RTRIM(gh.ssname)), ''), '-')) AS ssmc1,
                 sy.ssbm2, sy.ssmc2,
                 sy.ssbm3, sy.ssmc3,
                 sy.ylzffs,
-                jb.fylx AS insurance_type
+                {self._INSURANCE_TYPE_SELECT}
             FROM dbo.his_bl_sy sy
             LEFT JOIN dbo.jbxx jb ON sy.lsh = jb.zyh
             LEFT JOIN dbo.his_zyjz jz ON sy.lsh = jz.lsh AND jz.iszf = 0
@@ -405,16 +575,158 @@ class HISReader:
                 LEFT JOIN dbo.his_bf bf ON zk.xbfid = bf.bfid
                 WHERE zk.iszk = 1
             ) zk_latest ON sy.lsh = zk_latest.lsh AND zk_latest.rn = 1
+            {self._ATTENDING_DOC_JOINS}
             WHERE sy.cysj IS NULL AND jz.lsh IS NULL
             """
             params = []
             if department:
-                sql += " AND (COALESCE(zk_latest.xksname, sy.zkkb, sy.rykb) = %s OR COALESCE(zk_latest.xksname, sy.zkkb, sy.rykb) LIKE %s)"
+                sql += f" AND ({self._DEPT_EXPR} = %s OR {self._DEPT_EXPR} LIKE %s)"
                 params.extend([department, f"%{department}%"])
 
             sql += " ORDER BY sy.rysj DESC"
             cur.execute(sql, tuple(params))
             return cur.fetchall()
+        finally:
+            conn.close()
+
+    def get_active_billed_procedures(self, lsh: str) -> List[str]:
+        """
+        从在院医嘱/处置明细 (dbo.his_zycz) 提取净数量 > 0（自动剔除退费冲红）的实际已计费操作项目名称。
+        用于在院期病案首页尚未编码手术操作时辅助识别已实施的专科检查/操作。
+        """
+        if not lsh:
+            return []
+        conn = self.get_connection()
+        cur = conn.cursor(as_dict=True)
+        try:
+            cur.execute(
+                """
+                SELECT xmname
+                FROM dbo.his_zycz WITH (NOLOCK)
+                WHERE lsh = %s AND ISNULL(istf, 0) = 0
+                GROUP BY xmname
+                HAVING SUM(ISNULL(sl, 0)) > 0
+                ORDER BY xmname
+                """,
+                (lsh,),
+            )
+            return [str(r["xmname"]).strip() for r in cur.fetchall() if r.get("xmname")]
+        finally:
+            conn.close()
+
+    def get_monthly_inpatients(
+        self,
+        year_month: Optional[str] = None,
+        department: Optional[str] = None,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """
+        查询指定月份（默认当月）全部住院患者（包含当前在院未出院患者 + 本月已出院/已结算病例）。
+        费用与诊断严格区分口径：
+        - 已结算患者使用 his_zyjz (iszf=0, amoney>0) 汇总净结算金额 (_pre_settled_amount) 并优先取 cydj/首页出院主诊断；
+        - 仍在院患者不混入结算单金额，交由 InpatientScanner 调用 get_active_patient_fee 聚合实时明细。
+        """
+        from datetime import datetime, timezone, timedelta
+        bj_now = datetime.now(timezone(timedelta(hours=8)))
+        ym = (year_month or bj_now.strftime("%Y-%m")).strip()
+        year_i, month_i = [int(x) for x in ym.split("-", 1)]
+        start_str = f"{year_i:04d}-{month_i:02d}-01"
+        if month_i == 12:
+            end_str = f"{year_i + 1:04d}-01-01"
+        else:
+            end_str = f"{year_i:04d}-{month_i + 1:02d}-01"
+
+        conn = self.get_connection()
+        cur = conn.cursor(as_dict=True)
+        try:
+            top_clause = f"TOP ({int(limit)})" if limit else ""
+            sql = f"""
+            SELECT {top_clause}
+                sy.lsh AS zyh,
+                sy.xm AS patient_name,
+                sy.xb AS gender,
+                COALESCE(NULLIF(LTRIM(RTRIM(CAST(sy.years AS VARCHAR(20)))), ''), CAST(CAST(ROUND(gh.oldyear, 0) AS INT) AS VARCHAR(20))) AS age,
+                COALESCE(zk_latest.xksid, NULLIF(gh.ksid, 0), NULLIF(sy.ksid, 0)) AS current_dept_id,
+                {self._DEPT_EXPR} AS current_dept,
+                CASE
+                    WHEN jz_sum.lsh IS NOT NULL THEN N'已结算'
+                    WHEN sy.cysj IS NOT NULL THEN N'已出院'
+                    ELSE COALESCE(
+                        NULLIF(NULLIF(LTRIM(RTRIM(zk_latest.xbfname)), ''), '-'),
+                        NULLIF(NULLIF(LTRIM(RTRIM(gh.cwhname)), ''), '-'),
+                        NULLIF(NULLIF(LTRIM(RTRIM(sy.rybf)), ''), '-')
+                    )
+                END AS current_bed,
+                sy.rysj AS admission_time,
+                sy.cysj AS discharge_time,
+                COALESCE(
+                    NULLIF(NULLIF(LTRIM(RTRIM(CAST(sy.zyts AS VARCHAR(20)))), ''), '0'),
+                    CAST(NULLIF(gh.zyts, 0) AS VARCHAR(20)),
+                    CAST(CASE WHEN DATEDIFF(DAY, COALESCE(sy.rysj, gh.ghrq), COALESCE(sy.cysj, GETDATE())) >= 1
+                              THEN DATEDIFF(DAY, COALESCE(sy.rysj, gh.ghrq), COALESCE(sy.cysj, GETDATE()))
+                              ELSE 1 END AS VARCHAR(20))
+                ) AS current_stay_days,
+                {self._ATTENDING_DOC_SELECT}
+                sy.kszrname AS dept_director,
+                COALESCE(
+                    NULLIF(NULLIF(LTRIM(RTRIM(cydj.CYZYZDDM)), ''), '-'),
+                    NULLIF(NULLIF(LTRIM(RTRIM(sy.xycyzd1bm)), ''), '-'),
+                    NULLIF(NULLIF(LTRIM(RTRIM(sy.ryzdbm)), ''), '-'),
+                    NULLIF(NULLIF(LTRIM(RTRIM(gh.jbbm)), ''), '-')
+                ) AS admission_diag_code,
+                COALESCE(
+                    NULLIF(NULLIF(LTRIM(RTRIM(cydj.CYZYZDMC)), ''), '-'),
+                    NULLIF(NULLIF(LTRIM(RTRIM(sy.xycyzd1)), ''), '-'),
+                    NULLIF(NULLIF(LTRIM(RTRIM(sy.ryzd)), ''), '-'),
+                    NULLIF(NULLIF(LTRIM(RTRIM(gh.jbname)), ''), '-'),
+                    NULLIF(NULLIF(LTRIM(RTRIM(gh.lczd)), ''), '-')
+                ) AS admission_diag_name,
+                COALESCE(NULLIF(NULLIF(LTRIM(RTRIM(sy.ssbm1)), ''), '-'), NULLIF(NULLIF(LTRIM(RTRIM(gh.ssbm)), ''), '-')) AS ssbm1,
+                COALESCE(NULLIF(NULLIF(LTRIM(RTRIM(sy.ssmc1)), ''), '-'), NULLIF(NULLIF(LTRIM(RTRIM(gh.ssname)), ''), '-')) AS ssmc1,
+                NULLIF(NULLIF(LTRIM(RTRIM(sy.ssbm2)), ''), '-') AS ssbm2,
+                NULLIF(NULLIF(LTRIM(RTRIM(sy.ssmc2)), ''), '-') AS ssmc2,
+                NULLIF(NULLIF(LTRIM(RTRIM(sy.ssbm3)), ''), '-') AS ssbm3,
+                NULLIF(NULLIF(LTRIM(RTRIM(sy.ssmc3)), ''), '-') AS ssmc3,
+                sy.ylzffs,
+                {self._INSURANCE_TYPE_SELECT},
+                jz_sum.total_amount AS settled_total_amount,
+                CASE WHEN jz_sum.lsh IS NOT NULL THEN 1 ELSE 0 END AS is_settled
+            FROM dbo.his_bl_sy sy
+            LEFT JOIN (
+                SELECT lsh, SUM(amoney) AS total_amount, MAX(jzrq) AS latest_jzrq
+                FROM dbo.his_zyjz
+                WHERE iszf = 0 AND amoney > 0
+                GROUP BY lsh
+            ) jz_sum ON sy.lsh = jz_sum.lsh
+            LEFT JOIN dbo.his_ZY_CYDJXX cydj ON sy.lsh = cydj.ZYH
+            LEFT JOIN dbo.jbxx jb ON sy.lsh = jb.zyh
+            LEFT JOIN (
+                SELECT zk.lsh, zk.xksid, ks.ksname AS xksname, bf.bfname AS xbfname,
+                       ROW_NUMBER() OVER(PARTITION BY zk.lsh ORDER BY zk.sqrq DESC) as rn
+                FROM dbo.his_zk zk
+                LEFT JOIN dbo.his_ks ks ON zk.xksid = ks.ksid
+                LEFT JOIN dbo.his_bf bf ON zk.xbfid = bf.bfid
+                WHERE zk.iszk = 1
+            ) zk_latest ON sy.lsh = zk_latest.lsh AND zk_latest.rn = 1
+            {self._ATTENDING_DOC_JOINS}
+            WHERE (
+                (sy.rysj >= %s AND sy.rysj < %s)
+                OR (sy.cysj >= %s AND sy.cysj < %s)
+                OR (jz_sum.latest_jzrq >= %s AND jz_sum.latest_jzrq < %s)
+            )
+            """
+            params: List[Any] = [start_str, end_str, start_str, end_str, start_str, end_str]
+            if department:
+                sql += f" AND ({self._DEPT_EXPR} = %s OR {self._DEPT_EXPR} LIKE %s)"
+                params.extend([department, f"%{department}%"])
+            sql += " ORDER BY COALESCE(sy.rysj, gh.ghrq) DESC"
+            cur.execute(sql, tuple(params))
+            rows = cur.fetchall()
+            for r in rows:
+                if r.get("is_settled") and r.get("settled_total_amount") is not None:
+                    r["_pre_settled_amount"] = r["settled_total_amount"]
+                    r["_is_settled"] = True
+            return rows
         finally:
             conn.close()
 
@@ -429,25 +741,21 @@ class HISReader:
         conn = self.get_connection()
         cur = conn.cursor(as_dict=True)
         try:
-            sql = """
+            sql = f"""
             SELECT TOP 1
                 sy.lsh AS zyh,
                 sy.xm AS patient_name,
                 sy.xb AS gender,
-                sy.years AS age,
-                COALESCE(zk_latest.xksid, sy.ksid) AS current_dept_id,
-                COALESCE(zk_latest.xksname, sy.zkkb, sy.rykb) AS current_dept,
-                COALESCE(zk_latest.xbfname, sy.rybf) AS current_bed,
+                COALESCE(NULLIF(LTRIM(RTRIM(CAST(sy.years AS VARCHAR(20)))), ''), CAST(CAST(ROUND(gh.oldyear, 0) AS INT) AS VARCHAR(20))) AS age,
+                {self._DEPT_BED_SELECT}
                 sy.rysj AS admission_time,
                 sy.cysj AS discharge_time,
-                sy.zyysbm AS attending_doctor_id,
-                sy.zyysname AS attending_doctor,
+                {self._ATTENDING_DOC_SELECT}
                 sy.kszrbm AS dept_director_id,
                 sy.kszrname AS dept_director,
-                sy.ryzdbm AS admission_diag_code,
-                sy.ryzd AS admission_diag_name,
+                {self._CLINICAL_DIAG_SELECT}
                 sy.ylzffs,
-                jb.fylx AS insurance_type
+                {self._INSURANCE_TYPE_SELECT}
             FROM dbo.his_bl_sy sy
             LEFT JOIN dbo.jbxx jb ON sy.lsh = jb.zyh
             LEFT JOIN dbo.his_zyjz jz ON sy.lsh = jz.lsh AND jz.iszf = 0
@@ -459,6 +767,7 @@ class HISReader:
                 LEFT JOIN dbo.his_bf bf ON zk.xbfid = bf.bfid
                 WHERE zk.iszk = 1
             ) zk_latest ON sy.lsh = zk_latest.lsh AND zk_latest.rn = 1
+            {self._ATTENDING_DOC_JOINS}
             WHERE sy.lsh = %s AND sy.cysj IS NULL AND jz.lsh IS NULL
             ORDER BY sy.rysj DESC
             """

@@ -132,7 +132,7 @@ INPATIENT_ALERTS_HTML = r"""<!DOCTYPE html>
       </div>
       <table>
         <thead>
-          <tr><th>住院号</th><th>科室</th><th>床号</th><th>医生工号</th><th>主诊断</th><th>参保</th><th>当前费用(元)</th><th>DIP 基准(元)</th><th>占比</th><th>状态</th></tr>
+          <tr><th>住院号</th><th>科室</th><th>床号</th><th>医生工号</th><th>医生姓名</th><th>主诊断</th><th>参保</th><th>当前费用(元)</th><th>DIP 基准(元)</th><th>占比</th><th>状态</th></tr>
         </thead>
         <tbody id="tbody"></tbody>
       </table>
@@ -248,7 +248,7 @@ function renderRows() {
   for (const it of list) {
     const tr = document.createElement("tr");
     const vals = [
-      it.zyh || "-", it.dept_name || "-", it.bed || "-", it.doctor_id || "-",
+      it.zyh || "-", it.dept_name || "-", it.bed || "-", it.doctor_id || "-", it.doctor_name || "-",
       it.disease || "-", it.ins_type || "-",
       it.current_cost_str || String(it.current_cost ?? "-"),
       it.benchmark_str || (it.benchmark != null ? String(it.benchmark) : "-"),
@@ -413,7 +413,7 @@ ANALYTICS_HTML = r"""<!DOCTYPE html>
       <h2>医生控费绩效聚合</h2>
       <table>
         <thead>
-          <tr><th>医生工号</th><th>科室</th><th>病例数</th><th>红灯</th><th>黄灯</th><th>绿灯</th><th>绿灯达标率</th><th>平均费用比</th><th>总费用(元)</th><th>总基准(元)</th></tr>
+          <tr><th>医生工号</th><th>医生姓名</th><th>科室</th><th>病例数</th><th>红灯</th><th>黄灯</th><th>绿灯</th><th>绿灯达标率</th><th>平均费用比</th><th>总费用(元)</th><th>总基准(元)</th></tr>
         </thead>
         <tbody id="docTbody"></tbody>
       </table>
@@ -498,7 +498,7 @@ function renderDoctors(docs) {
   for (const d of docs) {
     const tr = document.createElement("tr");
     const vals = [
-      d.doctor_id, d.dept_name || "-", String(d.total_cases),
+      d.doctor_id, d.doctor_name || "-", d.dept_name || "-", String(d.total_cases),
       String(d.red_count), String(d.yellow_count), String(d.green_count),
       d.green_rate_percent != null ? d.green_rate_percent + "%" : "-",
       d.avg_fee_ratio_percent != null ? d.avg_fee_ratio_percent + "%" : "-",

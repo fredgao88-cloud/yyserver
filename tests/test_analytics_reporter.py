@@ -24,6 +24,7 @@ def test_aggregate_doctor_performance_deduplicates_visits():
             "dept_id": "101",
             "dept_name": "中医科",
             "doctor_id": "D001",
+            "doctor_name": "张医生",
             "current_fee": Decimal("2000.00"),
             "target_base": Decimal("2790.90"),
             "fee_ratio": Decimal("0.7166"),
@@ -60,6 +61,7 @@ def test_aggregate_doctor_performance_deduplicates_visits():
     assert len(res) == 1
     d1 = res[0]
     assert d1["doctor_id"] == "D001"
+    assert d1["doctor_name"] == "张医生"
     assert d1["total_cases"] == 2
     assert d1["red_count"] == 1
     assert d1["green_count"] == 1

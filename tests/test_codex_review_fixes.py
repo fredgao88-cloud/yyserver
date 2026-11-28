@@ -368,3 +368,115 @@ def test_snap_time_001_timezone_comparison():
          patch("datetime.datetime", _FixedDatetime):
         res = asyncio.run(main_mod.get_inpatient_alerts(dept=None, operator={"sub": "admin", "role": "ADMIN", "dept": ""}))
         assert res["is_stale"] is True
+
+
+def test_icd_subcode_merge_and_billed_op_inference_offline():
+    from tools import dip_calculator as dip_calc
+    from tools.inpatient_scanner import InpatientScanner
+
+    sample_rules = [
+        {
+            "rule_id": 101,
+            "rule_version": "2026_SAMPLE_V1",
+            "department": "消化内科",
+            "dip_group_name": "结肠息肉:电子结肠镜检查",
+            "icd_code": "K63.5",
+            "icd_name": "结肠息肉",
+            "op_code": None,
+            "op_name": "电子结肠镜检查",
+            "aux_detail": "",
+            "billing_unit": "PER_CASE",
+            "dip_score": Decimal("514.6000"),
+            "resident_point": Decimal("7.0000"),
+            "employee_point": Decimal("7.5000"),
+            "hosp_coef": Decimal("0.6000"),
+            "low_threshold": Decimal("0.9000"),
+            "high_threshold": Decimal("1.1000"),
+            "resident_base": Decimal("2161.3200"),
+            "employee_base": Decimal("2315.7000"),
+        },
+        {
+            "rule_id": 102,
+            "rule_version": "2026_SAMPLE_V1",
+            "department": "消化内科",
+            "dip_group_name": "结肠息肉:核心病种-保守治疗",
+            "icd_code": "K63.5",
+            "icd_name": "结肠息肉",
+            "op_code": None,
+            "op_name": "核心病种-保守治疗",
+            "aux_detail": "",
+            "billing_unit": "PER_CASE",
+            "dip_score": Decimal("357.0000"),
+            "resident_point": Decimal("7.0000"),
+            "employee_point": Decimal("7.5000"),
+            "hosp_coef": Decimal("0.6000"),
+            "low_threshold": Decimal("0.9000"),
+            "high_threshold": Decimal("1.1000"),
+            "resident_base": Decimal("1499.4000"),
+            "employee_base": Decimal("1606.5000"),
+        },
+    ]
+
+    op_kw = InpatientScanner.infer_op_keyword_from_billed_items(
+        "K63.500",
+        "结肠息肉",
+        ["上消化道内镜检查费（常规）", "下消化道内镜检查费（常规）", "全身麻醉费（无插管全麻）"],
+    )
+    assert op_kw == "电子结肠镜检查"
+
+    # Excision present -> never downgrade to exam-only
+    assert (
+        InpatientScanner.infer_op_keyword_from_billed_items(
+            "K63.500",
+            "结肠息肉",
+            ["下消化道内镜检查费（常规）", "纤维结肠镜下结肠息肉切除术"],
+        )
+        is None
+    )
+    assert InpatientScanner.infer_op_keyword_from_billed_items("K63.500", "结肠息肉", MagicMock()) is None
+
+    with patch.object(dip_calc, "get_loaded_rules", return_value=sample_rules):
+        matched = dip_calc.match_dip_rule(
+            disease="K63.500",
+            age=53,
+            ins_type="居民",
+            op_keyword=op_kw,
+        )
+        assert matched["matched"] is True
+        assert matched["status"] == "MATCHED"
+        assert matched["rule_id"] == 101
+        assert matched["benchmark_amount"] == 2161.32
+
+        # Without op_keyword, explicit K63.500 subcode still avoids K31.7 false leak and flags MISSING_OPERATION
+        pending = dip_calc.match_dip_rule(disease="K63.500", age=53, ins_type="居民")
+        assert pending["matched"] is False
+        assert pending["pending_reason"] == "MISSING_OPERATION"
+
+
+def test_monthly_alerts_scope_sql_filter_offline():
+    executed_sqls = []
+
+    class _ScopeCur:
+        def execute(self, sql, *args, **kwargs):
+            executed_sqls.append(str(sql))
+
+        def fetchone(self):
+            return {"batch_id": "MONTH_202611_20261128_090000", "data_cutoff_time": datetime(2026, 11, 28, 9, 0, 0), "synced_at": datetime(2026, 11, 28, 9, 0, 0)}
+
+        def fetchall(self):
+            return []
+
+    class _ScopeConn:
+        def close(self):
+            pass
+
+    with patch.object(main_mod, "get_local_db_connection", return_value=(_ScopeCur(), _ScopeConn())), \
+         patch.object(main_mod, "get_operator", return_value={"operator_id": "admin", "dept_scope": ""}):
+        res_m = asyncio.run(main_mod.get_inpatient_alerts(dept=None, scope="month", operator={"sub": "admin", "role": "ADMIN", "dept": ""}))
+        assert res_m["scope"] == "month"
+        assert any("LIKE 'MONTH_%'" in s and "NOT LIKE 'MONTH_%'" not in s for s in executed_sqls)
+
+        executed_sqls.clear()
+        res_a = asyncio.run(main_mod.get_inpatient_alerts(dept=None, scope="active", operator={"sub": "admin", "role": "ADMIN", "dept": ""}))
+        assert res_a["scope"] == "active"
+        assert any("NOT LIKE 'MONTH_%'" in s for s in executed_sqls)

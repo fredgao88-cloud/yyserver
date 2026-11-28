@@ -107,3 +107,48 @@ def test_auth_me_returns_sanitized_operator_profile():
         assert res["role_type"] == "INSURANCE_OFFICER"
         assert res["can_export_case"] is True
         assert "password_hash" not in str(res)
+
+
+def test_admin_his_doctors_endpoint_and_sanitization():
+    admin_op = {"sub": "admin", "role": ROLE_ADMIN, "dept": ""}
+    fake_his_rows = [
+        {
+            "doctor_id": "13", "ryid": 13, "doctor_name": "测试医生甲", "zh": "2",
+            "ybysdm": "D150000000001", "gjgbm_ybysdm": "", "dept_id": "4", "dept_name": "01中医科",
+            "is_doctor": 1, "sfzh": "SECRET_ID", "lxdh": "SECRET_PHONE", "password": "SECRET_PWD",
+        },
+        {
+            "doctor_id": "25", "ryid": 25, "doctor_name": "测试医生乙", "zh": "4",
+            "ybysdm": "D150000000002", "gjgbm_ybysdm": "", "dept_id": "5", "dept_name": "02内科",
+            "is_doctor": 1,
+        },
+    ]
+
+    class _FakeHisReader:
+        def get_his_doctors(self, include_non_doctors=False):
+            return fake_his_rows
+
+    with patch("api.main.HISReader", return_value=_FakeHisReader()), \
+         patch("api.main.record_audit_log"):
+        res_all = asyncio.run(main_mod.api_list_his_doctors(q=None, include_non_doctors=False, operator=admin_op))
+        assert res_all["total"] == 2
+        assert res_all["items"][0]["doctor_id"] == "13"
+        assert "SECRET_ID" not in str(res_all)
+        assert "SECRET_PHONE" not in str(res_all)
+        assert "SECRET_PWD" not in str(res_all)
+
+        res_filtered = asyncio.run(main_mod.api_list_his_doctors(q="中医", include_non_doctors=False, operator=admin_op))
+        assert res_filtered["total"] == 1
+        assert res_filtered["items"][0]["doctor_id"] == "13"
+
+    class _FailHisReader:
+        def get_his_doctors(self, include_non_doctors=False):
+            raise RuntimeError("HIS unavailable")
+
+    with patch("api.main.HISReader", return_value=_FailHisReader()), \
+         patch("api.main.record_audit_log"):
+        try:
+            asyncio.run(main_mod.api_list_his_doctors(q=None, include_non_doctors=False, operator=admin_op))
+            assert False, "expected 502"
+        except HTTPException as exc:
+            assert exc.status_code == 502

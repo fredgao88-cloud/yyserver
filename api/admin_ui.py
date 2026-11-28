@@ -69,7 +69,16 @@ ADMIN_OPERATORS_HTML = """<!DOCTYPE html>
           </select>
         </div>
         <div class="field"><label>科室范围 (dept_scope / ID)</label><input id="fDept" placeholder="如 101 或 101,102"></div>
-        <div class="field"><label>绑定 HIS 医生工号</label><input id="fDocId" placeholder="如 0012"></div>
+        <div class="field"><label>绑定 HIS 医生工号</label><input id="fDocId" placeholder="如 13（HIS ryid）"></div>
+        <div class="field">
+          <label>从 HIS 选择医生（自动带出工号/姓名/科室）</label>
+          <div style="display:flex;gap:6px;">
+            <select id="hisDocSelect" onchange="applyHisDoctor()" style="flex:1;min-width:160px;">
+              <option value="">-- 点击右侧同步 HIS 医生 --</option>
+            </select>
+            <button type="button" class="secondary" onclick="loadHisDoctors()">同步 HIS</button>
+          </div>
+        </div>
         <div class="field"><label>初始/重置口令 (至少8位) *</label><input id="fPwd" type="password" placeholder="至少 8 位字符"></div>
         <button onclick="saveOperator()">保存账号</button>
       </div>
@@ -124,6 +133,42 @@ async function doLogin() {
 function doLogout() {
   sessionStorage.removeItem(TOKEN_KEY);
   location.reload();
+}
+let cachedHisDocs = [];
+async function loadHisDoctors() {
+  const sel = document.getElementById("hisDocSelect");
+  const r = await fetch("/api/admin/his-doctors", { headers: authHeaders() });
+  const data = await r.json();
+  if (!r.ok) { showMsg(data.detail || "同步 HIS 医生列表失败", true); return; }
+  cachedHisDocs = data.items || [];
+  sel.innerHTML = "";
+  const opt0 = document.createElement("option");
+  opt0.value = "";
+  opt0.textContent = "-- 请选择 HIS 医生 (" + cachedHisDocs.length + " 人) --";
+  sel.appendChild(opt0);
+  for (const d of cachedHisDocs) {
+    const opt = document.createElement("option");
+    opt.value = d.doctor_id || "";
+    opt.textContent = (d.doctor_name || "未命名") + " (工号:" + (d.doctor_id || "-") + (d.dept_name ? " / " + d.dept_name : "") + ")";
+    sel.appendChild(opt);
+  }
+  showMsg("已同步 HIS 医生字典共 " + cachedHisDocs.length + " 人", false);
+}
+function applyHisDoctor() {
+  const val = document.getElementById("hisDocSelect").value;
+  if (!val) return;
+  const doc = cachedHisDocs.find(x => x.doctor_id === val);
+  if (!doc) return;
+  document.getElementById("fDocId").value = doc.doctor_id || "";
+  if (!document.getElementById("fName").value.trim() && doc.doctor_name) {
+    document.getElementById("fName").value = doc.doctor_name;
+  }
+  if (!document.getElementById("fDept").value.trim() && doc.dept_id) {
+    document.getElementById("fDept").value = doc.dept_id;
+  }
+  if (!document.getElementById("fId").value.trim() && doc.doctor_id) {
+    document.getElementById("fId").value = "DOC_" + doc.doctor_id;
+  }
 }
 async function loadOperators() {
   const r = await fetch("/api/admin/operators", { headers: authHeaders() });

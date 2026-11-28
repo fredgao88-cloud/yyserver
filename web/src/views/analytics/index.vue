@@ -41,7 +41,8 @@ const { domRef: chartRef, updateOptions } = useEcharts(() => ({
 }));
 
 const columns: DataTableColumns<DoctorPerformanceItem> = [
-  { title: '医生工号', key: 'doctor_id', width: 130 },
+  { title: '医生工号', key: 'doctor_id', width: 115 },
+  { title: '医生姓名', key: 'doctor_name', width: 105, render: row => row.doctor_name || '-' },
   { title: '科室', key: 'dept_name', width: 120 },
   { title: '病例数', key: 'total_cases', width: 85 },
   { title: '绿灯', key: 'green_count', width: 70 },

@@ -131,8 +131,10 @@ export interface InpatientAlertItem {
   ward: string;
   bed: string;
   doctor_id: string;
+  doctor_name?: string | null;
   disease: string;
   ins_type: string;
+  matched_rule_id?: number | null;
   current_cost: number;
   current_cost_str: string;
   benchmark: number | null;
@@ -146,6 +148,7 @@ export interface InpatientAlertItem {
 
 export interface InpatientAlertsResponse {
   is_demo_baseline: boolean;
+  scope?: 'active' | 'month';
   total: number;
   batch_id: string | null;
   batch_time: string | null;
@@ -154,12 +157,15 @@ export interface InpatientAlertsResponse {
   items: InpatientAlertItem[];
 }
 
-export function fetchInpatientAlerts(dept?: string) {
-  const qs = dept ? `?dept=${encodeURIComponent(dept)}` : '';
-  return hospitalRequest<InpatientAlertsResponse>(`/api/inpatient/alerts${qs}`);
+export function fetchInpatientAlerts(dept?: string, scope: 'active' | 'month' = 'month') {
+  const qs = new URLSearchParams();
+  if (dept) qs.set('dept', dept);
+  if (scope) qs.set('scope', scope);
+  const query = qs.toString() ? `?${qs.toString()}` : '';
+  return hospitalRequest<InpatientAlertsResponse>(`/api/inpatient/alerts${query}`);
 }
 
-export function triggerManualScan(limit = 50, notifyDingtalk = false) {
+export function triggerManualScan(limit = 50, notifyDingtalk = false, scope: 'active' | 'month' = 'active') {
   return hospitalRequest<{
     success: boolean;
     batch_id: string;
@@ -173,12 +179,13 @@ export function triggerManualScan(limit = 50, notifyDingtalk = false) {
     NOT_APPLICABLE: number;
   }>('/api/admin/trigger-scan', {
     method: 'POST',
-    body: JSON.stringify({ limit, notify_dingtalk: notifyDingtalk })
+    body: JSON.stringify({ limit, notify_dingtalk: notifyDingtalk, scope })
   });
 }
 
 export interface DoctorPerformanceItem {
   doctor_id: string;
+  doctor_name?: string | null;
   dept_id: string | null;
   dept_name: string;
   total_cases: number;
@@ -402,6 +409,22 @@ export interface OperatorItem {
 
 export function fetchOperators() {
   return hospitalRequest<{ total: number; items: OperatorItem[] }>('/api/admin/operators');
+}
+
+export interface HisDoctorItem {
+  doctor_id: string;
+  doctor_name: string;
+  zh: string;
+  ybysdm: string;
+  gjgbm_ybysdm: string;
+  dept_id: string;
+  dept_name: string;
+  is_doctor: boolean;
+}
+
+export function fetchHisDoctors(q?: string) {
+  const qs = q?.trim() ? `?q=${encodeURIComponent(q.trim())}` : '';
+  return hospitalRequest<{ total: number; items: HisDoctorItem[] }>(`/api/admin/his-doctors${qs}`);
 }
 
 export function upsertOperator(payload: {

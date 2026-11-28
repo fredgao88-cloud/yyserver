@@ -65,6 +65,7 @@ BEGIN
         dept_id           NVARCHAR(30)   NULL,
         dept_name         NVARCHAR(50)   NOT NULL,
         doctor_id         NVARCHAR(50)   NOT NULL,
+        doctor_name       NVARCHAR(64)   NULL,
         age               INT            NULL,
         ins_type          NVARCHAR(20)   NOT NULL,
         primary_icd       NVARCHAR(50)   NULL,
@@ -88,6 +89,13 @@ GO
 IF OBJECT_ID(N'dbo.inpatient_dip_snapshot', N'U') IS NOT NULL AND COL_LENGTH('dbo.inpatient_dip_snapshot', 'dept_id') IS NULL
 BEGIN
     ALTER TABLE dbo.inpatient_dip_snapshot ADD dept_id NVARCHAR(30) NULL;
+END
+GO
+
+-- 幂等升级：若已有 inpatient_dip_snapshot 表缺少 doctor_name，动态补齐
+IF OBJECT_ID(N'dbo.inpatient_dip_snapshot', N'U') IS NOT NULL AND COL_LENGTH('dbo.inpatient_dip_snapshot', 'doctor_name') IS NULL
+BEGIN
+    ALTER TABLE dbo.inpatient_dip_snapshot ADD doctor_name NVARCHAR(64) NULL;
 END
 GO
 

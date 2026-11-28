@@ -115,6 +115,8 @@ class DipRuleReviewRequest(BaseModel):
 class ManualScanRequest(BaseModel):
     limit: int = Field(50, ge=1, le=500, description="扫描在院患者上限")
     notify_dingtalk: bool = Field(False, description="是否同步推送钉钉脱敏汇总")
+    scope: str = Field("active", description="扫描范围：active（仅在院）/ month（本月全部患者）")
+    year_month: Optional[str] = Field(None, description="目标年月 YYYY-MM（仅 scope=month 有效）")
 
 class DipRuleImportRequest(BaseModel):
     rule_version: str = Field(..., description="目标规则版本号，如 2026_V2")
@@ -428,11 +430,14 @@ async def check_patient_dip(req: CheckPatientDipRequest, operator: Dict[str, Any
         "evaluation": light_eval
     }
 
-@app.get("/api/inpatient/alerts", summary="在院科室预警列表看板接口")
+@app.get("/api/inpatient/alerts", summary="在院及本月患者预警列表看板接口")
 async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="科室筛选，如 中医科"),
+                               scope: str = Query("active", description="统计范围：active（仅在院）/ month（本月全部患者）"),
                                operator: Dict[str, Any] = Depends(require_roles(*ALERTS_ROLES))):
     """
-    获取当前住院患者红黄绿灯控费预警清单（穿透读取 dbo.inpatient_dip_snapshot 最新批次）。
+    获取患者红黄绿灯控费预警清单（穿透读取 dbo.inpatient_dip_snapshot 最新批次）。
+    - scope='active'（默认）：仅返回在院未出院患者快照（batch_id NOT LIKE 'MONTH_%'）。
+    - scope='month'：返回本月全部患者快照（含本月已出院结算患者，batch_id LIKE 'MONTH_%'）。
     患者级接口：强制有效令牌，仅科室主任、医保办与管理员角色可访问。
     支持按角色实施科室范围 (dept_scope) 行级数据隔离及快照过期检测。
     """
@@ -440,6 +445,9 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
     role = operator.get("role")
     op_info = get_operator(operator["sub"])
     user_dept = operator.get("dept") or (op_info.get("dept_scope") if op_info else "")
+    scope_val = (scope.strip().lower() if isinstance(scope, str) else "active") or "active"
+    if scope_val not in ("active", "month"):
+        raise HTTPException(status_code=400, detail="scope 仅支持 active 或 month")
 
     # 行级权限过滤：科室主任仅允许查看本科室数据
     effective_dept = dept
@@ -450,9 +458,11 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
 
     cursor, conn = get_local_db_connection(as_dict=True)
     try:
-        cursor.execute("""
+        batch_filter_sql = "WHERE batch_id LIKE 'MONTH_%'" if scope_val == "month" else "WHERE batch_id NOT LIKE 'MONTH_%'"
+        cursor.execute(f"""
         SELECT TOP 1 batch_id, data_cutoff_time, synced_at
         FROM dbo.inpatient_dip_snapshot
+        {batch_filter_sql}
         ORDER BY synced_at DESC
         """)
         latest_batch = cursor.fetchone()
@@ -460,11 +470,12 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
         if not latest_batch:
             return {
                 "is_demo_baseline": False,
+                "scope": scope_val,
                 "total": 0,
                 "batch_id": None,
                 "batch_time": None,
                 "is_stale": True,
-                "stale_warning": "系统尚未生成任何在院快照批次，请先触发在院扫描任务",
+                "stale_warning": "系统尚未生成对应范围的快照批次，请先触发扫描任务",
                 "items": []
             }
 
@@ -485,8 +496,12 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
                 synced_local = synced_aware.astimezone(_DB_TZ)
                 stale_warning = f"快照数据生成于 {synced_local.strftime('%Y-%m-%d %H:%M:%S')}，已超过 24 小时未更新，请及时运行定时巡检任务"
 
-        sql = """
-        SELECT visit_id, ward_name, bed_no, dept_id, dept_name, doctor_id, age,
+        cursor.execute("SELECT COL_LENGTH('dbo.inpatient_dip_snapshot', 'doctor_name') AS has_dn")
+        dn_row = cursor.fetchone() or {}
+        doc_name_col = ", doctor_name" if dn_row.get("has_dn") is not None else ""
+
+        sql = f"""
+        SELECT visit_id, ward_name, bed_no, dept_id, dept_name, doctor_id{doc_name_col}, age,
                ins_type, primary_icd, matched_rule_id, current_fee, target_base,
                fee_ratio, alert_level, pending_reason, data_cutoff_time
         FROM dbo.inpatient_dip_snapshot
@@ -507,7 +522,19 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
             # 管理员路径不受科室 ID 授权约束，但仍建议前端传 dept_id 而非名称
             sql += " AND (dept_id = %s OR dept_name = %s)"
             params.extend([dept, dept])
-        sql += " ORDER BY alert_level ASC, current_fee DESC"
+        sql += """
+        ORDER BY
+            CASE alert_level
+                WHEN 'RED' THEN 1
+                WHEN 'YELLOW' THEN 2
+                WHEN 'GREEN' THEN 3
+                WHEN 'PENDING' THEN 4
+                WHEN 'NOT_APPLICABLE' THEN 5
+                ELSE 6
+            END ASC,
+            fee_ratio DESC,
+            current_fee DESC
+        """
 
         cursor.execute(sql, tuple(params))
         rows = cursor.fetchall()
@@ -534,8 +561,10 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
                 "ward": r["ward_name"],
                 "bed": r["bed_no"],
                 "doctor_id": r["doctor_id"],
+                "doctor_name": (r.get("doctor_name") or "").strip() or None,
                 "disease": r["primary_icd"] or "未明确",
                 "ins_type": r["ins_type"],
+                "matched_rule_id": r.get("matched_rule_id"),
                 "current_cost": float(fee_dec),
                 "current_cost_str": f"{fee_dec:.2f}",
                 "benchmark": float(bm_dec) if bm_dec is not None else None,
@@ -549,6 +578,7 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
 
         return {
             "is_demo_baseline": False,
+            "scope": scope_val,
             "total": len(items),
             "batch_id": batch_id,
             "batch_time": cutoff_time.strftime("%Y-%m-%d %H:%M:%S") if cutoff_time else None,
@@ -709,17 +739,25 @@ async def api_review_dip_rules(
     )
     return {"success": True, "rule_version": ver, "target_status": target, "updated_rows": updated_rows}
 
-@app.post("/api/admin/trigger-scan", summary="手动触发一次在院 DIP 巡检扫描（医保办/管理员）")
+@app.post("/api/admin/trigger-scan", summary="手动触发一次 DIP 巡检扫描（医保办/管理员）")
 async def api_trigger_manual_scan(
     req: ManualScanRequest,
     operator: Dict[str, Any] = Depends(require_roles(ROLE_INSURANCE, ROLE_ADMIN)),
 ):
+    scope_val = (req.scope or "active").strip().lower()
+    if scope_val not in ("active", "month"):
+        raise HTTPException(status_code=400, detail="scope 仅支持 active 或 month")
     if not _manual_scan_lock.acquire(blocking=False):
         raise HTTPException(status_code=409, detail="在院巡检任务正在执行中，请勿重复并发触发")
     try:
         from tools.inpatient_scanner import InpatientScanner
         scanner = InpatientScanner()
-        res = scanner.scan_and_snapshot(limit=req.limit, notify_dingtalk=req.notify_dingtalk)
+        res = scanner.scan_and_snapshot(
+            limit=req.limit,
+            notify_dingtalk=req.notify_dingtalk,
+            scope=scope_val,
+            year_month=req.year_month,
+        )
     except Exception as exc:
         _scan_logger.error("EVENT=MANUAL_SCAN_FAILED err_type=%s", type(exc).__name__)
         record_audit_log(
@@ -789,10 +827,11 @@ def _build_csv_response(filename: str, headers: List[str], rows: List[List[Any]]
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
-@app.get("/api/inpatient/alerts/export", summary="导出在院控费预警 CSV（需开通 can_export_case 权限）")
+@app.get("/api/inpatient/alerts/export", summary="导出在院/本月控费预警 CSV（需开通 can_export_case 权限）")
 async def export_inpatient_alerts_csv(
     dept: Optional[str] = Query(None),
     level: Optional[str] = Query(None),
+    scope: str = Query("active"),
     operator: Dict[str, Any] = Depends(require_roles(*ALERTS_ROLES)),
 ):
     op_rec = get_operator(operator["sub"])
@@ -803,16 +842,16 @@ async def export_inpatient_alerts_csv(
         )
         raise HTTPException(status_code=403, detail="权限不足：当前账号未开通病例明细导出权限 (can_export_case=0)")
 
-    alerts_data = await get_inpatient_alerts(dept=dept, operator=operator)
+    alerts_data = await get_inpatient_alerts(dept=dept, scope=scope, operator=operator)
     items = alerts_data.get("items") or []
     if level:
         lvl_u = level.strip().upper()
         items = [x for x in items if x.get("alert_level") == lvl_u]
 
-    headers = ["住院号", "科室", "床号", "医生工号", "主诊断", "参保类型", "当前费用(元)", "DIP基准(元)", "占比(%)", "灯号", "状态"]
+    headers = ["住院号", "科室", "床号", "医生工号", "医生姓名", "主诊断", "参保类型", "当前费用(元)", "DIP基准(元)", "占比(%)", "灯号", "状态"]
     rows = [
         [
-            it.get("zyh"), it.get("dept_name"), it.get("bed"), it.get("doctor_id"),
+            it.get("zyh"), it.get("dept_name"), it.get("bed"), it.get("doctor_id"), it.get("doctor_name") or "-",
             it.get("disease"), it.get("ins_type"),
             it.get("current_cost_str") or it.get("current_cost"),
             it.get("benchmark_str") or it.get("benchmark"),
@@ -955,6 +994,48 @@ async def api_list_operators(operator: Dict[str, Any] = Depends(require_roles(RO
     record_audit_log(
         operator_id=operator["sub"], role_type=operator["role"], channel="API",
         action_type="ADMIN_LIST_OPERATORS", target_ref=f"COUNT:{len(items)}", auth_result="PERMITTED"
+    )
+    return {"total": len(items), "items": items}
+
+@app.get("/api/admin/his-doctors", summary="从 HIS 职员字典同步/查询医生工号清单（仅管理员，脱敏）")
+async def api_list_his_doctors(
+    q: Optional[str] = Query(None, description="按工号、姓名、科室名称或医保码关键字筛选"),
+    include_non_doctors: bool = Query(False, description="是否包含非医生职员（默认仅返回 isys=1）"),
+    operator: Dict[str, Any] = Depends(require_roles(ROLE_ADMIN)),
+):
+    """只读访问 HIS dbo.his_ry 与 dbo.his_ks，返回用于操作员绑定/下拉选择的医生目录（不含证件/电话/口令）。"""
+    try:
+        raw_items = HISReader().get_his_doctors(include_non_doctors=include_non_doctors)
+    except Exception:
+        record_audit_log(
+            operator_id=operator["sub"], role_type=operator["role"], channel="API",
+            action_type="ADMIN_LIST_HIS_DOCTORS", target_ref="HIS_READ_ERROR", auth_result="ERROR"
+        )
+        raise HTTPException(status_code=502, detail="HIS 医生目录读取失败，请确认 HIS 代理连接状态")
+
+    kw = (q or "").strip().lower()
+    items = []
+    for row in raw_items:
+        item = {
+            "doctor_id": str(row.get("doctor_id") or "").strip(),
+            "doctor_name": str(row.get("doctor_name") or "").strip(),
+            "zh": str(row.get("zh") or "").strip(),
+            "ybysdm": str(row.get("ybysdm") or "").strip(),
+            "gjgbm_ybysdm": str(row.get("gjgbm_ybysdm") or "").strip(),
+            "dept_id": str(row.get("dept_id") or "").strip(),
+            "dept_name": str(row.get("dept_name") or "").strip(),
+            "is_doctor": bool(row.get("is_doctor")),
+        }
+        if kw and not any(
+            kw in item[k].lower()
+            for k in ("doctor_id", "doctor_name", "zh", "ybysdm", "dept_id", "dept_name")
+        ):
+            continue
+        items.append(item)
+
+    record_audit_log(
+        operator_id=operator["sub"], role_type=operator["role"], channel="API",
+        action_type="ADMIN_LIST_HIS_DOCTORS", target_ref=f"COUNT:{len(items)}", auth_result="PERMITTED"
     )
     return {"total": len(items), "items": items}
 

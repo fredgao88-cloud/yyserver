@@ -28,8 +28,12 @@ def aggregate_doctor_performance(rows: List[Dict[str, Any]]) -> List[Dict[str, A
     防止同一患者跨多批次被重复累计费用。
     """
     latest_by_doc_visit: Dict[tuple, Dict[str, Any]] = {}
+    known_doc_names: Dict[str, str] = {}
     for r in rows:
         doc_id = (r.get("doctor_id") or "UNKNOWN").strip()
+        cand_name = (r.get("doctor_name") or "").strip()
+        if cand_name:
+            known_doc_names[doc_id] = cand_name
         visit_id = (r.get("visit_id") or "").strip()
         if not visit_id:
             continue
@@ -46,10 +50,12 @@ def aggregate_doctor_performance(rows: List[Dict[str, Any]]) -> List[Dict[str, A
     buckets: Dict[str, Dict[str, Any]] = {}
     for (_, _), r in latest_by_doc_visit.items():
         doc_id = (r.get("doctor_id") or "UNKNOWN").strip()
+        doc_name = (r.get("doctor_name") or "").strip() or known_doc_names.get(doc_id, "")
         b = buckets.get(doc_id)
         if b is None:
             b = {
                 "doctor_id": doc_id,
+                "doctor_name": doc_name,
                 "dept_id": r.get("dept_id"),
                 "dept_name": r.get("dept_name") or "未知科室",
                 "total_cases": 0,
@@ -64,6 +70,8 @@ def aggregate_doctor_performance(rows: List[Dict[str, Any]]) -> List[Dict[str, A
                 "ratio_count": 0,
             }
             buckets[doc_id] = b
+        elif not b["doctor_name"] and doc_name:
+            b["doctor_name"] = doc_name
 
         b["total_cases"] += 1
         lvl = (r.get("alert_level") or "PENDING").upper()
@@ -102,6 +110,7 @@ def aggregate_doctor_performance(rows: List[Dict[str, Any]]) -> List[Dict[str, A
 
         results.append({
             "doctor_id": doc_id,
+            "doctor_name": b.get("doctor_name") or None,
             "dept_id": b["dept_id"],
             "dept_name": b["dept_name"],
             "total_cases": b["total_cases"],
@@ -195,8 +204,11 @@ def get_doctor_performance_report(
 
     cursor, conn = get_local_db_connection(as_dict=True)
     try:
-        sql = """
-        SELECT batch_id, visit_id, dept_id, dept_name, doctor_id,
+        cursor.execute("SELECT COL_LENGTH('dbo.inpatient_dip_snapshot', 'doctor_name') AS has_dn")
+        dn_row = cursor.fetchone() or {}
+        doc_name_col = ", doctor_name" if dn_row.get("has_dn") is not None else ""
+        sql = f"""
+        SELECT batch_id, visit_id, dept_id, dept_name, doctor_id{doc_name_col},
                current_fee, target_base, fee_ratio, alert_level,
                data_cutoff_time, synced_at
         FROM dbo.inpatient_dip_snapshot

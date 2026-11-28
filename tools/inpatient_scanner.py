@@ -72,55 +72,109 @@ class InpatientScanner:
         m = re.search(r'\d+', str(age_str))
         return int(m.group()) if m else None
 
+    @staticmethod
+    def infer_op_keyword_from_billed_items(diag_code: str, diag_name: str, billed_items: Any) -> Optional[str]:
+        """
+        根据 his_zycz 净计费处置项目识别明确且无歧义的 DIP 操作关键字（仅在首页手术编码为空时启用）。
+        若存在切除/活检/EMR/ESD 等高阶治疗项，绝不降级为单纯内镜检查，交由人工复核 (PENDING)。
+        """
+        if not isinstance(billed_items, (list, tuple)) or not billed_items:
+            return None
+        items = [str(x).strip() for x in billed_items if x]
+        if not items:
+            return None
+
+        joined = " ".join(items)
+        # 若已计费切除/活检/内镜治疗等操作，不简化为单纯内镜检查
+        if any(k in joined for k in ("切除", "活检", "活组织检查", "EMR", "ESD")):
+            return None
+
+        has_lower_scope = any(("下消化道内镜检查" in x or "结肠镜检查" in x) for x in items)
+        has_upper_scope = any(("上消化道内镜检查" in x or "胃镜检查" in x) for x in items)
+        diag_text = f"{diag_code or ''} {diag_name or ''}".upper()
+
+        if has_lower_scope and any(k in diag_text for k in ("K63", "K62", "D12", "结肠", "直肠", "大肠")):
+            return "电子结肠镜检查"
+        if has_upper_scope and any(k in diag_text for k in ("K21", "K22", "K29", "K31", "胃", "食管", "十二指肠")):
+            return "胃镜检查"
+        if has_lower_scope and not has_upper_scope:
+            return "电子结肠镜检查"
+        if has_upper_scope and not has_lower_scope:
+            return "胃镜检查"
+        return None
+
     def scan_and_snapshot(
         self,
         batch_id: Optional[str] = None,
         department: Optional[str] = None,
         limit: int = 50,
         include_recent_settled: bool = False,
-        notify_dingtalk: bool = False
+        notify_dingtalk: bool = False,
+        scope: str = "active",
+        year_month: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Executes a scan over inpatient cases and saves snapshots into dbo.inpatient_dip_snapshot.
-        If include_recent_settled is True, also evaluates recent discharges for validation.
+        - scope='active' (default): evaluates active un-discharged patients (unless include_recent_settled=True).
+        - scope='month': evaluates all patients in the target month (active + discharged/settled in month),
+          writing into a distinct MONTH_YYYYMM_* batch so active-only snapshots stay strictly isolated.
         """
         now_bj = datetime.now(BEIJING_TZ)
+        scope_val = (scope or "active").strip().lower()
+        if scope_val not in ("active", "month"):
+            raise ValueError(f"Unsupported scan scope: {scope}")
+
         if not batch_id:
-            batch_id = f"BATCH_{now_bj.strftime('%Y%m%d_%H%M%S')}"
+            if scope_val == "month":
+                ym = (year_month or now_bj.strftime("%Y-%m")).strip().replace("-", "")
+                batch_id = f"MONTH_{ym}_{now_bj.strftime('%Y%m%d_%H%M%S')}"
+            else:
+                batch_id = f"BATCH_{now_bj.strftime('%Y%m%d_%H%M%S')}"
 
         data_cutoff_time = now_bj.strftime("%Y-%m-%d %H:%M:%S")
 
         # 1. Fetch patients to evaluate
         patients_to_scan = []
-        active_inpatients = self.his_reader.get_active_inpatients(department=department, limit=limit)
-        patients_to_scan.extend(active_inpatients)
+        if scope_val == "month":
+            monthly_limit = limit if limit and limit > 50 else 200
+            patients_to_scan.extend(
+                self.his_reader.get_monthly_inpatients(
+                    year_month=year_month,
+                    department=department,
+                    limit=monthly_limit,
+                )
+            )
+        else:
+            active_inpatients = self.his_reader.get_active_inpatients(department=department, limit=limit)
+            patients_to_scan.extend(active_inpatients)
 
-        # Strictly decouple: Only include settled cases when explicitly requested (e.g. for replay/backtesting)
-        if include_recent_settled:
-            settled_cases = self.his_reader.get_settled_cases(limit=limit, department=department)
-            for sc in settled_cases:
-                # Avoid duplicate scan if patient already active
-                if not any(p['zyh'] == sc['lsh'] for p in patients_to_scan):
-                    patients_to_scan.append({
-                        'zyh': sc['lsh'],
-                        'patient_name': sc['patient_name'],
-                        'gender': sc['gender'],
-                        'age': sc['age'],
-                        'current_dept': sc['discharge_dept'] or sc['admission_dept'] or '未知科室',
-                        'current_bed': '已结算',
-                        'admission_time': sc['admission_time'],
-                        'current_stay_days': sc['stay_days'],
-                        'attending_doctor': sc['attending_doctor'] or sc['doctor_code'] or '未知医生',
-                        'dept_director': sc['dept_director'] or '未知主任',
-                        'admission_diag_code': sc['primary_diag_code'],
-                        'admission_diag_name': sc['primary_diag_name'],
-                        'ssmc1': sc['ssmc1'],
-                        'ssmc2': sc['ssmc2'],
-                        'ssmc3': sc['ssmc3'],
-                        'ylzffs': sc.get('ylzffs'),
-                        'insurance_type': sc['insurance_type'],
-                        '_pre_settled_amount': sc['total_amount']
-                    })
+            # Strictly decouple: Only include settled cases when explicitly requested (e.g. for replay/backtesting)
+            if include_recent_settled:
+                settled_cases = self.his_reader.get_settled_cases(limit=limit, department=department)
+                for sc in settled_cases:
+                    # Avoid duplicate scan if patient already active
+                    if not any(p['zyh'] == sc['lsh'] for p in patients_to_scan):
+                        patients_to_scan.append({
+                            'zyh': sc['lsh'],
+                            'patient_name': sc['patient_name'],
+                            'gender': sc['gender'],
+                            'age': sc['age'],
+                            'current_dept': sc['discharge_dept'] or sc['admission_dept'] or '未知科室',
+                            'current_bed': '已结算',
+                            'admission_time': sc['admission_time'],
+                            'current_stay_days': sc['stay_days'],
+                            'attending_doctor': sc['attending_doctor'] or sc['doctor_code'] or '未知医生',
+                            'dept_director': sc['dept_director'] or '未知主任',
+                            'admission_diag_code': sc['primary_diag_code'],
+                            'admission_diag_name': sc['primary_diag_name'],
+                            'ssmc1': sc['ssmc1'],
+                            'ssmc2': sc['ssmc2'],
+                            'ssmc3': sc['ssmc3'],
+                            'ylzffs': sc.get('ylzffs'),
+                            'insurance_type': sc['insurance_type'],
+                            '_pre_settled_amount': sc['total_amount'],
+                            '_is_settled': True,
+                        })
 
         print(f"[{batch_id}] Total patients selected for DIP snapshot: {len(patients_to_scan)}")
 
@@ -142,6 +196,11 @@ class InpatientScanner:
         local_cur, local_conn = get_local_db_connection(as_dict=True)
 
         try:
+            local_cur.execute(
+                "IF OBJECT_ID(N'dbo.inpatient_dip_snapshot', N'U') IS NOT NULL "
+                "AND COL_LENGTH('dbo.inpatient_dip_snapshot', 'doctor_name') IS NULL "
+                "ALTER TABLE dbo.inpatient_dip_snapshot ADD doctor_name NVARCHAR(64) NULL;"
+            )
             for pat in patients_to_scan:
                 zyh = pat['zyh']
                 ward_name = pat.get('current_dept') or '默认病区'
@@ -149,6 +208,7 @@ class InpatientScanner:
                 dept_name = pat.get('current_dept') or '默认科室'
                 dept_id = str(pat.get('current_dept_id') or pat.get('dept_id') or '').strip() or None
                 doctor_id = str(pat.get('attending_doctor_id') or pat.get('attending_doctor') or 'UNKNOWN')
+                doctor_name = str(pat.get('attending_doctor') or '').strip() or None
                 age = self.parse_age(pat.get('age'))
                 ins_type = self.map_insurance_type(pat.get('ylzffs'), pat.get('insurance_type'))
 
@@ -165,8 +225,17 @@ class InpatientScanner:
                 diag_code = (pat.get('admission_diag_code') or '').strip()
                 diag_name = (pat.get('admission_diag_name') or '').strip()
                 procedures = [pat.get('ssmc1'), pat.get('ssmc2'), pat.get('ssmc3')]
-                op_kw = " ".join([p for p in procedures if p]) or None
+                clean_procs = [str(p).strip() for p in procedures if p and str(p).strip() and str(p).strip() != '-']
+                op_kw = "+".join(clean_procs) or None
+                if not op_kw and hasattr(self.his_reader, "get_active_billed_procedures"):
+                    try:
+                        billed_items = self.his_reader.get_active_billed_procedures(zyh)
+                    except Exception:
+                        billed_items = []
+                    if isinstance(billed_items, (list, tuple)) and billed_items:
+                        op_kw = self.infer_op_keyword_from_billed_items(diag_code, diag_name, billed_items)
                 bed_days = self.parse_age(pat.get('current_stay_days'))
+                discharge_review_flag = 1 if pat.get('_is_settled') else 0
 
                 # Primary Evaluation logic
                 target_base = None
@@ -200,6 +269,20 @@ class InpatientScanner:
                         bed_days=bed_days,
                         rule_version=self.rule_version
                     )
+                    # 若已有明确编码（如 I63.900 脑梗死）但规则库无该病种，严禁退回病名做子串模糊匹配（防“脑梗死”误配“脑梗死后遗症 I69.3”）；
+                    # 仅当编码为空或非标准 ICD 编码时才回退临床名称。
+                    has_std_code = bool(diag_code and re.match(r'^[A-Z]\d{2}', diag_code.upper()))
+                    if not match_res.get("matched") and match_res.get("status") == "NOT_FOUND" and diag_code and diag_name and not has_std_code:
+                        fallback_res = match_dip_rule(
+                            disease=diag_name,
+                            age=age,
+                            ins_type=norm_ins["category"],
+                            op_keyword=op_kw,
+                            bed_days=bed_days,
+                            rule_version=self.rule_version
+                        )
+                        if fallback_res.get("matched") or fallback_res.get("status") != "NOT_FOUND":
+                            match_res = fallback_res
 
                     if match_res.get("matched"):
                         matched_rule_id = match_res.get("rule_id")
@@ -252,6 +335,7 @@ class InpatientScanner:
                         dept_id = %s,
                         dept_name = %s,
                         doctor_id = %s,
+                        doctor_name = %s,
                         age = %s,
                         ins_type = %s,
                         primary_icd = %s,
@@ -267,30 +351,31 @@ class InpatientScanner:
                         synced_at = SYSDATETIME()
                 WHEN NOT MATCHED THEN
                     INSERT (
-                        batch_id, visit_id, ward_name, bed_no, dept_id, dept_name, doctor_id, age,
+                        batch_id, visit_id, ward_name, bed_no, dept_id, dept_name, doctor_id, doctor_name, age,
                         ins_type, primary_icd, matched_rule_id, rule_version, current_fee,
                         target_base, fee_ratio, alert_level, pending_reason, discharge_review,
                         data_cutoff_time, synced_at
                     )
                     VALUES (
-                        %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s,
                         %s, %s, %s, %s, %s,
                         %s, %s, %s, %s, %s,
                         %s, SYSDATETIME()
                     );
                 """
+                primary_icd_val = (diag_code or diag_name or '')[:50] or None
                 params = (
                     # MATCHED params
                     batch_id, zyh,
-                    ward_name, bed_no, dept_id, dept_name, doctor_id, age,
-                    ins_type, diag_code or None, matched_rule_id, self.rule_version,
+                    ward_name, bed_no, dept_id, dept_name, doctor_id, doctor_name, age,
+                    ins_type, primary_icd_val, matched_rule_id, self.rule_version,
                     current_fee, target_base, fee_ratio, alert_level, pending_reason,
-                    0, data_cutoff_time,
+                    discharge_review_flag, data_cutoff_time,
                     # NOT MATCHED params
-                    batch_id, zyh, ward_name, bed_no, dept_id, dept_name, doctor_id, age,
-                    ins_type, diag_code or None, matched_rule_id, self.rule_version,
+                    batch_id, zyh, ward_name, bed_no, dept_id, dept_name, doctor_id, doctor_name, age,
+                    ins_type, primary_icd_val, matched_rule_id, self.rule_version,
                     current_fee, target_base, fee_ratio, alert_level, pending_reason,
-                    0, data_cutoff_time
+                    discharge_review_flag, data_cutoff_time
                 )
                 local_cur.execute(upsert_sql, params)
 
@@ -299,8 +384,9 @@ class InpatientScanner:
                     'patient_name': pat.get('patient_name'),
                     'dept_name': dept_name,
                     'doctor_id': doctor_id,
+                    'doctor_name': doctor_name,
                     'ins_type': ins_type,
-                    'primary_icd': diag_code,
+                    'primary_icd': primary_icd_val,
                     'current_fee': float(current_fee),
                     'target_base': float(target_base) if target_base is not None else None,
                     'fee_ratio': float(fee_ratio) if fee_ratio is not None else None,

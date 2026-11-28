@@ -16,6 +16,7 @@ defineOptions({ name: 'InpatientAlertsPage' });
 const authStore = useAuthStore();
 const loading = ref(false);
 const scanning = ref(false);
+const filterScope = ref<'month' | 'active'>('month');
 const filterDept = ref('');
 const filterLevel = ref<string | null>(null);
 const notifyDingtalk = ref(false);
@@ -23,6 +24,11 @@ const report = ref<InpatientAlertsResponse | null>(null);
 
 const canScan = computed(() => authStore.userInfo.roles.some(r => ['ADMIN', 'INSURANCE_OFFICER'].includes(r)));
 const canExport = computed(() => Boolean(authStore.userInfo.canExportCase));
+
+const scopeOptions = [
+  { label: '本月全部患者（含出院结算）', value: 'month' },
+  { label: '仅当前在院患者', value: 'active' }
+];
 
 const levelOptions = [
   { label: '全部灯号', value: '' },
@@ -60,7 +66,8 @@ const columns: DataTableColumns<InpatientAlertItem> = [
   { title: '住院号', key: 'zyh', width: 130 },
   { title: '科室', key: 'dept_name', width: 110 },
   { title: '床号', key: 'bed', width: 80 },
-  { title: '医生工号', key: 'doctor_id', width: 120 },
+  { title: '医生工号', key: 'doctor_id', width: 110 },
+  { title: '医生姓名', key: 'doctor_name', width: 105, render: row => row.doctor_name || '-' },
   { title: '主诊断', key: 'disease', minWidth: 130 },
   { title: '参保类型', key: 'ins_type', width: 95 },
   { title: '当前费用(元)', key: 'current_cost_str', width: 120 },
@@ -99,13 +106,13 @@ async function loadData() {
   const mySeq = ++inpReqSeq;
   loading.value = true;
   try {
-    const res = await fetchInpatientAlerts(filterDept.value.trim() || undefined);
+    const res = await fetchInpatientAlerts(filterDept.value.trim() || undefined, filterScope.value);
     if (mySeq !== inpReqSeq) return;
     report.value = res;
   } catch (err: any) {
     if (mySeq !== inpReqSeq) return;
     if (err?.status !== 499 && err?.status !== 401) {
-      window.$message?.error(err?.message || '加载在院预警失败');
+      window.$message?.error(err?.message || '加载控费预警失败');
     }
   } finally {
     if (mySeq === inpReqSeq) {
@@ -117,7 +124,8 @@ async function loadData() {
 async function handleTriggerScan() {
   scanning.value = true;
   try {
-    const res = await triggerManualScan(100, notifyDingtalk.value);
+    const scanLimit = filterScope.value === 'month' ? 200 : 100;
+    const res = await triggerManualScan(scanLimit, notifyDingtalk.value, filterScope.value);
     window.$message?.success(
       `巡检完成（${res.batch_id}）：共 ${res.total_scanned} 例，红灯 ${res.RED} / 黄灯 ${res.YELLOW} / 绿灯 ${res.GREEN} / 待定 ${res.PENDING}`
     );
@@ -133,12 +141,13 @@ async function handleTriggerScan() {
 
 async function handleExport() {
   const qs = new URLSearchParams();
+  qs.set('scope', filterScope.value);
   if (filterDept.value.trim()) qs.set('dept', filterDept.value.trim());
   if (filterLevel.value) qs.set('level', filterLevel.value);
   const queryStr = qs.toString() ? `?${qs.toString()}` : '';
   try {
     await downloadHospitalCsv(`/api/inpatient/alerts/export${queryStr}`, 'inpatient_alerts.csv');
-    window.$message?.success('已导出在院预警 CSV');
+    window.$message?.success('已导出控费预警 CSV');
   } catch (err: any) {
     if (err?.status !== 499 && err?.status !== 401) {
       window.$message?.error(err?.message || '导出失败');
@@ -154,6 +163,12 @@ onMounted(loadData);
     <NCard :bordered="false" class="card-wrapper">
       <div class="flex flex-wrap items-center justify-between gap-12px">
         <NSpace wrap align="center">
+          <NSelect
+            v-model:value="filterScope"
+            :options="scopeOptions"
+            style="width: 230px"
+            @update:value="loadData"
+          />
           <NInput v-model:value="filterDept" placeholder="科室名称或科室 ID" clearable style="width: 180px" @keyup.enter="loadData" />
           <NSelect v-model:value="filterLevel" :options="levelOptions" placeholder="灯号筛选" clearable style="width: 160px" />
           <NButton type="primary" :loading="loading" @click="loadData">查询刷新</NButton>
@@ -161,7 +176,9 @@ onMounted(loadData);
         </NSpace>
         <NSpace v-if="canScan" align="center">
           <NCheckbox v-model:checked="notifyDingtalk">同步推送钉钉</NCheckbox>
-          <NButton type="warning" :loading="scanning" @click="handleTriggerScan">立即触发全院巡检</NButton>
+          <NButton type="warning" :loading="scanning" @click="handleTriggerScan">
+            {{ filterScope === 'month' ? '刷新本月全量巡检' : '立即触发在院巡检' }}
+          </NButton>
         </NSpace>
       </div>
       <div class="mt-10px text-12px text-#64748b">
@@ -174,7 +191,7 @@ onMounted(loadData);
     </NAlert>
 
     <NGrid cols="2 s:3 m:6" responsive="screen" :x-gap="12" :y-gap="12">
-      <NGi><NCard :bordered="false" class="card-wrapper"><NStatistic label="在院总人数" :value="counts.total" /></NCard></NGi>
+      <NGi><NCard :bordered="false" class="card-wrapper"><NStatistic :label="filterScope === 'month' ? '本月总人数' : '在院总人数'" :value="counts.total" /></NCard></NGi>
       <NGi><NCard :bordered="false" class="card-wrapper"><NStatistic label="红灯超标"><span class="text-#dc2626 font-bold">{{ counts.red }}</span></NStatistic></NCard></NGi>
       <NGi><NCard :bordered="false" class="card-wrapper"><NStatistic label="黄灯观察"><span class="text-#d97706 font-bold">{{ counts.yellow }}</span></NStatistic></NCard></NGi>
       <NGi><NCard :bordered="false" class="card-wrapper"><NStatistic label="绿灯正常"><span class="text-#16a34a font-bold">{{ counts.green }}</span></NStatistic></NCard></NGi>
@@ -182,7 +199,7 @@ onMounted(loadData);
       <NGi><NCard :bordered="false" class="card-wrapper"><NStatistic label="自费不适用"><span class="text-#0284c7 font-bold">{{ counts.na }}</span></NStatistic></NCard></NGi>
     </NGrid>
 
-    <NCard title="在院患者控费预警明细（已脱敏，不含患者姓名）" :bordered="false" class="card-wrapper">
+    <NCard :title="(filterScope === 'month' ? '本月全部患者控费预警明细' : '在院患者控费预警明细') + '（已脱敏，不含患者姓名）'" :bordered="false" class="card-wrapper">
       <NDataTable :loading="loading" :columns="columns" :data="filteredItems" :pagination="{ pageSize: 20 }" :scroll-x="1100" size="small" />
     </NCard>
   </NSpace>

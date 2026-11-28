@@ -1,15 +1,32 @@
 <script setup lang="ts">
-import { h, onMounted, reactive, ref } from 'vue';
+import { computed, h, onMounted, reactive, ref } from 'vue';
 import type { DataTableColumns } from 'naive-ui';
 import { NButton, NTag } from 'naive-ui';
-import { fetchOperators, updateOperatorStatus, upsertOperator, type OperatorItem } from '@/service/api/hospital';
+import {
+  fetchHisDoctors,
+  fetchOperators,
+  updateOperatorStatus,
+  upsertOperator,
+  type HisDoctorItem,
+  type OperatorItem
+} from '@/service/api/hospital';
 
 defineOptions({ name: 'OperatorsAdminPage' });
 
 const loading = ref(false);
 const saving = ref(false);
 const modalOpen = ref(false);
+const hisDocsLoading = ref(false);
+const selectedHisDoctorId = ref<string | null>(null);
 const operators = ref<OperatorItem[]>([]);
+const hisDoctors = ref<HisDoctorItem[]>([]);
+
+const hisDoctorOptions = computed(() =>
+  hisDoctors.value.map(d => ({
+    label: `${d.doctor_name || '未命名'}（工号:${d.doctor_id}${d.dept_name ? ` / ${d.dept_name}` : ''}${d.ybysdm ? ` / ${d.ybysdm}` : ''}）`,
+    value: d.doctor_id
+  }))
+);
 
 const form = reactive({
   operator_id: '',
@@ -90,6 +107,7 @@ async function loadData() {
 }
 
 function openCreate() {
+  selectedHisDoctorId.value = null;
   form.operator_id = '';
   form.display_name = '';
   form.role_type = 'DOCTOR';
@@ -99,9 +117,11 @@ function openCreate() {
   form.can_export_case = false;
   form.password = '';
   modalOpen.value = true;
+  if (hisDoctors.value.length === 0) loadHisDoctors();
 }
 
 function openEdit(row: OperatorItem) {
+  selectedHisDoctorId.value = row.doctor_id || null;
   form.operator_id = row.operator_id;
   form.display_name = row.display_name;
   form.role_type = row.role_type;
@@ -111,6 +131,38 @@ function openEdit(row: OperatorItem) {
   form.can_export_case = Boolean(row.can_export_case);
   form.password = '';
   modalOpen.value = true;
+  if (hisDoctors.value.length === 0) loadHisDoctors();
+}
+
+async function loadHisDoctors() {
+  hisDocsLoading.value = true;
+  try {
+    const res = await fetchHisDoctors();
+    hisDoctors.value = res.items || [];
+  } catch (err: any) {
+    if (err?.status !== 499 && err?.status !== 401) {
+      window.$message?.warning(err?.message || 'HIS 医生目录读取失败');
+    }
+  } finally {
+    hisDocsLoading.value = false;
+  }
+}
+
+function handleSelectHisDoctor(val: string | null) {
+  selectedHisDoctorId.value = val;
+  if (!val) return;
+  const doc = hisDoctors.value.find(d => d.doctor_id === val);
+  if (!doc) return;
+  form.doctor_id = doc.doctor_id;
+  if (!form.display_name.trim() && doc.doctor_name) {
+    form.display_name = doc.doctor_name;
+  }
+  if (!form.dept_scope.trim() && doc.dept_id) {
+    form.dept_scope = doc.dept_id;
+  }
+  if (!form.operator_id.trim()) {
+    form.operator_id = `DOC_${doc.doctor_id}`;
+  }
 }
 
 async function handleSave() {
@@ -180,7 +232,21 @@ onMounted(loadData);
         <NFormItem label="姓名 *"><NInput v-model:value="form.display_name" placeholder="如 张医生" /></NFormItem>
         <NFormItem label="角色 *"><NSelect v-model:value="form.role_type" :options="roleOptions" /></NFormItem>
         <NFormItem label="科室范围 (ID)"><NInput v-model:value="form.dept_scope" placeholder="科主任建议填科室 ID，如 101" /></NFormItem>
-        <NFormItem label="HIS 医生工号"><NInput v-model:value="form.doctor_id" placeholder="医生角色绑定，如 D1502..." /></NFormItem>
+        <NFormItem label="从 HIS 选医生">
+          <div class="w-full flex gap-8px">
+            <NSelect
+              :value="selectedHisDoctorId"
+              :options="hisDoctorOptions"
+              :loading="hisDocsLoading"
+              filterable
+              clearable
+              placeholder="从 HIS 职员表选择（自动带出工号/姓名/科室）"
+              @update:value="handleSelectHisDoctor"
+            />
+            <NButton secondary size="small" :loading="hisDocsLoading" @click="loadHisDoctors">同步 HIS</NButton>
+          </div>
+        </NFormItem>
+        <NFormItem label="HIS 医生工号"><NInput v-model:value="form.doctor_id" placeholder="建议填 HIS ryid（如 13），可由上方选择带出" /></NFormItem>
         <NFormItem label="钉钉 userid"><NInput v-model:value="form.dingtalk_userid" placeholder="可选" /></NFormItem>
         <NFormItem label="病例导出权限"><NSwitch v-model:value="form.can_export_case" /></NFormItem>
         <NFormItem label="登录口令(>=8位)*"><NInput v-model:value="form.password" type="password" show-password-on="click" /></NFormItem>

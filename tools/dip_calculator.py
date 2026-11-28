@@ -864,6 +864,23 @@ def match_dip_rule(
             matched_candidates.append(r)
 
     if not matched_candidates:
+        # Step 1b: 临床/医保 6 位扩展 ICD 编码向 4 位/3 位 DIP 核心编码归并（如 K63.500 -> K63.5, I10.x00 -> I10）
+        icd_parent = None
+        m_sub = re.match(r'^([A-Z]\d{2}\.\d)(?:\d+|[Xx][0-9A-Z]*)$', kw)
+        if m_sub:
+            icd_parent = m_sub.group(1)
+        else:
+            m_cat = re.match(r'^([A-Z]\d{2})\.[Xx][0-9A-Z]*$', kw)
+            if m_cat:
+                icd_parent = m_cat.group(1)
+        if icd_parent:
+            for r in all_rules:
+                r_icd = (r["icd_code"] or "").strip().upper()
+                r_icd_clean = re.sub(r'\.[Xx]$', '', r_icd)
+                if r_icd_clean == icd_parent:
+                    matched_candidates.append(r)
+
+    if not matched_candidates:
         return {
             "matched": False,
             "status": "NOT_FOUND",

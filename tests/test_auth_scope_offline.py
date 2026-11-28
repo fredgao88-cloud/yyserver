@@ -25,8 +25,9 @@ import auth.rbac as rbac_mod
 
 
 class _FakeCursor:
-    def __init__(self, row=None):
+    def __init__(self, row=None, rows=None):
         self.row = row
+        self.rows = rows if rows is not None else ([] if row is None else [row])
         self.executed = []
 
     def execute(self, sql, params=None):
@@ -34,6 +35,9 @@ class _FakeCursor:
 
     def fetchone(self):
         return self.row
+
+    def fetchall(self):
+        return self.rows
 
 
 class _FakeConn:
@@ -93,6 +97,32 @@ def test_his_fixture_removed():
         assert conn_empty.closed is True
 
     print("PASS [HIS-FIXTURE-001]: 生产读取器无 SYNTH_* 硬编码，统一走带参数在院 SQL 查询，空记录返回 None")
+
+
+def test_his_ry_mapping_and_fallback_sql():
+    reader = HISReader()
+
+    cur_docs = _FakeCursor(rows=[{"doctor_id": "13", "doctor_name": "测试医生", "dept_id": "4", "dept_name": "中医科"}])
+    conn_docs = _FakeConn(cur_docs)
+    with patch.object(reader, "get_connection", return_value=conn_docs):
+        docs = reader.get_his_doctors()
+        assert len(docs) == 1 and docs[0]["doctor_id"] == "13"
+        doc_sql = cur_docs.executed[0][0]
+        assert "FROM dbo.his_ry" in doc_sql and "WHERE r.isys = 1" in doc_sql
+        for forbidden_col in ("sfzh", "lxdh", "password", "xxdz"):
+            assert forbidden_col not in doc_sql.lower()
+
+    cur_act = _FakeCursor(rows=[])
+    conn_act = _FakeConn(cur_act)
+    with patch.object(reader, "get_connection", return_value=conn_act):
+        reader.get_active_inpatients(limit=10)
+        act_sql = cur_act.executed[0][0]
+        assert "HAVING COUNT(*) = 1" in act_sql
+        assert "dbo.his_gh" in act_sql and "gdfysid" in act_sql and "ks_gh.ksname" in act_sql
+        assert "dbo.his_btyb_rycbxx_1101" in act_sql and "gh.jylxid" in act_sql
+        assert "gh.jbbm" in act_sql and "gh.ssname" in act_sql
+        assert "dbo.his_zycz" in act_sql and "dbo.his_bl_yzzycf" in act_sql and "dbo.his_zycfmain" in act_sql
+        assert "WHEN NULLIF(LTRIM(RTRIM(sy.zyysbm)), '') IS NOT NULL" in act_sql
 
 
 def test_auth_scope_001_doctor_precedence():
@@ -307,6 +337,7 @@ if __name__ == "__main__":
     print("=" * 70)
     with offline_connection_guard():
         test_his_fixture_removed()
+        test_his_ry_mapping_and_fallback_sql()
         test_auth_scope_001_doctor_precedence()
         test_auth_scope_002_and_snap_query_001()
     print("=" * 70)
