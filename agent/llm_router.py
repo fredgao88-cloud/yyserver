@@ -11,7 +11,135 @@
 import re
 from decimal import Decimal
 from typing import Dict, Any, Optional
-from tools.dip_calculator import match_dip_rule, evaluate_traffic_light, normalize_insurance_type
+from tools.dip_calculator import (
+    extract_icd_code,
+    match_dip_rule,
+    evaluate_traffic_light,
+    normalize_insurance_type,
+)
+
+def extract_operation_keyword(text_clean: str):
+    """
+    DIP-OP-001：按分句顺序建立操作状态机追踪每个具体操作词的最新状态：
+    - 同一操作（含“胃镜检查”/“胃镜”等子串关联操作）后句状态覆盖前句；
+    - 同一操作先拟行后完成（“拟行胃镜，随后已完成胃镜”）-> 取 COMPLETED；
+    - 不同操作互不抹去（“已完成胃镜，拟行活检”）-> 保留已完成的胃镜；
+    - 后句省略操作名直接取消（“胃镜检查，现已取消”）-> 将取消绑定到前序最近操作并回退保守；
+    - 非手术事项计划（“已完成胃镜，计划出院”）-> 不影响手术状态。
+    """
+    candidate_ops = [
+        ("切除术+胃镜", "胃镜检查"),
+        ("切除+胃镜", "胃镜检查"),
+        ("胃镜检查", "胃镜检查"),
+        ("胃十二指肠镜", "胃十二指肠"),
+        ("活检", "活检"),
+        ("活组织", "活检"),
+        ("直肠息肉切除", "直肠息肉切除"),
+        ("胃息肉切除", "胃息肉切除"),
+        ("电子结肠镜", "电子结肠镜"),
+        ("结肠镜", "结肠镜"),
+        ("保守", "保守"),
+        ("胃镜", "胃镜"),
+        ("切除", "切除"),
+        ("治疗性操作", "综合-治疗性操作"),
+        ("操作", "综合-治疗性操作"),
+    ]
+    cancel_kws = ("取消", "未做", "未行", "放弃", "暂不做")
+    planned_kws = ("拟行", "拟做", "计划", "准备行", "拟实施", "准备做", "打算做", "原定")
+    completed_kws = ("已完成", "已行", "已做", "做完", "术后", "已实施")
+    non_op_nouns = ("出院", "入院", "手续", "转科", "复查", "随访", "回家", "床位", "病历", "签字", "缴费", "结算", "餐饮", "陪护")
+
+    clauses = [c.strip() for c in re.split(r"[，,；;。！？!?]+", text_clean or "") if c.strip()]
+    if not clauses:
+        clauses = [text_clean or ""]
+
+    op_states = {}
+    last_op = None
+
+    def _set_op_state(target_op: str, new_state: str):
+        for existing_op in list(op_states.keys()):
+            if existing_op == target_op or existing_op in target_op or target_op in existing_op:
+                op_states[existing_op] = new_state
+        op_states[target_op] = new_state
+
+    _temporal_ref_re = re.compile(r"(?:该|此|上述)(?:操作|手术|检查)(?:之前|之后|前|后|时|中)")
+    _pronoun_re = re.compile(r"(?:该操作|该手术|该检查|此操作|此手术|此检查|该项|上述操作|上述手术|上述检查|前项)")
+    _tense_strip_re = re.compile(
+        r"(?:现已|已经|已完成|已行|已做|做完|术后|已实施|暂不做|准备行|拟实施|准备做|打算做|"
+        r"取消|未做|未行|放弃|拟行|拟做|计划|原定|原本|随后|后来|最终|确定|决定|还是|改为|变成|"
+        r"完成|实施|执行|目前|已|暂|了|的|呢|\s)+"
+    )
+
+    for clause in clauses:
+        # 先剥除时间状语参照（如“该检查前”），避免时间参照触发指代继承
+        clause_no_temporal = _temporal_ref_re.sub("", clause)
+        has_pronoun = bool(_pronoun_re.search(clause_no_temporal))
+
+        matched_kw = None
+        matched_pat = None
+        for pattern, op_kw in candidate_ops:
+            if pattern in clause_no_temporal:
+                matched_kw = op_kw
+                matched_pat = pattern
+                break
+
+        # 仅当无具体术式名（或仅被泛词“操作”匹配且句中带明确指代词如“该操作”）
+        # 且剥除指代词与时态词后无其他独立事项（如“抽血”）时，才继承更新上一操作
+        is_pure_pronoun_ref = has_pronoun and (matched_kw is None or matched_pat == "操作")
+        if is_pure_pronoun_ref and last_op is not None:
+            residual_after_pronoun = _tense_strip_re.sub("", _pronoun_re.sub("", clause_no_temporal)).strip()
+            if not residual_after_pronoun:
+                if any(k in clause for k in cancel_kws):
+                    _set_op_state(last_op, "CANCELED")
+                elif any(k in clause for k in completed_kws):
+                    _set_op_state(last_op, "COMPLETED")
+                elif any(k in clause for k in planned_kws):
+                    if op_states.get(last_op) == "UNKNOWN":
+                        _set_op_state(last_op, "PLANNED")
+            continue
+
+        if matched_kw is not None:
+            last_op = matched_kw
+            if any(k in clause for k in cancel_kws):
+                _set_op_state(matched_kw, "CANCELED")
+            elif any(k in clause for k in planned_kws):
+                _set_op_state(matched_kw, "PLANNED")
+            elif any(k in clause for k in completed_kws):
+                _set_op_state(matched_kw, "COMPLETED")
+            else:
+                op_states.setdefault(matched_kw, "UNKNOWN")
+        elif last_op is not None:
+            residual = _tense_strip_re.sub("", clause).strip()
+            if residual:
+                continue
+            if any(k in clause for k in cancel_kws):
+                _set_op_state(last_op, "CANCELED")
+            elif any(k in clause for k in completed_kws):
+                _set_op_state(last_op, "COMPLETED")
+            elif any(k in clause for k in planned_kws):
+                if op_states.get(last_op) == "UNKNOWN":
+                    _set_op_state(last_op, "PLANNED")
+
+    if op_states:
+        for op_kw, st in op_states.items():
+            if st == "COMPLETED":
+                return op_kw, "COMPLETED", ""
+        for op_kw, st in op_states.items():
+            if st == "UNKNOWN":
+                return op_kw, "UNKNOWN", ""
+        for op_kw, st in op_states.items():
+            if st == "CANCELED":
+                return "保守", "CANCELED", "（检测到手术/操作已取消，按保守治疗基础分组测算）"
+        for op_kw, st in op_states.items():
+            if st == "PLANNED":
+                return "保守", "PLANNED", "（检测到操作为拟行/尚未执行状态，依规暂不计入手术操作组，按保守治疗分组测算；待实际执行后按新组结算）"
+
+    if any(k in text_clean for k in cancel_kws):
+        return "保守", "CANCELED", "（检测到手术/操作已取消，按保守治疗基础分组测算）"
+    if any(k in text_clean for k in planned_kws):
+        return "保守", "PLANNED", "（检测到操作为拟行/尚未执行状态，依规暂不计入手术操作组，按保守治疗分组测算；待实际执行后按新组结算）"
+    return None, "UNKNOWN", ""
+
 
 def parse_local_intent(text: str, channel: str = "web") -> Dict[str, Any]:
     """院内纯本地意图解析与参数提取（零云端调用）"""
@@ -126,56 +254,16 @@ def parse_local_intent(text: str, channel: str = "web") -> Dict[str, Any]:
     ins_type = norm_ins.get("category") if norm_ins.get("valid") else None
 
     # ---------------- 6. 操作识别与时态感知 ----------------
-    op_status = "UNKNOWN"
-    if any(k in text_clean for k in ["取消", "未做", "未行", "放弃", "暂不做"]):
-        op_status = "CANCELED"
-    elif any(k in text_clean for k in ["拟行", "拟做", "计划", "准备行", "拟实施", "准备做", "打算做"]):
-        op_status = "PLANNED"
-    elif any(k in text_clean for k in ["已完成", "已行", "已做", "做完", "术后", "已实施"]):
-        op_status = "COMPLETED"
-
-    op_keyword = None
-    op_note = ""
-    
-    if op_status in ("CANCELED", "PLANNED"):
-        # 依规范：拟行或已取消操作均尚未实际发生加分效力，一律回退至保守治疗/基础分组测算
-        op_keyword = "保守"
-        if op_status == "CANCELED":
-            op_note = "（检测到手术/操作已取消，按保守治疗基础分组测算）"
-        else:
-            op_note = "（检测到操作为拟行/尚未执行状态，依规暂不计入手术操作组，按保守治疗分组测算；待实际执行后按新组结算）"
-    else:
-        # 优先提取具体复合操作词，避免笼统词（如单纯“切除”）覆盖复合术式
-        candidate_ops = [
-            ("切除术+胃镜", "胃镜检查"),
-            ("切除+胃镜", "胃镜检查"),
-            ("胃镜检查", "胃镜检查"),
-            ("胃十二指肠镜", "胃十二指肠"),
-            ("活检", "活检"),
-            ("活组织", "活检"),
-            ("直肠息肉切除", "直肠息肉切除"),
-            ("胃息肉切除", "胃息肉切除"),
-            ("电子结肠镜", "电子结肠镜"),
-            ("结肠镜", "结肠镜"),
-            ("保守", "保守"),
-            ("胃镜", "胃镜"),
-            ("切除", "切除"),
-            ("治疗性操作", "综合-治疗性操作"),
-            ("操作", "综合-治疗性操作")
-        ]
-        for pattern, op_kw in candidate_ops:
-            if pattern in text_clean:
-                op_keyword = op_kw
-                break
+    op_keyword, op_status, op_note = extract_operation_keyword(text_clean)
 
     # ---------------- 7. 识别病种 (区分显式 ICD 编码与宽泛病名) ----------------
     disease = None
     has_explicit_icd = False
     
-    # 优先提取 ICD 编码 (如 M17.9, K63.5, I10.x, M53.1)
-    icd_regex = re.search(r'\b([A-Z]\d{2}(?:\.[0-9a-zA-Z]{1,2})?)\b', text_clean, re.I)
-    if icd_regex:
-        disease = icd_regex.group(1).upper()
+    # 优先提取完整 ICD 编码（共用 dip_calculator.extract_icd_code：支持中文紧邻及 6 位扩展码 K63.500）
+    icd_code_hit = extract_icd_code(text_clean)
+    if icd_code_hit:
+        disease = icd_code_hit
         has_explicit_icd = True
     else:
         # 常见疾病名称

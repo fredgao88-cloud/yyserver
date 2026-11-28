@@ -4,6 +4,7 @@
 严格按照《开发设计文档 v1.2》架构规范实现，从 .env 读取连接参数，统一管理连接与事务
 支持容器内与宿主机环境无缝切换，提供规则库检索、在院快照保存与合规审计日志记录
 """
+import logging
 import os
 try:
     import pymssql
@@ -24,6 +25,9 @@ LOCAL_DB_PORT = int(os.getenv("LOCAL_DB_PORT", "1433"))
 LOCAL_DB_USER = os.getenv("LOCAL_DB_USER", "sa")
 LOCAL_DB_PASS = os.getenv("LOCAL_DB_PASS", "")
 LOCAL_DB_NAME = os.getenv("LOCAL_DB_NAME", "his_agent_db")
+DB_NO_FALLBACK = os.getenv("DB_NO_FALLBACK", "").strip().lower() in ("1", "true", "yes")
+
+logger = logging.getLogger("hospital_agent.local_db")
 
 def get_local_db_connection(as_dict: bool = True) -> Tuple[Any, Any]:
     """
@@ -35,12 +39,14 @@ def get_local_db_connection(as_dict: bool = True) -> Tuple[Any, Any]:
     if not LOCAL_DB_PASS:
         raise ValueError("LOCAL_DB_PASS environment variable must be explicitly configured and non-empty.")
     candidates = [LOCAL_DB_HOST]
-    for fallback in ["127.0.0.1", "localhost", "sqlserver"]:
-        if fallback not in candidates:
-            candidates.append(fallback)
-            
+    # FIX-04: 支持通过 DB_NO_FALLBACK=1 禁用连接回退，避免在已知单点环境中浪费超时重试
+    if not DB_NO_FALLBACK:
+        for fallback in ["127.0.0.1", "localhost", "sqlserver"]:
+            if fallback not in candidates:
+                candidates.append(fallback)
+
     last_err = None
-    for h in candidates:
+    for idx, h in enumerate(candidates):
         try:
             conn = pymssql.connect(
                 server=h,
@@ -55,9 +61,11 @@ def get_local_db_connection(as_dict: bool = True) -> Tuple[Any, Any]:
             return conn.cursor(as_dict=as_dict), conn
         except Exception as e:
             last_err = e
+            if idx + 1 < len(candidates):
+                logger.warning("EVENT=DB_CONNECT_FALLBACK host=%s next_host=%s err_type=%s", h, candidates[idx + 1], type(e).__name__)
             continue
             
-    raise ConnectionError(f"无法连接到本地数据库 his_agent_db (尝试地址: {candidates}): {last_err}")
+    raise ConnectionError(f"EVENT=DB_CONNECT_FAILED hosts={candidates} err_type={type(last_err).__name__ if last_err else 'Unknown'}")
 
 def query_approved_dip_rules(
     rule_version: str = "2026_SAMPLE_V1",
@@ -127,6 +135,7 @@ def record_audit_log(
         ))
         conn.commit()
     except Exception as e:
-        print(f"[WARN] 记录审计日志失败: {e}")
+        # AUDIT-LOG-001：仅输出受控事件码与动作类型，绝不输出原始驱动异常文本、堆栈或操作员敏感字段
+        logger.error("EVENT=AUDIT_LOG_WRITE_FAILED action=%s role=%s err_type=%s", action_type, role_type, type(e).__name__)
     finally:
         conn.close()

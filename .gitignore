@@ -10,3 +10,8 @@ nginx/ssl/
 *.crt
 .venv*/
 freetds.conf
+logs/
+wireguard/config/
+web/node_modules/
+web/.pnpm-store/
+web/dist/

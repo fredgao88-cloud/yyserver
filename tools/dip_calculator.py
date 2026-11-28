@@ -24,6 +24,22 @@ def get_loaded_rules(rule_version: str = "2026_SAMPLE_V1", force_reload: bool = 
         _RULES_CACHE[rule_version] = rules
     return _RULES_CACHE[rule_version]
 
+
+def extract_icd_code(text: str) -> Optional[str]:
+    """
+    DIP-ICD-001：统一自然语言与结构化入口的 ICD 编码提取逻辑。
+    1) 使用非 ASCII 字母数字边界替代 \\b，支持中文紧邻（如“诊断编码M17.9”、“诊断K63.500”）；
+    2) 先完整保留扩展编码（如 K63.500、I10.x00、R12.x00x002），不提前截断，
+       后续交由 match_dip_rule 优先精确匹配、无命中时再按统一规则归并至 4 位/3 位核心码。
+    """
+    if not text:
+        return None
+    m = re.search(
+        r'(?:^|(?<![A-Za-z0-9]))([A-Za-z]\d{2}(?:\.[0-9A-Za-z]{1,8})?)(?![A-Za-z0-9])',
+        str(text),
+    )
+    return m.group(1).upper() if m else None
+
 # ----------------------------------------------------
 # 统一医保别名定义 (肯定匹配与否定匹配共用同一套底表)
 # ----------------------------------------------------
@@ -54,23 +70,33 @@ WHOLE_BILL_SCOPE = r'(?:本次住院|整次住院|住院费用|整单|整次|本
 def has_whole_bill_self_pay(c: str) -> bool:
     """整单自费判定：项目范围词（如“检查”）后出现“本次住院/整单”等整单范围词再接自费结算，
     则该指令作用于整次住院（如“经检查本次住院按自费结算”），而非项目级自费。
-    整单范围词的优先级高于词语距离。"""
-    return bool(re.search(
-        r'(?:' + ITEM_SCOPE_PREFIXES + r')[^，。；,;]{0,8}?' + WHOLE_BILL_SCOPE + r'[^，。；,;]{0,6}?(?:按|以|属于|采用)\s*自费',
+    整单范围词的优先级高于词语距离；
+    但整单范围词之后若再次出现项目限定（如“经检查本次住院仅耗材按自费结算”中的“仅耗材”），
+    自费范围被重新收窄到具体项目，不属于整单自费。"""
+    for m in re.finditer(
+        r'(?:' + ITEM_SCOPE_PREFIXES + r')[^，。；,;]{0,8}?(?:' + WHOLE_BILL_SCOPE + r')([^，。；,;]{0,6}?)(?:按|以|属于|采用)\s*自费',
         c
-    ))
+    ):
+        gap_after_scope = m.group(1)
+        if re.search(ITEM_SCOPE_PREFIXES, gap_after_scope) or re.search(r'(?:仅|只是|只有|仅限)', gap_after_scope):
+            continue  # 整单范围词后又限定具体项目，自费仅限该项目
+        return True
+    return False
 
 def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
     """
-    统一参保类型归一化与前置合规审查核心函数 (Round 12 优化版)：
+    统一参保类型归一化与前置合规审查核心函数 (Round 14 优化版)：
     1. 统一别名库：否定匹配与肯定匹配 100% 共享相同别名表，精准支持“城乡居民”等复合险种；
     2. 针对性选择疑问句识别：仅当选择词连接的是两类及以上不同险种时触发 AMBIGUOUS_INS_TYPE，
        若用户已确认险种而后文仅询问临床方案（如“保守还是手术”），绝不误判险种歧义；
        且选择词判定只在非历史、非否定的活跃分句内进行，历史疑问不压制当前确认；
     3. “更正为/修改为/调整为”明确覆盖：后置更正指令强力覆盖既往/前置指令；
        但“暂不更正/不更正/无需更正”等明确否定保留原险种；“是否需要更正为…”“需要更正为…吗”
-       等询问形式（含句尾“吗/呢/吧”疑问标记）一律先澄清（CORRECTION_UNCONFIRMED），绝不擅自更改测算口径；
-       多次更正并存时按语句先后判断最后一次更正请求的状态：询问在后则澄清，确认在后则以确认更正为准；
+       等询问形式（含句尾“吗/呢/吧”疑问标记与分句句尾问号），以及“待核实后再更正为…”
+       “如果符合条件则更正为…”等条件性更正（前提未满足），一律先澄清（CORRECTION_UNCONFIRMED），
+       绝不擅自更改测算口径；
+       多次更正并存时按(分句序号, 分句内字符位置)判断最后一次更正请求的状态：
+       询问/条件更正在后则澄清，确认更正在后则以确认更正为准；
     4. 支付范围前置隔离：“耗材按自费项目结算”“进口耗材单独按自费项目结算”精准判定为
        项目级自费（范围词与动词间允许“单独/需要”等填充词），整单按基本医保正常测算；
        但“经检查本次住院按自费结算”等含整单范围词（本次住院/整单）的指令优先于词语距离，按整单自费处理；
@@ -90,10 +116,20 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
     s = str(ins_type_str).strip()
 
     # 1. 分句拆分：按中英文逗号、句号、分号、问号、感叹号、换行符分割
-    clauses = [c.strip() for c in re.split(r'[,，;；。?!？！\n]+', s) if c.strip()]
+    # 保留句尾问号标记：问号是“更正为居民医保？”等更正询问的唯一疑问信号，分句时不得丢弃，
+    # 否则询问会被当作已确认的更正指令直接执行并返回错误金额
+    raw_parts = re.split(r'([,，;；。?!？！\n]+)', s)
+    clauses = []  # 每项为 (分句文本, 是否以问号结尾)
+    for pi in range(0, len(raw_parts), 2):
+        text_part = (raw_parts[pi] or '').strip()
+        if not text_part:
+            continue
+        delim = raw_parts[pi + 1] if pi + 1 < len(raw_parts) else ''
+        ends_question = bool(delim) and ('?' in delim or '？' in delim)
+        clauses.append((text_part, ends_question))
     clause_info = []
 
-    for c in clauses:
+    for c, c_ends_question in clauses:
         is_historical = bool(re.search(r'(?:原|既往|过去|曾|之前|既往的)', c))
         is_negated = bool(re.search(NEGATION_PREFIXES, c))
         is_closed = bool(re.search(r'(?:已结案|已结清|结案|已终结)', c))
@@ -131,7 +167,8 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
             'is_correction': is_correction,
             'is_current': is_current_directive,
             'has_ins_pending': has_ins_pending,
-            'is_item_self_pay': is_item_level_self_pay
+            'is_item_self_pay': is_item_level_self_pay,
+            'is_question': c_ends_question
         })
 
     # 2. 检查是否存在活跃的待查表述（历史时态的'原参保类型待查'若伴随当前确认指令，不压制当前确认）
@@ -156,9 +193,10 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
 
     # 3. 提取结算指令与更正指令
     # 注意：若指令前存在“耗材/药品/检查”等项目修饰词，属于项目自费，严禁提取为整单结算指令！
-    directive_records = []  # 记录 (category, is_correction, clause_index)
+    directive_records = []  # 记录 (category, is_correction, clause_index, pos)
     correction_question_target = None  # “是否需要更正为X”等询问形式的目标险种（先澄清，绝不擅自更改）
-    correction_question_clause_idx = -1  # 更正询问所在分句序号（用于按语句先后判断最后一次更正请求的状态）
+    correction_question_clause_idx = -1  # 更正询问所在分句序号
+    correction_question_pos = -1  # 更正询问在分句内的字符位置（与分句序号共同定位最后一次更正请求）
 
     # 指令匹配正则：支持“本次按/采用/转为/以”以及更正词“更正为/修改为/调整为”
     # 使用统一别名表 INS_ALIAS_COMBINED
@@ -169,11 +207,195 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
     # 更正动词前置否定/疑问识别（如“暂不更正为居民医保”/“是否需要更正为居民医保？”）
     corr_neg_pre = re.compile(r'(?:暂不|不需要|无需|无须|不予|勿|别|不|未)$')
     corr_question_pre = re.compile(r'(?:是否需要|要不要|需要|能否|可否|可不可以|是否)$')
+    # 条件性/待核实更正识别（如“待核实后再更正为居民医保”/“如果符合条件则更正为居民医保”）：
+    # 前提条件尚未满足，更正未生效，确认前绝不执行
+    corr_conditional_pre = re.compile(r'(?:待核实|待确认|待核准|待审批|如果|若|假如|一旦|必要时|视情况|符合条件)')
+    # 前提已落实识别（如“已核实符合条件并确认更正为居民医保”）：
+    # 条件词与“已核实/已确认/已审批”等完成态确认标记共存时，说明前提已有明确核实结果，
+    # 不再视为未决前提，更正正常生效
+    corr_fulfilled_pre = re.compile(r'(?:已核实|经核实|核实无误|已确认|确认无误|已审批|已核准|已获批|已满足|已符合)')
+    # 假设语气识别（“如果/若/假如/一旦”）：假设句内的完成态词（如“如果已获批则…”）只是假设前提，
+    # 绝非事实确认，完成态词不得放行使更正生效（DIP-INS-001 变体）；
+    # 仅当后续分句以陈述事实口吻明确确认同一前提结果（含完成态词且无假设词）时才解除待定（DIP-INS-002 变体）
+    corr_hypothetical = re.compile(r'(?:如果|若|假如|一旦)')
 
+    # 前提中的肯定结果词（DIP-INS-001 变体四）：前提既含“事项”又含“结果”，
+    # 确认分句必须同时覆盖事项话题与前提中出现的结果词，才视为同一前提已被确认；
+    # “审批尚在办理”（无结果词）、“审批材料齐全”（事项相关但结果不符）均不得解除待定
+    _premise_outcome_words = ('通过', '获批', '批准', '核准', '同意', '符合', '满足', '成功', '完成', '落实', '到位')
+    # 1. 全局否决与冲突判定（DIP-INS-001 变体八）：含任何否定终审/审批结果的陈述，绝不放行
+    # （“审批终审未通过但初审通过”“审批未通过”“审批不予通过”“审批结果为不予通过”均不放行）
+    _rejection_pattern = re.compile(
+        r'(?:终审|审批|复审|核准|申请)?(?:未通过|没有通过|未能通过|没能通过|不予通过|未予通过|不予批准|未获批准|未获批|被否决|否决|被驳回|驳回|未予核准|不予核准|未通过终审)'
+    )
+
+    # 2. 全局撤回、辟谣与消息不实判定（DIP-INS-001 变体八）：审批通过的消息被证实有误/辟谣/撤回，绝不放行
+    # （“审批通过的消息有误”“审批通过的消息不实”“审批通过系误传”“审批通过已被撤回”均不放行）
+    _retraction_pattern = re.compile(
+        r'(?:(?:消息|信息|传闻|报道|通报|记录|说法)?(?:有误|不实|不属实|系误传|属误报|系误报|纯属误报|已被撤回|被撤回|已被撤销|被撤销|纯属谣传|属谣传|系谣传|已被辟谣|已辟谣|属误传))|'
+        r'(?:(?:通过|获批|批准).{0,6}(?:消息|信息|传闻|记录|说法)?(?:有误|不实|不属实|系误传|属误报|系误报|撤回|撤销|谣传|辟谣))'
+    )
+
+    # 过去时间约数修饰（DIP-INS-001 变体十三）：“大约三天前”“约两周前”仅修饰日期，不影响已完成的审批结果
+    _past_time_approx = re.compile(
+        r'(?:大约|大概|约)\s*(?:\d+|[一二三四五六七八九十两半]+)\s*(?:天|日|周|个?月|年|小时)(?:以)?前'
+    )
+    # 日期/时间字段未知修饰（DIP-INS-001 变体十四）：“通过时间未知”仅修饰时间字段，不影响“结果已确认通过”
+    _time_field_unknown = re.compile(
+        r'(?:(?:具体)?(?:通过|获批|批准|核准)?(?:时间|日期|时点)(?:尚)?(?:未知|未明|不明|不清楚|待定|不详|不明确))'
+    )
+
+    # 3. 阶段性/未决/等待/跨词尚未/疑问/生效条件/预期/推测判定（DIP-INS-001 变体六/七/八/十一/十二/十三/十四）：
+    # “仍在等待通过”“系统尚未显示通过”“尚未被确认通过”一律拒绝；
+    # 时间约数及时间字段未知先剥除，不影响“已经通过”“结果已确认通过”判定
+    _premise_pending_markers = re.compile(
+        r'(?:仍待|尚待|待终审|待复审|待复核|待批|仍需|还需|尚无结论|尚无定论|未有结论|未有定论|无结论|结论未定|悬而未决|'
+        r'是否通过|有无通过|通过与否|与否|能否|可否|不知道|尚不清楚|不清楚|尚不明确|不明确|未知|未明|待确认|尚待确认|有待确认|'
+        r'等待|等候|仍在等|正在等|尚在等|方能|方可|才能|才生效|后生效|后才|须通过|必须通过|需通过|'
+        r'(?:尚未|还未|仍未|暂未|未曾).{0,6}(?:显示|被确认|确认|明确|批复|收到|通过|获批|批准|核准)|'
+        r'预计|预期|计划|打算|拟于|拟在|将要|即将|有望|有机会|有希望|可能|或许|也许|大概|大约|估计|猜测|应该|应当|看似|似乎|好像|多半|大概率|八成|差不多|倾向于|争取|力争|不确定|说不定|待定|未定|明天|明日|后天|下周|稍后)'
+    )
+
+    # 4. 紧邻否定/跨词尚未/疑问/条件/阶段限定前缀（“初审通过”“须通过”“尚未显示通过”“尚未被确认通过”等）
+    _negation_pre = re.compile(
+        r'(?:(?:尚未|还未|仍未|暂未|未曾|并未)(?:显示|被确认|确认|明确|批复|收到)?|未有|没有|没能|未能|还没有|还没|并无|不予|未予|是否|有无|能否|可否|须|必须|仅仅|仅|只|只是|初审|预审|初核|预核|一审|未|不|无|没)$'
+    )
+
+    # 5. 阶段/疑问/条件后缀（“通过初审”“通过与否”“通过后方可生效”等）
+    _premise_stage_suffix = re.compile(r'(?:初审|预审|初核|预核|一审|与否|后方可|后才能|后才|才能|方可|才行|才生效)')
+
+    # 无关业务事项前缀（DIP-INS-001 变体九）：排班/费用/采购等其他业务审批/审核不得解除医保险种更正前提
+    _unrelated_topic_prefixes = re.compile(
+        r'(?:排班|费用|采购|人事|考勤|请假|预算|设备|物资|合同|科研|教学|出差|值班|调休|加班|绩效|身份核验|报销)(?:的)?$'
+    )
+
+    def _premise_core_confirmed(core_text, clause_text):
+        """跨分句前提解除判据（DIP-INS-001 变体三/四/五/六/七/八/九）：
+        1) 事项话题严格绑定：核心内容先剥除结果词做完整/二字片段匹配（绝不做单字匹配），
+           且话题前不得带有“排班/费用/采购/人事”等无关业务前缀；
+           仅当核心为“审批”时允许“终审通过/已通过终审”精确语义作为最终审批对照；
+        2) 全局否决与冲突判定：整句含“终审未通过”“未予通过”“被否决”等任何否定审批结果的，绝不放行；
+        3) 全局撤回与辟谣判定：整句含“消息有误”“消息不实”“已被撤回”等撤销消息的，绝不放行；
+        4) 全局阶段性未决判定：含“仍待终审/尚无结论”，或仅有“初审通过/通过初审”而无终审结果的，绝不放行；
+        5) 结果词肯定同现：前提中的结果词（如“通过”）须在确认分句剥除时间字段未知修饰后的
+           同一份文本上以肯定形式出现，且前后无否定词、阶段词、辟谣词修饰，
+           且结果词归属于审批事项本身（“但/且/而”引入的新主语事项结果不予采纳；
+           “手术审批/采购审批”等其他业务对象的审批结果同样不予采纳）；
+        6) 肯定对照放行：“审批通过”“终审通过”“已确认审批通过”等无冲突明确结果正常放行。"""
+        if not core_text:
+            return False  # 前提核心为空时绝不自动解除，保持澄清
+        topic_core = core_text
+        for w in _premise_outcome_words:
+            topic_core = topic_core.replace(w, '')
+        topic_core = topic_core.strip()
+        _allowed_approval_pre = re.compile(
+            r'(?:^|已确认|现已确认|确认|已核实|经核实|核实|明确|关于|该|此|本|其|上述|本次|医保|参保|险种|更正|且|并|，|,)$'
+        )
+        if topic_core:
+            topic_tokens = [topic_core] if len(topic_core) <= 2 else [
+                topic_core[i:i + 2] for i in range(len(topic_core) - 1)
+            ]
+            topic_hit = False
+            for tok in topic_tokens:
+                for tm in re.finditer(re.escape(tok), clause_text):
+                    pre_seg = clause_text[:tm.start()].strip()
+                    if _unrelated_topic_prefixes.search(pre_seg):
+                        continue
+                    if tok == "审批" and not _allowed_approval_pre.search(pre_seg):
+                        continue  # 拒绝“手术审批”“采购申请审批”等其他业务主语修饰的审批
+                    topic_hit = True
+                    break
+                if topic_hit:
+                    break
+            if not topic_hit and topic_core == "审批" and ("终审通过" in clause_text or "已通过终审" in clause_text):
+                pre_final = clause_text.split("终审")[0].strip()
+                if not _unrelated_topic_prefixes.search(pre_final) and _allowed_approval_pre.search(pre_final):
+                    topic_hit = True
+        else:
+            topic_hit = core_text in clause_text  # 前提只剩结果词时从严整体匹配
+        if not topic_hit:
+            return False
+
+        # 全局否决、撤回/消息有误、未决标记一律拒绝（变体八）
+        if _rejection_pattern.search(clause_text):
+            return False
+        if _retraction_pattern.search(clause_text):
+            return False
+        norm_clause = _past_time_approx.sub('', clause_text)
+        norm_clause = _time_field_unknown.sub('', norm_clause)
+        if _premise_pending_markers.search(norm_clause):
+            return False
+
+        # 结果词肯定判定必须与未决标记检查共用同一份剥除了过去时间约数与时间字段未知修饰的
+        # 文本（norm_clause）：否则已从时间字段中剔除的“通过”（如“审批通过时间未知”
+        # “审批通过日期待定”）会在原始 clause_text 中重新参与肯定结果判定，
+        # 把“时间字段未知/待定”误判为“同一前提已有明确肯定结果”（DIP-INS-001 变体十五）
+        core_outcomes = [w for w in _premise_outcome_words if w in core_text]
+        if not core_outcomes:
+            return core_text in norm_clause
+        for w in core_outcomes:
+            for m in re.finditer(re.escape(w), norm_clause):
+                if _negation_pre.search(norm_clause[:m.start()]):
+                    continue  # 紧邻否定/疑问/部分限定（“未通过”“不予通过”“是否通过”“仅通过”）不算肯定
+                if _premise_stage_suffix.match(norm_clause[m.end():]):
+                    continue  # 结果词后紧跟阶段词（“通过初审/预审”）仅为阶段性通过，不算最终肯定
+                # 必须不是阶段性通过（如果包含初审/预审/初核且不包含终审通过，则不算最终肯定）
+                if any(st in norm_clause for st in ('初审', '预审', '初核', '预核')) and not ('终审通过' in norm_clause or '已通过终审' in norm_clause):
+                    continue
+                # 事项-结果配对（DIP-INS-001 变体十六/十七）：结果词必须归属于审批事项本身；
+                # “但/且/而”等边界引入明确新主语时，其后结果词归新主语所有，不得用于解除审批前提：
+                # 1) 子段不含“审批/终审”：剥除确认副词后须为空或“结果/结论”类承接词，
+                #    否则为新主语事项（身份核验/材料形式审查），其结果不予采纳；
+                # 2) 子段含“审批/终审”：仍须解析其前业务对象——“手术审批”“采购审批”等其他
+                #    业务对象的审批结果同样不得解除险种更正前提；
+                #    仅“审批”本身或“本次险种更正审批”等明确指向本次更正事项的表述放行；
+                # 无新主语时“结果已确认通过”等承接表述仍视为审批结果，正常放行
+                seg_start = max([norm_clause.rfind(b, 0, m.start()) for b in ('但', '且', '而', '，', ',', '；', ';', '。')] + [-1]) + 1
+                seg_subject = norm_clause[seg_start:m.start()]
+                _confirm_words = r'(?:现已确认|已确认|确认无误|确认|已核实|经核实|核实无误|核实|已核准|核准|已获批|明确|现已|已经|已|正式|顺利|无误)'
+                if '审批' in seg_subject or '终审' in seg_subject:
+                    last_appr = max(seg_subject.rfind('审批'), seg_subject.rfind('终审'))
+                    obj_part = re.sub(_confirm_words, '', seg_subject[:last_appr])
+                    obj_part = obj_part.replace('审批', '').replace('终审', '').strip(' 的了')
+                    # 本地归一化（DIP-INS-001 变体十八）：医保险种/参保险种/参保类型/参保身份/
+                    # 医保类型/险种类型等完整名称均指同一险种更正事项，与“险种更正”同等放行
+                    for _alias in ('医保险种', '参保险种', '参保类型', '参保身份', '医保类型', '险种类型'):
+                        obj_part = obj_part.replace(_alias, '险种')
+                    obj_part = obj_part.replace('医保', '险种').replace('参保', '险种')
+                    if obj_part and not re.fullmatch(r'(?:本次|该|此|其|上述)?(?:险种)?(?:更正|变更|调整)?(?:的)?', obj_part):
+                        continue  # “手术审批/采购审批”等其他业务对象的审批结果，不算险种更正前提的肯定结论
+                    # “审批”与结果词之间不得夹带其他子事项（DIP-INS-001 变体十八）：
+                    # “审批材料的身份核验通过”“审批材料的形式审查通过”中“通过”属于
+                    # 材料核验/形式审查而非审批本身；仅允许时间副词与“结果已确认”类承接；
+                    # 过去时间短语须完整识别（DIP-INS-001 变体十九）：“于”可选，
+                    # “昨日/昨天下午/于昨日/上周三/三天前”等一次匹配，残余字符不得触发拒绝；
+                    # 上午/下午等时段可独立使用（DIP-INS-001 变体二十，“审批于上午通过”），
+                    # 不限于日期后缀，恢复上一版本的兼容行为
+                    gap_part = re.sub(_confirm_words, '', seg_subject[last_appr + 2:])
+                    gap_part = re.sub(r'(?:于|在)?(?:(?:上|本|这)周[一二三四五六七日天]?|昨天|昨日|今天|今日|前天|前日)(?:的)?(?:上午|下午|中午|晚上|凌晨|早上|晚间|午后|清晨)?(?:[一二三四五六七八九十\d]{1,2}[点时](?:[一二三四五六七八九十\d]{1,2}分)?)?|(?:于|在)?(?:上午|下午|中午|晚上|凌晨|早上|晚间|午后|清晨)(?:[一二三四五六七八九十\d]{1,2}[点时](?:[一二三四五六七八九十\d]{1,2}分)?)?|(?:于|在)?[一二三四五六七八九十\d]+个?(?:天|日|周|月|小时)(?:以)?前', '', gap_part)
+                    gap_part = gap_part.strip(' 的了，,')
+                    if gap_part and not re.fullmatch(r'(?:该|其|本|此)?(?:审批|审核)?(?:结果|结论)', gap_part):
+                        continue
+                else:
+                    subj = re.sub(_confirm_words, '', seg_subject).strip(' 的了')
+                    if subj and not re.fullmatch(r'(?:该|其|本|此)?(?:审批|审核)?(?:结果|结论)', subj):
+                        continue  # 新主语事项的结果（身份核验通过/材料审查通过等），不算审批前提的肯定结论
+                return True
+        return False
+
+    pending_cond_clause_idx = -1  # 最近一个含未决前提（有条件词且无完成态确认）的分句序号；该前提修饰其后第一条更正指令
+    pending_cond_core = ""  # 该未决前提的核心内容（剥除假设/条件标记与标点），用于核对后续确认是否针对同一前提
     for idx, ci in enumerate(clause_info):
         if ci['is_historical'] or ci['is_negated']:
             continue
         c = ci['text']
+
+        # 本分句是否含未决前提：出现“如果/待核实/符合条件”等条件词，
+        # 且无“已核实/已确认”等前提已落实标记（“如果审批通过”为未决，“已核实符合条件”为已落实）；
+        # 假设句（如果/若/假如/一旦）内的完成态词（如“如果已获批”）只是假设前提，绝不视为已落实
+        clause_has_pending_cond = bool(corr_conditional_pre.search(c)) and (
+            bool(corr_hypothetical.search(c)) or not bool(corr_fulfilled_pre.search(c))
+        )
 
         for m in combined_dir_regex.finditer(c):
             verb = m.group(1)
@@ -187,10 +409,42 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
             if is_corr_verb and corr_neg_pre.search(pre_text):
                 continue
 
-            # 疑问形式的更正询问（“是否需要更正为居民医保？”/“需要更正为居民医保吗？”）：先澄清，绝不擅自更改口径
-            # 除动词前的疑问词外，句尾“吗/呢/吧”等疑问语气标记同样表明更正处于询问状态，确认前严禁执行
+            # 跨分句未决前提（如“如果审批通过，再更正为居民医保”中前一分句的“如果审批通过”）：
+            # 将其与其修饰的下一条更正关联，仅作用于其后第一条结算/更正指令，命中即消费，
+            # 绝不污染更靠后的已确认指令（如“…，已确认更正为职工”仍以确认更正为准）
+            cross_clause_conditional = False
+            if 0 <= pending_cond_clause_idx < idx:
+                if (bool(corr_fulfilled_pre.search(c)) and not bool(corr_hypothetical.search(c))
+                        and _premise_core_confirmed(pending_cond_core, c)):
+                    # 后续分句以陈述事实口吻明确确认了**同一前提**的结果
+                    # （如“现已确认审批通过并更正为居民医保”对应“如果审批通过”），
+                    # 解除跨分句待定，更正正常生效（DIP-INS-002 变体）；
+                    # 确认内容与前提无关的（如“已核实年龄”对应“如果审批通过”）绝不解除（DIP-INS-001 变体）
+                    pending_cond_clause_idx = -1
+                    pending_cond_core = ""
+                else:
+                    cross_clause_conditional = is_corr_verb
+                    pending_cond_clause_idx = -1
+                    pending_cond_core = ""
+
+            # 疑问/条件性更正（“是否需要更正为居民医保？”/“需要更正为居民医保吗？”/“更正为居民医保？”/
+            # “待核实后再更正为居民医保”/“如果符合条件则更正为居民医保”）：先澄清，绝不擅自更改口径
+            # 除动词前的疑问词外，句尾“吗/呢/吧”疑问语气词、分句句尾问号，以及“待核实/如果/若”等
+            # 条件前提标记，同样表明更正尚未生效，确认前严禁执行；
+            # 但条件词处同时存在“已核实/已确认”等前提已落实标记的（如“已核实符合条件并确认更正为X”），
+            # 说明前提已有明确核实结果，更正生效，绝不误拦截；
+            # 假设句（如果/若/假如/一旦）内的完成态词（如“如果已获批则更正为X”）只是假设前提，绝不放行
             post_text = c[m.end():].strip()
-            is_question_form = bool(corr_question_pre.search(pre_text)) or bool(re.search(r'(?:吗|嘛|么|呢|吧)$', post_text))
+            pre_conditional = bool(corr_conditional_pre.search(pre_text)) and (
+                bool(corr_hypothetical.search(pre_text)) or not bool(corr_fulfilled_pre.search(pre_text))
+            )
+            is_question_form = (
+                bool(corr_question_pre.search(pre_text))
+                or bool(re.search(r'(?:吗|嘛|么|呢|吧)$', post_text))
+                or ci['is_question']
+                or pre_conditional
+                or cross_clause_conditional
+            )
             if is_corr_verb and is_question_form:
                 q_t = raw_tgt
                 if re.search(INS_ALIAS_GF, q_t):
@@ -204,6 +458,7 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
                 elif re.search(INS_ALIAS_EMP, q_t):
                     correction_question_target = '职工'
                 correction_question_clause_idx = idx
+                correction_question_pos = start_pos
                 continue
 
             # 检查指令前面是否紧挨着“耗材/药品/检查”等项目范围限定词
@@ -236,21 +491,35 @@ def normalize_insurance_type(ins_type_str: Optional[str]) -> Dict[str, Any]:
                     'category': matched_cat,
                     'is_correction': is_corr,
                     'clause_idx': idx,
+                    'pos': start_pos,
                     'text': m.group(0)
                 })
 
+        # 分句处理完毕：若本分句含未决前提且前提目标不在本分句内（本分句无更正动词，
+        # 如同分句的“如果符合条件则更正为X”已由动词前条件词判定），则登记为跨分句未决前提，
+        # 修饰其后第一条更正指令（如“如果审批通过，再更正为居民医保”）
+        if clause_has_pending_cond and not ci['is_correction'] and pending_cond_clause_idx < 0:
+            pending_cond_clause_idx = idx
+            # 记录前提核心内容（剥除假设/条件标记、语气词与标点），供后续分句确认同一前提时比对
+            _core = re.sub(r'(?:如果|若|假如|一旦|待核实|待确认|待核准|待审批|必要时|视情况|则|就|再|的|了|吗|呢)', '', c)
+            pending_cond_core = re.sub(r'[\s，。；,;、？?！!：:（）()【】"“”]+', '', _core)
+
     # 3.0 更正询问未确认：先澄清，保留当前口径，绝不擅自更改险种
-    # 按语句先后判断最后一次更正请求的状态：仅当更正询问出现在最后一次已确认更正之后时才阻断；
+    # 按语句先后判断最后一次更正请求的状态：以(分句序号, 分句内字符位置)精确定位，
+    # 仅当更正询问出现在最后一次已确认更正之后时才阻断（同一分句内的多次更正也能区分先后）；
     # 若询问之后已有明确确认更正（如“是否需要更正为居民？已确认更正为职工”），以确认的更正为准
-    last_confirmed_corr_idx = max((d['clause_idx'] for d in directive_records if d['is_correction']), default=-1)
-    if correction_question_target and correction_question_clause_idx > last_confirmed_corr_idx:
+    last_confirmed_corr_key = max(
+        ((d['clause_idx'], d.get('pos', -1)) for d in directive_records if d['is_correction']),
+        default=(-1, -1)
+    )
+    if correction_question_target and (correction_question_clause_idx, correction_question_pos) > last_confirmed_corr_key:
         return {
             'valid': False,
             'category': None,
             'status': 'PENDING',
             'reason': 'CORRECTION_UNCONFIRMED',
             'pending_reason': 'CORRECTION_UNCONFIRMED',
-            'message': f"检测到关于是否更正参保类型的询问（目标：{correction_question_target}），更正尚未确认。请明确回复「确认更正为{correction_question_target}」或「暂不更正」；确认前系统按合规要求暂不更改测算口径"
+            'message': f"检测到参保类型更正请求（目标：{correction_question_target}），更正尚未确认或前提条件未满足。请明确回复「确认更正为{correction_question_target}」或「暂不更正」；确认前系统按合规要求暂不更改测算口径"
         }
 
     # 3.1 检查是否存在明确的险种间选择疑问句（连接了两个及以上不同险种候选）
@@ -473,6 +742,18 @@ def evaluate_traffic_light(
        cost > benchmark * high_threshold -> 红灯
     3. 临界浮动判定（如 110.004% 标注“略高于 110%”，89.99% 标注“略低于 90%”）
     """
+    if current_cost < Decimal("0"):
+        return {
+            "light": "无",
+            "status": "PENDING",
+            "pending_reason": "NEGATIVE_FEE_UNRECONCILED",
+            "message": "当前费用为负数（可能存在冲正退费未闭环或结算重算明细），暂停判灯并进入待定核查",
+            "ratio_percent": None,
+            "boundary_note": None,
+            "lower_bound": None,
+            "upper_bound": None
+        }
+
     if "自费" in ins_type:
         return {
             "light": "无",
@@ -510,8 +791,8 @@ def evaluate_traffic_light(
     if cost_val < lower_limit:
         light = "绿灯"
         status = "费用正常（<90%）"
-        # 临界判定：89.5% <= ratio < 90%
-        if ratio >= Decimal("89.5"):
+        # 临界判定：89.95% <= ratio < 90%
+        if ratio >= Decimal("89.95") or ratio_display == 90.00:
             boundary_note = "略低于 90%"
     elif cost_val <= upper_limit:
         light = "黄灯"
@@ -519,8 +800,8 @@ def evaluate_traffic_light(
     else:
         light = "红灯"
         status = "费用超标（>110%）"
-        # 临界判定：110% < ratio <= 110.5% (例如 110.004%)
-        if ratio <= Decimal("110.5"):
+        # 临界判定：110% < ratio <= 110.05% 或展示四舍五入为 110.00 且原值越界 (如 110.004%)
+        if (ratio <= Decimal("110.05") and cost_val > upper_limit) or (ratio_display == 110.00 and cost_val > upper_limit):
             boundary_note = "略高于 110%"
 
     return {
@@ -597,6 +878,23 @@ def match_dip_rule(
         # 匹配 ICD 编码（精确或前缀）或疾病名称匹配
         if (kw == r_icd) or (kw_clean and kw_clean == r_icd_clean) or (kw in r_icd_name) or (kw in r_group_name):
             matched_candidates.append(r)
+
+    if not matched_candidates:
+        # Step 1b: 临床/医保 6 位扩展 ICD 编码向 4 位/3 位 DIP 核心编码归并（如 K63.500 -> K63.5, I10.x00 -> I10）
+        icd_parent = None
+        m_sub = re.match(r'^([A-Z]\d{2}\.\d)(?:\d+|[Xx][0-9A-Z]*)$', kw)
+        if m_sub:
+            icd_parent = m_sub.group(1)
+        else:
+            m_cat = re.match(r'^([A-Z]\d{2})\.[Xx][0-9A-Z]*$', kw)
+            if m_cat:
+                icd_parent = m_cat.group(1)
+        if icd_parent:
+            for r in all_rules:
+                r_icd = (r["icd_code"] or "").strip().upper()
+                r_icd_clean = re.sub(r'\.[Xx]$', '', r_icd)
+                if r_icd_clean == icd_parent:
+                    matched_candidates.append(r)
 
     if not matched_candidates:
         return {

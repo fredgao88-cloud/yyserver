@@ -404,8 +404,652 @@ def run_phase1_tests():
     assert "2604.84" not in res_13c["reply"]
     print("PASS [Case 13c]: “已更正为职工医保，是否需要更正为居民医保？” -> 按语序判定最后更正请求待确认，PENDING / CORRECTION_UNCONFIRMED")
 
+    # ---------------- 用例 14: Round 13 审查验收 (分句问号保留、同分句多次更正定位、整单范围词后项目再收窄) ----------------
+    print("\n--- [Case 14] Round 13 审查验收 (分句问号保留、同分句多次更正定位、整单范围词后项目再收窄) ---")
+    # 14a. 职工医保，更正为居民医保？ -> 分句句尾问号保留为疑问标记，更正询问先澄清，绝不擅自执行
+    q_14a = "68岁，职工医保，更正为居民医保？M17.9，保守治疗"
+    res_14a = parse_local_intent(q_14a)
+    assert res_14a["intent"] == "need_clarification"
+    assert res_14a["data"]["status"] == "PENDING"
+    assert res_14a["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+    assert "2790.90" not in res_14a["reply"]
+    assert "2604.84" not in res_14a["reply"]
+    print("PASS [Case 14a]: “更正为居民医保？” -> 分句问号保留为疑问标记，PENDING / CORRECTION_UNCONFIRMED，零金额输出")
+
+    # 14b. 已更正为职工医保后是否需要更正为居民医保？ -> 同一分句内两次更正按(分句, 字符位置)定位，后一次询问待确认
+    q_14b = "68岁，已更正为职工医保后是否需要更正为居民医保？M17.9，保守治疗"
+    res_14b = parse_local_intent(q_14b)
+    assert res_14b["intent"] == "need_clarification"
+    assert res_14b["data"]["status"] == "PENDING"
+    assert res_14b["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+    assert "2790.90" not in res_14b["reply"]
+    assert "2604.84" not in res_14b["reply"]
+    print("PASS [Case 14b]: “已更正为职工医保后是否需要更正为居民医保？” -> 同分句多次更正按字符位置判定，PENDING / CORRECTION_UNCONFIRMED")
+
+    # 14c. 职工医保，经检查本次住院仅耗材按自费结算 -> 整单范围词后“仅耗材”将自费重新收窄到项目级，保留职工基准 ￥2790.90
+    q_14c = "68岁，职工医保，经检查本次住院仅耗材按自费结算，M17.9，保守治疗"
+    res_14c = parse_local_intent(q_14c)
+    assert res_14c["intent"] == "query_dip_rule"
+    assert res_14c["data"]["matched"] is True
+    assert res_14c["data"]["benchmark_amount"] == 2790.90
+    assert "2790.90" in res_14c["reply"]
+    print("PASS [Case 14c]: “经检查本次住院仅耗材按自费结算” -> “仅耗材”收窄为项目级自费，保留职工基准 ￥2790.90")
+
+    # ---------------- 用例 15: DIP-INS-001 验收 (条件性更正不生效：待核实/如果则 先澄清，已确认更正对照执行) ----------------
+    print("\n--- [Case 15] DIP-INS-001 验收 (条件性更正不生效：待核实/如果则 先澄清，已确认更正对照执行) ---")
+    # 15a. 本次按职工医保结算，待核实后再更正为居民医保 -> 前提“待核实”未满足，更正未生效，先澄清并省略金额
+    q_15a = "68岁，本次按职工医保结算，待核实后再更正为居民医保，M17.9，保守治疗"
+    res_15a = parse_local_intent(q_15a)
+    assert res_15a["intent"] == "need_clarification"
+    assert res_15a["data"]["status"] == "PENDING"
+    assert res_15a["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+    assert "2790.90" not in res_15a["reply"]
+    assert "2604.84" not in res_15a["reply"]
+    print("PASS [Case 15a]: “待核实后再更正为居民医保” -> 条件未满足不生效，PENDING / CORRECTION_UNCONFIRMED，零金额输出")
+
+    # 15b. 本次职工医保，如果符合条件则更正为居民医保 -> “如果…则”条件句，更正未生效，先澄清并省略金额
+    q_15b = "68岁，本次职工医保，如果符合条件则更正为居民医保，M17.9，保守治疗"
+    res_15b = parse_local_intent(q_15b)
+    assert res_15b["intent"] == "need_clarification"
+    assert res_15b["data"]["status"] == "PENDING"
+    assert res_15b["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+    assert "2790.90" not in res_15b["reply"]
+    assert "2604.84" not in res_15b["reply"]
+    print("PASS [Case 15b]: “如果符合条件则更正为居民医保” -> 条件句不生效，PENDING / CORRECTION_UNCONFIRMED，零金额输出")
+
+    # 15c. 对照例：本次按职工医保结算，已核实并确认更正为居民医保 -> 已确认更正正常执行，采用居民基准 ￥2604.84
+    q_15c = "68岁，本次按职工医保结算，已核实并确认更正为居民医保，M17.9，保守治疗"
+    res_15c = parse_local_intent(q_15c)
+    assert res_15c["intent"] == "query_dip_rule"
+    assert res_15c["data"]["matched"] is True
+    assert res_15c["data"]["benchmark_amount"] == 2604.84
+    assert "2604.84" in res_15c["reply"]
+    print("PASS [Case 15c]: “已核实并确认更正为居民医保” -> 对照例：已确认更正正常执行，居民基准 ￥2604.84")
+
+    # ---------------- 用例 16: DIP-INS-001/002 复审验收 (跨分句未决前提关联更正、前提已落实的确认更正放行) ----------------
+    print("\n--- [Case 16] DIP-INS-001/002 复审验收 (跨分句未决前提关联更正、前提已落实的确认更正放行) ---")
+    # 16a. 本次按职工医保结算，如果审批通过，再更正为居民医保 -> “如果审批通过”跨分句修饰下一条更正，前提未决，先澄清并省略金额
+    q_16a = "68岁，本次按职工医保结算，如果审批通过，再更正为居民医保，M17.9，保守治疗"
+    res_16a = parse_local_intent(q_16a)
+    assert res_16a["intent"] == "need_clarification"
+    assert res_16a["data"]["status"] == "PENDING"
+    assert res_16a["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+    assert "2790.90" not in res_16a["reply"]
+    assert "2604.84" not in res_16a["reply"]
+    print("PASS [Case 16a]: “如果审批通过，再更正为居民医保” -> 跨分句未决前提关联更正，PENDING / CORRECTION_UNCONFIRMED，零金额输出")
+
+    # 16b. 对照例：本次按职工医保结算，已核实符合条件并确认更正为居民医保 -> “符合条件”前提已被“已核实/确认”落实，更正生效，采用居民基准 ￥2604.84
+    q_16b = "68岁，本次按职工医保结算，已核实符合条件并确认更正为居民医保，M17.9，保守治疗"
+    res_16b = parse_local_intent(q_16b)
+    assert res_16b["intent"] == "query_dip_rule"
+    assert res_16b["data"]["matched"] is True
+    assert res_16b["data"]["benchmark_amount"] == 2604.84
+    assert "2604.84" in res_16b["reply"]
+    print("PASS [Case 16b]: “已核实符合条件并确认更正为居民医保” -> 前提已落实，确认更正放行，居民基准 ￥2604.84")
+
+    # ---------------- 用例 17: DIP-INS-001/002 新变体验收 (假设句内完成态词不放行；后续分句确认前提则更正生效) ----------------
+    print("\n--- [Case 17] DIP-INS-001/002 新变体验收 (假设句完成态词误判修复：如果已获批则→待定；现已确认审批通过→更正生效) ---")
+    # 17a. 本次按职工医保结算，如果已获批则更正为居民医保 -> “已获批”位于“如果…则”假设句内，只是假设前提而非事实确认，
+    #      更正未生效，先澄清并省略金额（DIP-INS-001 新变体）
+    q_17a = "68岁，本次按职工医保结算，如果已获批则更正为居民医保，M17.9，保守治疗"
+    res_17a = parse_local_intent(q_17a)
+    assert res_17a["intent"] == "need_clarification"
+    assert res_17a["data"]["status"] == "PENDING"
+    assert res_17a["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+    assert "2790.90" not in res_17a["reply"]
+    assert "2604.84" not in res_17a["reply"]
+    print("PASS [Case 17a]: “如果已获批则更正为居民医保” -> 假设句内完成态词不放行，PENDING / CORRECTION_UNCONFIRMED，零金额输出")
+
+    # 17b. 对照例：本次职工医保，如果审批通过，现已确认审批通过并更正为居民医保 -> 后续分句以陈述事实口吻
+    #      明确确认同一前提结果（“现已确认审批通过”），解除跨分句待定，更正生效，采用居民基准 ￥2604.84（DIP-INS-002 新变体）
+    q_17b = "68岁，本次职工医保，如果审批通过，现已确认审批通过并更正为居民医保，M17.9，保守治疗"
+    res_17b = parse_local_intent(q_17b)
+    assert res_17b["intent"] == "query_dip_rule"
+    assert res_17b["data"]["matched"] is True
+    assert res_17b["data"]["benchmark_amount"] == 2604.84
+    assert "2604.84" in res_17b["reply"]
+    print("PASS [Case 17b]: “如果审批通过，现已确认审批通过并更正为居民医保” -> 前提结果被确认，更正生效，居民基准 ￥2604.84")
+
+    # ---------------- 用例 18: DIP-INS-001 变体三验收 (确认内容须针对同一前提：核实年龄≠审批通过) ----------------
+    print("\n--- [Case 18] DIP-INS-001 变体三验收 (无关确认不解除待定：已核实年龄 ≠ 审批通过；确认审批通过对照放行) ---")
+    # 18a. 本次职工医保，如果审批通过，已核实年龄并更正为居民医保 -> “已核实年龄”确认的是年龄而非审批前提，
+    #      待定绝不解除，先澄清并省略金额（DIP-INS-001 变体）
+    q_18a = "68岁，本次职工医保，如果审批通过，已核实年龄并更正为居民医保，M17.9，保守治疗"
+    res_18a = parse_local_intent(q_18a)
+    assert res_18a["intent"] == "need_clarification"
+    assert res_18a["data"]["status"] == "PENDING"
+    assert res_18a["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+    assert "2790.90" not in res_18a["reply"]
+    assert "2604.84" not in res_18a["reply"]
+    print("PASS [Case 18a]: “如果审批通过，已核实年龄并更正为居民医保” -> 无关确认不解除待定，PENDING / CORRECTION_UNCONFIRMED，零金额输出")
+
+    # 18b. 对照例：本次职工医保，如果审批通过，已确认审批通过并更正为居民医保 -> 确认内容正是审批前提本身，
+    #      解除待定，更正生效，采用居民基准 ￥2604.84
+    q_18b = "68岁，本次职工医保，如果审批通过，已确认审批通过并更正为居民医保，M17.9，保守治疗"
+    res_18b = parse_local_intent(q_18b)
+    assert res_18b["intent"] == "query_dip_rule"
+    assert res_18b["data"]["matched"] is True
+    assert res_18b["data"]["benchmark_amount"] == 2604.84
+    assert "2604.84" in res_18b["reply"]
+    print("PASS [Case 18b]: “如果审批通过，已确认审批通过并更正为居民医保” -> 确认同一前提，更正生效，居民基准 ￥2604.84")
+
+    # ---------------- 用例 19: DIP-INS-001 变体四验收 (确认须同时覆盖前提事项与结果词) ----------------
+    print("\n--- [Case 19] DIP-INS-001 变体四验收 (“尚在办理/材料齐全”非审批结果，绝不解除待定) ---")
+    # 19a. “已确认审批尚在办理”——事项相关但无肯定结果词（通过），更正不生效，先澄清并省略金额
+    q_19a = "68岁，本次职工医保，如果审批通过，已确认审批尚在办理并更正为居民医保，M17.9，保守治疗"
+    res_19a = parse_local_intent(q_19a)
+    assert res_19a["intent"] == "need_clarification"
+    assert res_19a["data"]["status"] == "PENDING"
+    assert res_19a["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+    assert "2790.90" not in res_19a["reply"]
+    assert "2604.84" not in res_19a["reply"]
+    print("PASS [Case 19a]: “如果审批通过，已确认审批尚在办理并更正为居民医保” -> 事项在办理非结果，PENDING / CORRECTION_UNCONFIRMED，零金额输出")
+
+    # 19b. “已核实审批材料齐全”——材料齐全不等于审批通过，更正不生效，先澄清并省略金额；
+    #      对照仍由 Case 18b（“已确认审批通过”正常放行）覆盖
+    q_19b = "68岁，本次职工医保，如果审批通过，已核实审批材料齐全并更正为居民医保，M17.9，保守治疗"
+    res_19b = parse_local_intent(q_19b)
+    assert res_19b["intent"] == "need_clarification"
+    assert res_19b["data"]["status"] == "PENDING"
+    assert res_19b["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+    assert "2790.90" not in res_19b["reply"]
+    assert "2604.84" not in res_19b["reply"]
+    print("PASS [Case 19b]: “如果审批通过，已核实审批材料齐全并更正为居民医保” -> 材料齐全非审批结果，PENDING / CORRECTION_UNCONFIRMED，零金额输出")
+
+    # ---------------- 用例 20: DIP-INS-001 变体五验收 (确认须同话题且结果为肯定) ----------------
+    print("\n--- [Case 20] DIP-INS-001 变体五验收 (“审批未通过”否定结果与“身份核验”无关事项，绝不解除待定) ---")
+    # 20a. 本次职工医保，如果审批通过，已核实审批未通过并更正为居民医保 -> “未通过”是前提的否定结果，
+    #      前提未满足且结果相反，更正绝不生效，先澄清并省略金额
+    q_20a = "68岁，本次职工医保，如果审批通过，已核实审批未通过并更正为居民医保，M17.9，保守治疗"
+    res_20a = parse_local_intent(q_20a)
+    assert res_20a["intent"] == "need_clarification"
+    assert res_20a["data"]["status"] == "PENDING"
+    assert res_20a["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+    assert "2790.90" not in res_20a["reply"]
+    assert "2604.84" not in res_20a["reply"]
+    print("PASS [Case 20a]: “如果审批通过，已核实审批未通过并更正为居民医保” -> 否定结果不解除待定，PENDING / CORRECTION_UNCONFIRMED，零金额输出")
+
+    # 20b. 本次职工医保，如果审批通过，已确认身份核验通过并更正为居民医保 -> “身份核验通过”与审批前提无关，
+    #      更正绝不生效，先澄清并省略金额；正对照仍由 Case 18b（“已确认审批通过”放行 ￥2604.84）覆盖
+    q_20b = "68岁，本次职工医保，如果审批通过，已确认身份核验通过并更正为居民医保，M17.9，保守治疗"
+    res_20b = parse_local_intent(q_20b)
+    assert res_20b["intent"] == "need_clarification"
+    assert res_20b["data"]["status"] == "PENDING"
+    assert res_20b["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+    assert "2790.90" not in res_20b["reply"]
+    assert "2604.84" not in res_20b["reply"]
+    print("PASS [Case 20b]: “如果审批通过，已确认身份核验通过并更正为居民医保” -> 无关事项确认不解除待定，PENDING / CORRECTION_UNCONFIRMED，零金额输出")
+
+    # ---------------- 用例 21: DIP-INS-001 变体六验收 (较长否定形式与阶段性结果均不解除待定) ----------------
+    print("\n--- [Case 21] DIP-INS-001 变体六验收 (“审批没有通过”较长否定、“通过初审但仍待终审”阶段性结果，绝不解除待定) ---")
+    # 21a. 本次职工医保，如果审批通过，已核实审批没有通过并更正为居民医保 -> “没有通过”是前提的否定结果，
+    #      与“未通过”等义，更正绝不生效，先澄清并省略金额
+    q_21a = "68岁，本次职工医保，如果审批通过，已核实审批没有通过并更正为居民医保，M17.9，保守治疗"
+    res_21a = parse_local_intent(q_21a)
+    assert res_21a["intent"] == "need_clarification"
+    assert res_21a["data"]["status"] == "PENDING"
+    assert res_21a["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+    assert "2790.90" not in res_21a["reply"]
+    assert "2604.84" not in res_21a["reply"]
+    print("PASS [Case 21a]: “如果审批通过，已核实审批没有通过并更正为居民医保” -> 较长否定不解除待定，PENDING / CORRECTION_UNCONFIRMED，零金额输出")
+
+    # 21b. 本次职工医保，如果审批通过，已确认审批材料通过初审但仍待终审并更正为居民医保 -> “通过初审”只是阶段性结果，
+    #      “仍待终审”表明前提未最终满足，更正绝不生效，先澄清并省略金额；
+    #      正对照仍由 Case 18b（“已确认审批通过”放行 ￥2604.84）覆盖
+    q_21b = "68岁，本次职工医保，如果审批通过，已确认审批材料通过初审但仍待终审并更正为居民医保，M17.9，保守治疗"
+    res_21b = parse_local_intent(q_21b)
+    assert res_21b["intent"] == "need_clarification"
+    assert res_21b["data"]["status"] == "PENDING"
+    assert res_21b["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+    assert "2790.90" not in res_21b["reply"]
+    assert "2604.84" not in res_21b["reply"]
+    print("PASS [Case 21b]: “如果审批通过，已确认审批材料通过初审但仍待终审并更正为居民医保” -> 阶段性结果不解除待定，PENDING / CORRECTION_UNCONFIRMED，零金额输出")
+
+    # ---------------- 用例 22: DIP-INS-001 变体七验收 (部分限定/疑问未决/否决表述均不解除待定，聊天与结构化双路径) ----------------
+    print("\n--- [Case 22] DIP-INS-001 变体七验收 (“仅通过初审”“是否通过尚无结论”“不予通过”，双路径均不解除待定) ---")
+    # 三种审批表述：部分限定（仅通过初审）、疑问未决（是否通过尚无结论）、否决（不予通过），
+    # 均非同一前提的最终肯定结果，更正绝不生效；聊天入口(parse_local_intent)与结构化入口(match_dip_rule)同时覆盖
+    v7_variants = [
+        ("22a", "审批仅通过初审"),
+        ("22b", "审批是否通过尚无结论"),
+        ("22c", "审批结果为不予通过"),
+    ]
+    for tag, stage_text in v7_variants:
+        q = f"68岁，本次职工医保，如果审批通过，已确认{stage_text}并更正为居民医保，M17.9，保守治疗"
+        # 路径 1：聊天入口
+        res_c = parse_local_intent(q)
+        assert res_c["intent"] == "need_clarification", f"Case {tag} 聊天入口应澄清，实际 {res_c['intent']}"
+        assert res_c["data"]["status"] == "PENDING"
+        assert res_c["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+        assert "2790.90" not in res_c["reply"] and "2604.84" not in res_c["reply"]
+        # 路径 2：结构化入口（同一险种表述原样传入）
+        res_s = match_dip_rule(disease="M17.9", age=68,
+                               ins_type=f"本次职工医保，如果审批通过，已确认{stage_text}并更正为居民医保",
+                               op_keyword="保守")
+        assert res_s["matched"] is False, f"Case {tag} 结构化入口应不命中，实际 {res_s}"
+        assert res_s["status"] == "PENDING"
+        assert res_s["pending_reason"] == "CORRECTION_UNCONFIRMED"
+        assert "benchmark_amount" not in res_s
+        print(f"PASS [Case {tag}]: “已确认{stage_text}并更正为居民医保” -> 双路径均 PENDING / CORRECTION_UNCONFIRMED，零金额输出")
+
+    # 22d. 正对照：同一前提的最终肯定结果（审批通过）正常放行，居民基准 ￥2604.84（双路径）
+    q_22d = "68岁，本次职工医保，如果审批通过，已确认审批通过并更正为居民医保，M17.9，保守治疗"
+    res_22d = parse_local_intent(q_22d)
+    assert res_22d["intent"] == "query_dip_rule"
+    assert res_22d["data"]["matched"] is True
+    assert res_22d["data"]["benchmark_amount"] == 2604.84
+    res_22d_s = match_dip_rule(disease="M17.9", age=68,
+                               ins_type="本次职工医保，如果审批通过，已确认审批通过并更正为居民医保",
+                               op_keyword="保守")
+    assert res_22d_s["matched"] is True
+    assert res_22d_s["benchmark_amount"] == 2604.84
+    print("PASS [Case 22d]: “已确认审批通过并更正为居民医保” -> 正对照双路径放行，居民基准 ￥2604.84")
+
+    # ---------------- 用例 23: DIP-INS-001 变体八验收 (终审否决/初审阶段/辟谣撤回，双路径均不解除待定) ----------------
+    print("\n--- [Case 23] DIP-INS-001 变体八验收 (“审批终审未通过但初审通过”“审批初审通过”“审批通过的消息有误”，双路径表驱动) ---")
+    v8_variants = [
+        ("23a", "审批终审未通过但初审通过"),
+        ("23b", "审批初审通过"),
+        ("23c", "审批通过的消息有误"),
+        ("23d", "审批通过的消息不实"),
+    ]
+    for tag, stage_text in v8_variants:
+        q = f"68岁，本次职工医保，如果审批通过，已确认{stage_text}并更正为居民医保，M17.9，保守治疗"
+        # 路径 1：聊天入口
+        res_c = parse_local_intent(q)
+        assert res_c["intent"] == "need_clarification", f"Case {tag} 聊天入口应澄清，实际 {res_c['intent']}"
+        assert res_c["data"]["status"] == "PENDING"
+        assert res_c["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+        assert "2790.90" not in res_c["reply"] and "2604.84" not in res_c["reply"]
+        # 路径 2：结构化入口（同一险种表述原样传入）
+        res_s = match_dip_rule(disease="M17.9", age=68,
+                               ins_type=f"本次职工医保，如果审批通过，已确认{stage_text}并更正为居民医保",
+                               op_keyword="保守")
+        assert res_s["matched"] is False, f"Case {tag} 结构化入口应不命中，实际 {res_s}"
+        assert res_s["status"] == "PENDING"
+        assert res_s["pending_reason"] == "CORRECTION_UNCONFIRMED"
+        assert "benchmark_amount" not in res_s
+        print(f"PASS [Case {tag}]: “已确认{stage_text}并更正为居民医保” -> 双路径均 PENDING / CORRECTION_UNCONFIRMED，零金额输出")
+
+    # 23e. 正对照：同一前提的最终肯定结果（审批通过）正常放行，居民基准 ￥2604.84（双路径）
+    q_23e = "68岁，本次职工医保，如果审批通过，已确认审批通过并更正为居民医保，M17.9，保守治疗"
+    res_23e = parse_local_intent(q_23e)
+    assert res_23e["intent"] == "query_dip_rule"
+    assert res_23e["data"]["matched"] is True
+    assert res_23e["data"]["benchmark_amount"] == 2604.84
+    res_23e_s = match_dip_rule(disease="M17.9", age=68,
+                               ins_type="本次职工医保，如果审批通过，已确认审批通过并更正为居民医保",
+                               op_keyword="保守")
+    assert res_23e_s["matched"] is True
+    assert res_23e_s["benchmark_amount"] == 2604.84
+    print("PASS [Case 23e]: “已确认审批通过并更正为居民医保” -> 正对照双路径放行，居民基准 ￥2604.84")
+
+    # ---------------- 用例 24: DIP-INS-001 变体九验收 (无关审批/审核事项严禁误放行，双路径表驱动) ----------------
+    print("\n--- [Case 24] DIP-INS-001 变体九验收 (“排班审核通过”“费用审核通过”“采购审批通过”，双路径表驱动) ---")
+    v9_variants = [
+        ("24a", "排班审核通过"),
+        ("24b", "费用审核通过"),
+        ("24c", "采购审批通过"),
+    ]
+    for tag, stage_text in v9_variants:
+        q = f"68岁，本次职工医保，如果审批通过，已确认{stage_text}并更正为居民医保，M17.9，保守治疗"
+        res_c = parse_local_intent(q)
+        assert res_c["intent"] == "need_clarification", f"Case {tag} 聊天入口应澄清，实际 {res_c['intent']}"
+        assert res_c["data"]["status"] == "PENDING"
+        assert res_c["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+        assert "2790.90" not in res_c["reply"] and "2604.84" not in res_c["reply"]
+        res_s = match_dip_rule(disease="M17.9", age=68,
+                               ins_type=f"本次职工医保，如果审批通过，已确认{stage_text}并更正为居民医保",
+                               op_keyword="保守")
+        assert res_s["matched"] is False, f"Case {tag} 结构化入口应不命中，实际 {res_s}"
+        assert res_s["status"] == "PENDING"
+        assert res_s["pending_reason"] == "CORRECTION_UNCONFIRMED"
+        assert "benchmark_amount" not in res_s
+        print(f"PASS [Case {tag}]: “已确认{stage_text}并更正为居民医保” -> 双路径均 PENDING / CORRECTION_UNCONFIRMED，零金额输出")
+
+    # 24d. 正对照：同一前提的最终肯定结果（审批通过）正常放行，居民基准 ￥2604.84（双路径）
+    q_24d = "68岁，本次职工医保，如果审批通过，已确认审批通过并更正为居民医保，M17.9，保守治疗"
+    res_24d = parse_local_intent(q_24d)
+    assert res_24d["intent"] == "query_dip_rule"
+    assert res_24d["data"]["matched"] is True
+    assert res_24d["data"]["benchmark_amount"] == 2604.84
+    res_24d_s = match_dip_rule(disease="M17.9", age=68,
+                               ins_type="本次职工医保，如果审批通过，已确认审批通过并更正为居民医保",
+                               op_keyword="保守")
+    assert res_24d_s["matched"] is True
+    assert res_24d_s["benchmark_amount"] == 2604.84
+    print("PASS [Case 24d]: “已确认审批通过并更正为居民医保” -> 正对照双路径放行，居民基准 ￥2604.84")
+
+    # ---------------- 用例 25: DIP-INS-001 变体十验收 (“手术审批通过”“采购申请审批通过”等无关主语审批严禁放行) ----------------
+    print("\n--- [Case 25] DIP-INS-001 变体十验收 (“手术审批通过”“采购申请审批通过”“费用审核通过”，双路径表驱动) ---")
+    v10_variants = [
+        ("25a", "手术审批通过"),
+        ("25b", "采购申请审批通过"),
+        ("25c", "费用审核通过"),
+    ]
+    for tag, stage_text in v10_variants:
+        q = f"68岁，本次职工医保，如果审批通过，已确认{stage_text}并更正为居民医保，M17.9，保守治疗"
+        res_c = parse_local_intent(q)
+        assert res_c["intent"] == "need_clarification", f"Case {tag} 聊天入口应澄清，实际 {res_c['intent']}"
+        assert res_c["data"]["status"] == "PENDING"
+        assert res_c["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+        assert "2790.90" not in res_c["reply"] and "2604.84" not in res_c["reply"]
+        res_s = match_dip_rule(disease="M17.9", age=68,
+                               ins_type=f"本次职工医保，如果审批通过，已确认{stage_text}并更正为居民医保",
+                               op_keyword="保守")
+        assert res_s["matched"] is False
+        assert res_s["status"] == "PENDING"
+        assert res_s["pending_reason"] == "CORRECTION_UNCONFIRMED"
+        assert "benchmark_amount" not in res_s
+        print(f"PASS [Case {tag}]: “已确认{stage_text}并更正为居民医保” -> 双路径均 PENDING / CORRECTION_UNCONFIRMED，零金额输出")
+
+    q_25d = "68岁，本次职工医保，如果审批通过，已确认审批通过并更正为居民医保，M17.9，保守治疗"
+    res_25d = parse_local_intent(q_25d)
+    assert res_25d["intent"] == "query_dip_rule" and res_25d["data"]["benchmark_amount"] == 2604.84
+    res_25d_s = match_dip_rule(disease="M17.9", age=68,
+                               ins_type="本次职工医保，如果审批通过，已确认审批通过并更正为居民医保",
+                               op_keyword="保守")
+    assert res_25d_s["matched"] is True and res_25d_s["benchmark_amount"] == 2604.84
+    print("PASS [Case 25d]: “已确认审批通过并更正为居民医保” -> 正对照双路径放行，居民基准 ￥2604.84")
+
+    # ---------------- 用例 26: DIP-INS-001 变体十一验收 (“预计明天通过”“计划通过”预期结果严禁放行) ----------------
+    print("\n--- [Case 26] DIP-INS-001 变体十一验收 (“审批预计明天通过”“审批计划通过”与肯定对照，双路径表驱动) ---")
+    v11_variants = [
+        ("26a", "审批预计明天通过"),
+        ("26b", "审批计划通过"),
+    ]
+    for tag, stage_text in v11_variants:
+        q = f"68岁，本次职工医保，如果审批通过，已确认{stage_text}并更正为居民医保，M17.9，保守治疗"
+        res_c = parse_local_intent(q)
+        assert res_c["intent"] == "need_clarification", f"Case {tag} 聊天入口应澄清，实际 {res_c['intent']}"
+        assert res_c["data"]["status"] == "PENDING"
+        assert res_c["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+        assert "2790.90" not in res_c["reply"] and "2604.84" not in res_c["reply"]
+        res_s = match_dip_rule(disease="M17.9", age=68,
+                               ins_type=f"本次职工医保，如果审批通过，已确认{stage_text}并更正为居民医保",
+                               op_keyword="保守")
+        assert res_s["matched"] is False
+        assert res_s["status"] == "PENDING"
+        assert res_s["pending_reason"] == "CORRECTION_UNCONFIRMED"
+        assert "benchmark_amount" not in res_s
+        print(f"PASS [Case {tag}]: “已确认{stage_text}并更正为居民医保” -> 双路径均 PENDING / CORRECTION_UNCONFIRMED，零金额输出")
+
+    q_26c = "68岁，本次职工医保，如果审批通过，已确认审批通过并更正为居民医保，M17.9，保守治疗"
+    res_26c = parse_local_intent(q_26c)
+    assert res_26c["intent"] == "query_dip_rule" and res_26c["data"]["benchmark_amount"] == 2604.84
+    res_26c_s = match_dip_rule(disease="M17.9", age=68,
+                               ins_type="本次职工医保，如果审批通过，已确认审批通过并更正为居民医保",
+                               op_keyword="保守")
+    assert res_26c_s["matched"] is True and res_26c_s["benchmark_amount"] == 2604.84
+    print("PASS [Case 26c]: “已确认审批通过并更正为居民医保” -> 正对照双路径放行，居民基准 ￥2604.84")
+
+    # ---------------- 用例 27: DIP-INS-001 变体十二验收 (“可能通过”“有机会通过”推测表述拦截与“已于上周通过”对照) ----------------
+    print("\n--- [Case 27] DIP-INS-001 变体十二验收 (4 个未决用例 + 2 个已完成对照，双路径表驱动) ---")
+    v12_pending = [
+        ("27a", "审批预计明天通过"),
+        ("27b", "审批计划通过"),
+        ("27c", "审批可能通过"),
+        ("27d", "审批有机会通过"),
+    ]
+    for tag, stage_text in v12_pending:
+        q = f"68岁，本次职工医保，如果审批通过，已确认{stage_text}并更正为居民医保，M17.9，保守治疗"
+        res_c = parse_local_intent(q)
+        assert res_c["intent"] == "need_clarification", f"Case {tag} 聊天入口应澄清，实际 {res_c['intent']}"
+        assert res_c["data"]["status"] == "PENDING"
+        assert res_c["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+        assert "2790.90" not in res_c["reply"] and "2604.84" not in res_c["reply"]
+        res_s = match_dip_rule(disease="M17.9", age=68,
+                               ins_type=f"本次职工医保，如果审批通过，已确认{stage_text}并更正为居民医保",
+                               op_keyword="保守")
+        assert res_s["matched"] is False
+        assert res_s["status"] == "PENDING"
+        assert res_s["pending_reason"] == "CORRECTION_UNCONFIRMED"
+        assert "benchmark_amount" not in res_s
+        print(f"PASS [Case {tag}]: “已确认{stage_text}并更正为居民医保” -> 双路径均 PENDING / CORRECTION_UNCONFIRMED，零金额输出")
+
+    for tag, ok_text in [("27e", "审批通过"), ("27f", "审批已于上周通过")]:
+        q_ok = f"68岁，本次职工医保，如果审批通过，已确认{ok_text}并更正为居民医保，M17.9，保守治疗"
+        res_ok_c = parse_local_intent(q_ok)
+        assert res_ok_c["intent"] == "query_dip_rule" and res_ok_c["data"]["benchmark_amount"] == 2604.84
+        res_ok_s = match_dip_rule(disease="M17.9", age=68,
+                                  ins_type=f"本次职工医保，如果审批通过，已确认{ok_text}并更正为居民医保",
+                                  op_keyword="保守")
+        assert res_ok_s["matched"] is True and res_ok_s["benchmark_amount"] == 2604.84
+        print(f"PASS [Case {tag}]: “已确认{ok_text}并更正为居民医保” -> 正对照双路径放行，居民基准 ￥2604.84")
+
+    # ---------------- 用例 28: DIP-INS-001 变体十三验收 (未知/疑问/生效条件拦截 + 过去时间约数“大约三天前”放行) ----------------
+    print("\n--- [Case 28] DIP-INS-001 变体十三验收 (未知/疑问/生效条件 vs 过去时间约数，双路径表驱动) ---")
+    v13_pending = [
+        ("28a", "审批通过与否还不知道"),
+        ("28b", "审批结果尚不清楚能否通过"),
+        ("28c", "审批须通过后方可生效"),
+    ]
+    for tag, stage_text in v13_pending:
+        q = f"68岁，本次职工医保，如果审批通过，已确认{stage_text}并更正为居民医保，M17.9，保守治疗"
+        res_c = parse_local_intent(q)
+        assert res_c["intent"] == "need_clarification", f"Case {tag} 聊天入口应澄清，实际 {res_c['intent']}"
+        assert res_c["data"]["status"] == "PENDING"
+        assert res_c["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+        assert "2790.90" not in res_c["reply"] and "2604.84" not in res_c["reply"]
+        res_s = match_dip_rule(disease="M17.9", age=68,
+                               ins_type=f"本次职工医保，如果审批通过，已确认{stage_text}并更正为居民医保",
+                               op_keyword="保守")
+        assert res_s["matched"] is False
+        assert res_s["status"] == "PENDING"
+        assert res_s["pending_reason"] == "CORRECTION_UNCONFIRMED"
+        assert "benchmark_amount" not in res_s
+        print(f"PASS [Case {tag}]: “已确认{stage_text}并更正为居民医保” -> 双路径均 PENDING / CORRECTION_UNCONFIRMED，零金额输出")
+
+    for tag, ok_text in [("28d", "审批大约三天前已经通过"), ("28e", "审批已于上周通过")]:
+        q_ok = f"68岁，本次职工医保，如果审批通过，已确认{ok_text}并更正为居民医保，M17.9，保守治疗"
+        res_ok_c = parse_local_intent(q_ok)
+        assert res_ok_c["intent"] == "query_dip_rule" and res_ok_c["data"]["benchmark_amount"] == 2604.84
+        res_ok_s = match_dip_rule(disease="M17.9", age=68,
+                                  ins_type=f"本次职工医保，如果审批通过，已确认{ok_text}并更正为居民医保",
+                                  op_keyword="保守")
+        assert res_ok_s["matched"] is True and res_ok_s["benchmark_amount"] == 2604.84
+        print(f"PASS [Case {tag}]: “已确认{ok_text}并更正为居民医保” -> 正对照双路径放行，居民基准 ￥2604.84")
+
+    # ---------------- 用例 29: DIP-INS-001 变体十四验收 (等待/跨词尚未拦截 + 时间字段未知剥离) ----------------
+    print("\n--- [Case 29] DIP-INS-001 变体十四验收 (等待/跨词尚未 vs 时间字段未知，双路径表驱动) ---")
+    v14_pending = [
+        ("29a", "审批仍在等待通过"),
+        ("29b", "审批系统尚未显示通过"),
+        ("29c", "审批尚未被确认通过"),
+    ]
+    for tag, stage_text in v14_pending:
+        q = f"68岁，本次职工医保，如果审批通过，已确认{stage_text}并更正为居民医保，M17.9，保守治疗"
+        res_c = parse_local_intent(q)
+        assert res_c["intent"] == "need_clarification", f"Case {tag} 聊天入口应澄清，实际 {res_c['intent']}"
+        assert res_c["data"]["status"] == "PENDING"
+        assert res_c["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+        assert "2790.90" not in res_c["reply"] and "2604.84" not in res_c["reply"]
+        res_s = match_dip_rule(disease="M17.9", age=68,
+                               ins_type=f"本次职工医保，如果审批通过，已确认{stage_text}并更正为居民医保",
+                               op_keyword="保守")
+        assert res_s["matched"] is False
+        assert res_s["status"] == "PENDING"
+        assert res_s["pending_reason"] == "CORRECTION_UNCONFIRMED"
+        assert "benchmark_amount" not in res_s
+        print(f"PASS [Case {tag}]: “已确认{stage_text}并更正为居民医保” -> 双路径均 PENDING / CORRECTION_UNCONFIRMED，零金额输出")
+
+    for tag, ok_text in [("29d", "审批通过时间未知但结果已确认通过"), ("29e", "审批已于上周通过")]:
+        q_ok = f"68岁，本次职工医保，如果审批通过，已确认{ok_text}并更正为居民医保，M17.9，保守治疗"
+        res_ok_c = parse_local_intent(q_ok)
+        assert res_ok_c["intent"] == "query_dip_rule" and res_ok_c["data"]["benchmark_amount"] == 2604.84
+        res_ok_s = match_dip_rule(disease="M17.9", age=68,
+                                  ins_type=f"本次职工医保，如果审批通过，已确认{ok_text}并更正为居民医保",
+                                  op_keyword="保守")
+        assert res_ok_s["matched"] is True and res_ok_s["benchmark_amount"] == 2604.84
+        print(f"PASS [Case {tag}]: “已确认{ok_text}并更正为居民医保” -> 正对照双路径放行，居民基准 ￥2604.84")
+
+    # ---------------- 用例 30: DIP-INS-001 变体十五验收 (时间字段未知剥除后“通过”不得再参与肯定结果判定) ----------------
+    print("\n--- [Case 30] DIP-INS-001 变体十五验收 (“审批通过时间未知且结果仍在核对中”“审批通过日期待定”拦截，双路径表驱动) ---")
+    # 修复点：结果词扫描与未决标记检查共用同一份剥除时间字段后的文本（norm_clause），
+    # 字段名中的“通过”不得被当作独立的审批肯定结果
+    v15_pending = [
+        ("30a", "审批通过时间未知且结果仍在核对中"),
+        ("30b", "审批通过日期待定"),
+    ]
+    for tag, stage_text in v15_pending:
+        q = f"68岁，本次职工医保，如果审批通过，已确认{stage_text}并更正为居民医保，M17.9，保守治疗"
+        res_c = parse_local_intent(q)
+        assert res_c["intent"] == "need_clarification", f"Case {tag} 聊天入口应澄清，实际 {res_c['intent']}"
+        assert res_c["data"]["status"] == "PENDING"
+        assert res_c["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+        assert "2790.90" not in res_c["reply"] and "2604.84" not in res_c["reply"]
+        res_s = match_dip_rule(disease="M17.9", age=68,
+                               ins_type=f"本次职工医保，如果审批通过，已确认{stage_text}并更正为居民医保",
+                               op_keyword="保守")
+        assert res_s["matched"] is False, f"Case {tag} 结构化入口应不命中，实际 {res_s}"
+        assert res_s["status"] == "PENDING"
+        assert res_s["pending_reason"] == "CORRECTION_UNCONFIRMED"
+        assert "benchmark_amount" not in res_s
+        print(f"PASS [Case {tag}]: “已确认{stage_text}并更正为居民医保” -> 双路径均 PENDING / CORRECTION_UNCONFIRMED，零金额输出")
+
+    # 30c/30d 成对对照：同一时间字段未知但结果已确认通过 -> 剩余文本含同一事项明确肯定结论，放行；既已完成对照保持放行
+    for tag, ok_text in [("30c", "审批通过时间未知但结果已确认通过"), ("30d", "审批已于上周通过")]:
+        q_ok = f"68岁，本次职工医保，如果审批通过，已确认{ok_text}并更正为居民医保，M17.9，保守治疗"
+        res_ok_c = parse_local_intent(q_ok)
+        assert res_ok_c["intent"] == "query_dip_rule" and res_ok_c["data"]["benchmark_amount"] == 2604.84
+        res_ok_s = match_dip_rule(disease="M17.9", age=68,
+                                  ins_type=f"本次职工医保，如果审批通过，已确认{ok_text}并更正为居民医保",
+                                  op_keyword="保守")
+        assert res_ok_s["matched"] is True and res_ok_s["benchmark_amount"] == 2604.84
+        print(f"PASS [Case {tag}]: “已确认{ok_text}并更正为居民医保” -> 正对照双路径放行，居民基准 ￥2604.84")
+
+    # ---------------- 用例 31: DIP-INS-001 变体十六验收 (同句两个业务事项：新主语的结果词不得用于解除审批前提) ----------------
+    print("\n--- [Case 31] DIP-INS-001 变体十六验收 (“但身份核验通过”“且材料形式审查通过”拦截 + “结果已确认通过”承接放行，双路径表驱动) ---")
+    # 修复点：事项-结果配对，“但/且”引入明确新主语时其后结果词归新主语，不得满足审批前提
+    v16_pending = [
+        ("31a", "审批通过时间未知但身份核验通过"),
+        ("31b", "审批通过日期待定且材料形式审查通过"),
+    ]
+    for tag, stage_text in v16_pending:
+        q = f"68岁，本次职工医保，如果审批通过，已确认{stage_text}并更正为居民医保，M17.9，保守治疗"
+        res_c = parse_local_intent(q)
+        assert res_c["intent"] == "need_clarification", f"Case {tag} 聊天入口应澄清，实际 {res_c['intent']}"
+        assert res_c["data"]["status"] == "PENDING"
+        assert res_c["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+        assert "2790.90" not in res_c["reply"] and "2604.84" not in res_c["reply"]
+        res_s = match_dip_rule(disease="M17.9", age=68,
+                               ins_type=f"本次职工医保，如果审批通过，已确认{stage_text}并更正为居民医保",
+                               op_keyword="保守")
+        assert res_s["matched"] is False, f"Case {tag} 结构化入口应不命中，实际 {res_s}"
+        assert res_s["status"] == "PENDING"
+        assert res_s["pending_reason"] == "CORRECTION_UNCONFIRMED"
+        assert "benchmark_amount" not in res_s
+        print(f"PASS [Case {tag}]: “已确认{stage_text}并更正为居民医保” -> 双路径均 PENDING / CORRECTION_UNCONFIRMED，零金额输出")
+
+    # 31c. 同组对照：无新主语时“结果已确认通过”承接审批事项，正常放行（双路径）
+    q_31c = "68岁，本次职工医保，如果审批通过，已确认审批通过时间未知但结果已确认通过并更正为居民医保，M17.9，保守治疗"
+    res_31c = parse_local_intent(q_31c)
+    assert res_31c["intent"] == "query_dip_rule" and res_31c["data"]["benchmark_amount"] == 2604.84
+    res_31c_s = match_dip_rule(disease="M17.9", age=68,
+                               ins_type="本次职工医保，如果审批通过，已确认审批通过时间未知但结果已确认通过并更正为居民医保",
+                               op_keyword="保守")
+    assert res_31c_s["matched"] is True and res_31c_s["benchmark_amount"] == 2604.84
+    print("PASS [Case 31c]: “已确认审批通过时间未知但结果已确认通过并更正为居民医保” -> 承接对照双路径放行，居民基准 ￥2604.84")
+
+    # ---------------- 用例 32: DIP-INS-001 变体十七验收 (两项业务同为“审批”：须解析业务对象，其他对象审批不得解除前提) ----------------
+    print("\n--- [Case 32] DIP-INS-001 变体十七验收 (“手术审批通过”“采购审批通过”拦截 + “本次险种更正审批通过”放行，双路径表驱动) ---")
+    # 修复点：解析“审批”前的业务对象，仅审批事项本身或明确指向本次险种更正的审批结果允许切换
+    v17_pending = [
+        ("32a", "审批通过时间未知但手术审批通过"),
+        ("32b", "审批通过时间未知但采购审批通过"),
+    ]
+    for tag, stage_text in v17_pending:
+        q = f"68岁，本次职工医保，如果审批通过，已确认{stage_text}并更正为居民医保，M17.9，保守治疗"
+        res_c = parse_local_intent(q)
+        assert res_c["intent"] == "need_clarification", f"Case {tag} 聊天入口应澄清，实际 {res_c['intent']}"
+        assert res_c["data"]["status"] == "PENDING"
+        assert res_c["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+        assert "2790.90" not in res_c["reply"] and "2604.84" not in res_c["reply"]
+        res_s = match_dip_rule(disease="M17.9", age=68,
+                               ins_type=f"本次职工医保，如果审批通过，已确认{stage_text}并更正为居民医保",
+                               op_keyword="保守")
+        assert res_s["matched"] is False, f"Case {tag} 结构化入口应不命中，实际 {res_s}"
+        assert res_s["status"] == "PENDING"
+        assert res_s["pending_reason"] == "CORRECTION_UNCONFIRMED"
+        assert "benchmark_amount" not in res_s
+        print(f"PASS [Case {tag}]: “已确认{stage_text}并更正为居民医保” -> 双路径均 PENDING / CORRECTION_UNCONFIRMED，零金额输出")
+
+    # 32c. 同组对照：明确指向本次险种更正事项的审批结果，正常放行（双路径）
+    q_32c = "68岁，本次职工医保，如果审批通过，已确认审批通过时间未知但本次险种更正审批通过并更正为居民医保，M17.9，保守治疗"
+    res_32c = parse_local_intent(q_32c)
+    assert res_32c["intent"] == "query_dip_rule" and res_32c["data"]["benchmark_amount"] == 2604.84
+    res_32c_s = match_dip_rule(disease="M17.9", age=68,
+                               ins_type="本次职工医保，如果审批通过，已确认审批通过时间未知但本次险种更正审批通过并更正为居民医保",
+                               op_keyword="保守")
+    assert res_32c_s["matched"] is True and res_32c_s["benchmark_amount"] == 2604.84
+    print("PASS [Case 32c]: “已确认审批通过时间未知但本次险种更正审批通过并更正为居民医保” -> 对照双路径放行，居民基准 ￥2604.84")
+
+    # ---------------- 用例 33: DIP-INS-001 变体十八验收 (审批与结果词间的子事项拦截 + 同一事项完整名称归一化放行) ----------------
+    print("\n--- [Case 33] DIP-INS-001 变体十八验收 (“审批材料的身份核验/形式审查通过”拦截 + “本次医保险种/参保类型更正审批通过”放行，双路径表驱动) ---")
+    # 修复点：结果词绑定紧邻完整事项，材料核验/形式审查等子事项结果不予采纳；
+    # 同一险种更正事项的完整名称（医保险种/参保类型更正）本地归一化后与“险种更正”同等放行
+    v18_pending = [
+        ("33a", "审批材料的身份核验通过"),
+        ("33b", "审批材料的形式审查通过"),
+    ]
+    for tag, stage_text in v18_pending:
+        q = f"68岁，本次职工医保，如果审批通过，已确认{stage_text}并更正为居民医保，M17.9，保守治疗"
+        res_c = parse_local_intent(q)
+        assert res_c["intent"] == "need_clarification", f"Case {tag} 聊天入口应澄清，实际 {res_c['intent']}"
+        assert res_c["data"]["status"] == "PENDING"
+        assert res_c["data"]["pending_reason"] == "CORRECTION_UNCONFIRMED"
+        assert "2790.90" not in res_c["reply"] and "2604.84" not in res_c["reply"]
+        res_s = match_dip_rule(disease="M17.9", age=68,
+                               ins_type=f"本次职工医保，如果审批通过，已确认{stage_text}并更正为居民医保",
+                               op_keyword="保守")
+        assert res_s["matched"] is False, f"Case {tag} 结构化入口应不命中，实际 {res_s}"
+        assert res_s["status"] == "PENDING"
+        assert res_s["pending_reason"] == "CORRECTION_UNCONFIRMED"
+        assert "benchmark_amount" not in res_s
+        print(f"PASS [Case {tag}]: “已确认{stage_text}并更正为居民医保” -> 双路径均 PENDING / CORRECTION_UNCONFIRMED，零金额输出")
+
+    # 33c/33d 同组对照：同一险种更正事项的完整名称，与“本次险种更正审批通过”获得相同放行结果（双路径）
+    for tag, ok_text in [("33c", "审批通过时间未知但本次医保险种更正审批通过"), ("33d", "审批通过时间未知但本次参保类型更正审批通过")]:
+        q_ok = f"68岁，本次职工医保，如果审批通过，已确认{ok_text}并更正为居民医保，M17.9，保守治疗"
+        res_ok_c = parse_local_intent(q_ok)
+        assert res_ok_c["intent"] == "query_dip_rule" and res_ok_c["data"]["benchmark_amount"] == 2604.84
+        res_ok_s = match_dip_rule(disease="M17.9", age=68,
+                                  ins_type=f"本次职工医保，如果审批通过，已确认{ok_text}并更正为居民医保",
+                                  op_keyword="保守")
+        assert res_ok_s["matched"] is True and res_ok_s["benchmark_amount"] == 2604.84
+        print(f"PASS [Case {tag}]: “已确认{ok_text}并更正为居民医保” -> 对照双路径放行，居民基准 ￥2604.84")
+
+    # ---------------- 用例 34: DIP-INS-001 变体十九验收 (审批与结果词间的完整过去时间短语放行，子事项检查保留) ----------------
+    print("\n--- [Case 34] DIP-INS-001 变体十九验收 (“审批于昨日通过”“审批昨日通过”“审批于昨天下午通过”均放行且同额，双路径表驱动) ---")
+    # 修复点：审批与结果词之间识别完整、明确的过去时间短语（“于”可选、日期+上午/下午一次匹配），
+    # 残余字符不得触发拒绝；两条材料子事项用例仍由 Case 33 保障 PENDING
+    v19_ok = [
+        ("34a", "本次险种更正审批于昨日通过"),
+        ("34b", "本次险种更正审批昨日通过"),
+        ("34c", "本次险种更正审批于昨天下午通过"),
+        ("34d", "本次险种更正审批于上午通过"),   # 变体二十回归：独立时段“于上午”上一版本可放行
+        ("34e", "本次险种更正审批于下午通过"),   # 变体二十回归：独立时段“于下午”上一版本可放行
+    ]
+    v19_rule_ids = []
+    for tag, ok_text in v19_ok:
+        q_ok = f"68岁，本次职工医保，如果审批通过，已确认{ok_text}并更正为居民医保，M17.9，保守治疗"
+        res_ok_c = parse_local_intent(q_ok)
+        assert res_ok_c["intent"] == "query_dip_rule", f"Case {tag} 聊天入口应命中，实际 {res_ok_c['intent']}"
+        assert res_ok_c["data"]["matched"] is True
+        assert res_ok_c["data"]["benchmark_amount"] == 2604.84
+        res_ok_s = match_dip_rule(disease="M17.9", age=68,
+                                  ins_type=f"本次职工医保，如果审批通过，已确认{ok_text}并更正为居民医保",
+                                  op_keyword="保守")
+        assert res_ok_s["matched"] is True
+        assert res_ok_s["benchmark_amount"] == 2604.84
+        assert res_ok_s["rule_id"] == res_ok_c["data"]["rule_id"]  # 双入口命中同一规则
+        v19_rule_ids.append(res_ok_s["rule_id"])
+        print(f"PASS [Case {tag}]: “已确认{ok_text}并更正为居民医保” -> 双路径放行，规则 #{res_ok_s['rule_id']}，居民基准 ￥2604.84")
+    assert len(set(v19_rule_ids)) == 1  # 五种时间措辞命中同一居民规则且金额相等
+    print(f"PASS [Case 34]: 五种过去时间/时段短语均命中同一居民规则 #{v19_rule_ids[0]}，金额一致 ￥2604.84")
+
     print("\n" + "=" * 70)
-    print(">>> 恭喜！Phase 1 验收回归测试套件全部 13 大关键测试集 100% 通过！ <<<")
+    print(">>> 恭喜！Phase 1 验收回归测试套件全部 34 大关键测试集 100% 通过！ <<<")
     print("=" * 70)
 
 if __name__ == "__main__":

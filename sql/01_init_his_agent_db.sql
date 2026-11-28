@@ -62,8 +62,10 @@ BEGIN
         visit_id          NVARCHAR(64)   NOT NULL,
         ward_name         NVARCHAR(50)   NOT NULL,
         bed_no            NVARCHAR(30)   NOT NULL,
+        dept_id           NVARCHAR(30)   NULL,
         dept_name         NVARCHAR(50)   NOT NULL,
         doctor_id         NVARCHAR(50)   NOT NULL,
+        doctor_name       NVARCHAR(64)   NULL,
         age               INT            NULL,
         ins_type          NVARCHAR(20)   NOT NULL,
         primary_icd       NVARCHAR(50)   NULL,
@@ -80,6 +82,58 @@ BEGIN
         synced_at         DATETIME2      NOT NULL DEFAULT SYSDATETIME()
     );
     CREATE UNIQUE INDEX UX_snapshot_batch_visit ON dbo.inpatient_dip_snapshot(batch_id, visit_id);
+END
+GO
+
+-- 幂等升级：若已有 inpatient_dip_snapshot 表缺少 dept_id，动态升级该列
+IF OBJECT_ID(N'dbo.inpatient_dip_snapshot', N'U') IS NOT NULL AND COL_LENGTH('dbo.inpatient_dip_snapshot', 'dept_id') IS NULL
+BEGIN
+    ALTER TABLE dbo.inpatient_dip_snapshot ADD dept_id NVARCHAR(30) NULL;
+END
+GO
+
+-- 幂等升级：若已有 inpatient_dip_snapshot 表缺少 doctor_name，动态补齐
+IF OBJECT_ID(N'dbo.inpatient_dip_snapshot', N'U') IS NOT NULL AND COL_LENGTH('dbo.inpatient_dip_snapshot', 'doctor_name') IS NULL
+BEGIN
+    ALTER TABLE dbo.inpatient_dip_snapshot ADD doctor_name NVARCHAR(64) NULL;
+END
+GO
+
+-- 2b. 巡检扫描批次元数据表（持久化范围、月份、扫描上限、实际人数与截断标记）
+IF OBJECT_ID(N'dbo.inpatient_scan_batch', N'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.inpatient_scan_batch (
+        batch_id         NVARCHAR(64)  PRIMARY KEY,
+        seq_id           BIGINT IDENTITY(1, 1) NOT NULL,
+        scope            NVARCHAR(16)  NOT NULL,
+        year_month       NVARCHAR(7)   NULL,
+        scan_dept        NVARCHAR(100) NULL,
+        rule_version     NVARCHAR(50)  NOT NULL,
+        scan_limit       INT           NULL,
+        total_scanned    INT           NOT NULL,
+        is_truncated     BIT           NOT NULL DEFAULT 0,
+        probe_version    INT           NULL,
+        data_cutoff_time DATETIME2     NOT NULL,
+        synced_at        DATETIME2     NOT NULL DEFAULT SYSDATETIME()
+    );
+END
+GO
+
+IF OBJECT_ID(N'dbo.inpatient_scan_batch', N'U') IS NOT NULL AND COL_LENGTH('dbo.inpatient_scan_batch', 'probe_version') IS NULL
+BEGIN
+    ALTER TABLE dbo.inpatient_scan_batch ADD probe_version INT NULL;
+END
+GO
+
+IF OBJECT_ID(N'dbo.inpatient_scan_batch', N'U') IS NOT NULL AND COL_LENGTH('dbo.inpatient_scan_batch', 'seq_id') IS NULL
+BEGIN
+    ALTER TABLE dbo.inpatient_scan_batch ADD seq_id BIGINT IDENTITY(1, 1) NOT NULL;
+END
+GO
+
+IF OBJECT_ID(N'dbo.inpatient_scan_batch', N'U') IS NOT NULL AND COL_LENGTH('dbo.inpatient_scan_batch', 'scan_dept') IS NULL
+BEGIN
+    ALTER TABLE dbo.inpatient_scan_batch ADD scan_dept NVARCHAR(100) NULL;
 END
 GO
 
@@ -101,7 +155,7 @@ BEGIN
 END
 GO
 
--- 4. 用户权限与身份映射表
+-- 4. 用户权限与身份映射表（统一服务端 RBAC 鉴权与钉钉映射）
 IF OBJECT_ID(N'dbo.sys_user_role', N'U') IS NULL
 BEGIN
     CREATE TABLE dbo.sys_user_role (
@@ -109,9 +163,34 @@ BEGIN
         dingtalk_userid NVARCHAR(100)  NULL,
         role_type       NVARCHAR(30)   NOT NULL,
         dept_scope      NVARCHAR(300)  NOT NULL DEFAULT N'',
+        doctor_id       NVARCHAR(64)   NULL,
         can_export_case BIT            NOT NULL DEFAULT 0,
         status          NVARCHAR(20)   NOT NULL DEFAULT N'ACTIVE',
         updated_at      DATETIME2      NOT NULL DEFAULT SYSDATETIME()
     );
+END
+GO
+
+IF OBJECT_ID(N'dbo.sys_operator_account', N'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.sys_operator_account (
+        operator_id     NVARCHAR(64)   PRIMARY KEY,
+        display_name    NVARCHAR(64)   NOT NULL,
+        password_hash   NVARCHAR(256)  NOT NULL,
+        role_type       NVARCHAR(30)   NOT NULL,
+        dept_scope      NVARCHAR(300)  NOT NULL DEFAULT N'',
+        dingtalk_userid NVARCHAR(100)  NULL,
+        can_export_case BIT            NOT NULL DEFAULT 0,
+        status          NVARCHAR(20)   NOT NULL DEFAULT N'ACTIVE',
+        created_at      DATETIME2      NOT NULL DEFAULT SYSDATETIME(),
+        updated_at      DATETIME2      NOT NULL DEFAULT SYSDATETIME()
+    );
+END
+GO
+
+-- 幂等升级：若已有 sys_operator_account 表缺少 doctor_id，动态补齐
+IF OBJECT_ID(N'dbo.sys_operator_account', N'U') IS NOT NULL AND COL_LENGTH('dbo.sys_operator_account', 'doctor_id') IS NULL
+BEGIN
+    ALTER TABLE dbo.sys_operator_account ADD doctor_id NVARCHAR(64) NULL;
 END
 GO
