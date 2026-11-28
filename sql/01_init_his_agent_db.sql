@@ -104,15 +104,29 @@ IF OBJECT_ID(N'dbo.inpatient_scan_batch', N'U') IS NULL
 BEGIN
     CREATE TABLE dbo.inpatient_scan_batch (
         batch_id         NVARCHAR(64)  PRIMARY KEY,
+        seq_id           BIGINT IDENTITY(1, 1) NOT NULL,
         scope            NVARCHAR(16)  NOT NULL,
         year_month       NVARCHAR(7)   NULL,
         rule_version     NVARCHAR(50)  NOT NULL,
         scan_limit       INT           NULL,
         total_scanned    INT           NOT NULL,
         is_truncated     BIT           NOT NULL DEFAULT 0,
+        probe_version    INT           NULL,
         data_cutoff_time DATETIME2     NOT NULL,
         synced_at        DATETIME2     NOT NULL DEFAULT SYSDATETIME()
     );
+END
+GO
+
+IF OBJECT_ID(N'dbo.inpatient_scan_batch', N'U') IS NOT NULL AND COL_LENGTH('dbo.inpatient_scan_batch', 'probe_version') IS NULL
+BEGIN
+    ALTER TABLE dbo.inpatient_scan_batch ADD probe_version INT NULL;
+END
+GO
+
+IF OBJECT_ID(N'dbo.inpatient_scan_batch', N'U') IS NOT NULL AND COL_LENGTH('dbo.inpatient_scan_batch', 'seq_id') IS NULL
+BEGIN
+    ALTER TABLE dbo.inpatient_scan_batch ADD seq_id BIGINT IDENTITY(1, 1) NOT NULL;
 END
 GO
 

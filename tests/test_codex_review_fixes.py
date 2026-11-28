@@ -1319,7 +1319,15 @@ def test_deploy_key_001_compose_volume_resolution_and_isolation():
         assert "wireguard_config" not in api_block
 
     script_path = os.path.join(repo_root, "wireguard", "migrate_to_volume.sh")
+    doc_path = os.path.join(repo_root, "wireguard", "UPGRADE_MIGRATION.md")
     if os.path.exists(script_path):
+        script_txt = open(script_path, "r", encoding="utf-8").read()
+        assert "m.get('type') != 'volume'" in script_txt
+        assert "clients/*.conf" in script_txt
+        assert "stat -c" in script_txt
+        assert "_wireguard_config" not in script_txt  # no offline hardcoded name guess
+
+        # 1) Mismatched --volume must abort before recreate
         proc = subprocess.run(
             ["sh", script_path, "-f", compose_path, "-p", "proj_alpha", "--volume", "wrong_volume_name", "--verify-only"],
             cwd=repo_root,
@@ -1328,3 +1336,278 @@ def test_deploy_key_001_compose_volume_resolution_and_isolation():
         )
         assert proc.returncode != 0
         assert "mismatch" in (proc.stderr + proc.stdout).lower()
+
+        # 2) Unreadable / nonexistent Compose file must fail BEFORE guessing volume name
+        proc_bad_cfg = subprocess.run(
+            ["sh", script_path, "-f", "/nonexistent/docker-compose.yml", "-p", "proj_alpha", "--verify-only"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+        assert proc_bad_cfg.returncode != 0
+        assert "abort" in (proc_bad_cfg.stderr + proc_bad_cfg.stdout).lower()
+
+    if os.path.exists(doc_path):
+        doc_txt = open(doc_path, "r", encoding="utf-8").read()
+        assert "docker compose -f docker-compose.yml -p my_proj up -d --force-recreate api wg nginx" in doc_txt
+        assert "-f docker-compose.yml -p my_proj" in doc_txt
+
+
+def test_snap_batch_id_001_same_second_collision_and_explicit_retry_offline():
+    """SNAP-BATCH-ID-001: Frozen same-second/millisecond scans yield distinct batch_ids and consistent details/summaries."""
+    import sqlite3
+    import tools.inpatient_scanner as scanner_mod
+
+    sconn = sqlite3.connect(":memory:")
+    sconn.row_factory = sqlite3.Row
+    sconn.execute(
+        "CREATE TABLE snaps ("
+        "batch_id TEXT, visit_id TEXT, ward_name TEXT, bed_no TEXT, dept_id TEXT, dept_name TEXT, "
+        "doctor_id TEXT, doctor_name TEXT, age INT, ins_type TEXT, primary_icd TEXT, matched_rule_id INT, "
+        "rule_version TEXT, current_fee REAL, target_base REAL, fee_ratio REAL, alert_level TEXT, "
+        "pending_reason TEXT, discharge_review INT, data_cutoff_time DATETIME, synced_at DATETIME, "
+        "PRIMARY KEY (batch_id, visit_id))"
+    )
+    sconn.execute(
+        "CREATE TABLE batches ("
+        "seq_id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "batch_id TEXT UNIQUE, scope TEXT, year_month TEXT, rule_version TEXT, scan_limit INT, "
+        "total_scanned INT, is_truncated INT, probe_version INT, data_cutoff_time DATETIME, synced_at DATETIME)"
+    )
+
+    class _FakeScanCur:
+        def __init__(self, as_dict=False):
+            self.as_dict = as_dict
+            self._one = None
+            self._all = []
+
+        def execute(self, sql, params=()):
+            s = " ".join(sql.split())
+            self._one = None
+            self._all = []
+            if "ALTER TABLE" in s or "CREATE TABLE dbo.inpatient_scan_batch" in s:
+                return
+            if s.startswith("SELECT TOP 1 1 FROM dbo.inpatient_scan_batch WHERE batch_id"):
+                r = sconn.execute("SELECT 1 FROM batches WHERE batch_id = ?", (params[0],)).fetchone()
+                self._one = (1,) if r else None
+            elif s.startswith("SELECT TOP 1 1 FROM dbo.inpatient_dip_snapshot WHERE batch_id"):
+                r = sconn.execute("SELECT 1 FROM snaps WHERE batch_id = ?", (params[0],)).fetchone()
+                self._one = (1,) if r else None
+            elif s.startswith("DELETE FROM dbo.inpatient_dip_snapshot WHERE batch_id"):
+                sconn.execute("DELETE FROM snaps WHERE batch_id = ?", (params[0],))
+            elif "MERGE dbo.inpatient_dip_snapshot" in s:
+                bid, vid = params[0], params[1]
+                sconn.execute(
+                    "INSERT OR REPLACE INTO snaps VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (bid, vid, params[2], params[3], params[4], params[5], params[6], params[7], params[8],
+                     params[9], params[10], params[11], params[12], float(params[13]),
+                     float(params[14]) if params[14] is not None else None,
+                     float(params[15]) if params[15] is not None else None,
+                     params[16], params[17], params[18], params[19], datetime(2026, 11, 28, 17, 45, 0)),
+                )
+            elif "MERGE dbo.inpatient_scan_batch" in s:
+                bid = params[0]
+                sconn.execute(
+                    "INSERT OR REPLACE INTO batches (batch_id, scope, year_month, rule_version, scan_limit, total_scanned, is_truncated, probe_version, data_cutoff_time, synced_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (bid, params[1], params[2], params[3], params[4], params[5], params[6], params[7], params[8], "2026-11-28 17:45:00"),
+                )
+            elif "OBJECT_ID(N'dbo.inpatient_scan_batch'" in s:
+                pat, excl, sc, ym = params[0].replace("%", "*"), params[1], params[2], params[3]
+                row = sconn.execute(
+                    "SELECT batch_id, data_cutoff_time, synced_at, scope, year_month, scan_limit, total_scanned, is_truncated, probe_version, 1 AS has_batch_meta "
+                    "FROM batches WHERE scope = ? AND (? IS NULL OR year_month = ?) ORDER BY synced_at DESC, seq_id DESC LIMIT 1",
+                    (sc, ym, ym),
+                ).fetchone()
+                if row:
+                    d = dict(row)
+                    d["data_cutoff_time"] = datetime(2026, 11, 28, 17, 45, 0)
+                    d["synced_at"] = datetime(2026, 11, 28, 17, 45, 0)
+                    self._one = d
+            elif "COL_LENGTH('dbo.inpatient_dip_snapshot', 'doctor_name')" in s:
+                self._one = {"has_dn": 1, "has_batch_tbl": 1, "has_pv": 1}
+            elif "FROM dbo.inpatient_dip_snapshot WHERE batch_id" in s:
+                rows = sconn.execute("SELECT * FROM snaps WHERE batch_id = ?", (params[0],)).fetchall()
+                self._all = [dict(r) for r in rows]
+
+        def fetchone(self):
+            return self._one
+
+        def fetchall(self):
+            return self._all
+
+    class _FakeConn:
+        def cursor(self, as_dict=True):
+            return _FakeScanCur(as_dict=as_dict)
+        def commit(self):
+            sconn.commit()
+        def rollback(self):
+            sconn.rollback()
+        def close(self):
+            pass
+
+    class _SeqMonthReader:
+        def __init__(self):
+            self.calls = 0
+        def get_monthly_inpatients(self, year_month, department=None, limit=None, return_meta=False):
+            self.calls += 1
+            rows = [{"zyh": "ZY_FIRST_ONLY", "patient_name": "甲", "current_dept": "中医科", "current_dept_id": "101", "current_bed": "1",
+                     "attending_doctor_id": "D1", "attending_doctor": "张", "age": "50", "ylzffs": "01", "insurance_type": "职工",
+                     "admission_diag_code": "M17.9", "admission_diag_name": "膝关节病", "ssmc1": "保守治疗"}] if self.calls == 1 else []
+            meta = {"year_month": year_month, "scan_limit": limit, "is_truncated": False, "probe_version": 2}
+            return (rows, meta) if return_meta else rows
+        def get_active_patient_fee(self, lsh, cutoff_time=None):
+            return {"total_fee": Decimal("1500.00"), "has_activity": True}
+
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 11, 28, 17, 45, 0, 123456, tzinfo=tz)
+
+    scanner = scanner_mod.InpatientScanner(rule_version="2026_SAMPLE_V1")
+    scanner.his_reader = _SeqMonthReader()
+
+    with patch.object(scanner_mod, "datetime", _FrozenDateTime), \
+         patch.object(scanner_mod, "get_local_db_connection", side_effect=lambda as_dict=False: (_FakeScanCur(as_dict=as_dict), _FakeConn())), \
+         patch.object(main_mod, "get_local_db_connection", side_effect=lambda as_dict=True: (_FakeScanCur(as_dict=as_dict), _FakeConn())), \
+         patch.object(main_mod, "get_operator", return_value={"operator_id": "admin", "role_type": "ADMIN", "dept_scope": "", "can_export_case": True}), \
+         patch.object(main_mod, "record_audit_log"), \
+         patch.object(scanner_mod, "query_approved_dip_rules", return_value=[]):
+        # 1) Frozen exact microsecond timestamp: 1st call writes 1 row, 2nd call writes 0 rows
+        res1 = scanner.scan_and_snapshot(scope="month", year_month="2026-11")
+        res2 = scanner.scan_and_snapshot(scope="month", year_month="2026-11")
+        assert res1["batch_id"] != res2["batch_id"]
+        assert res1["batch_id"].startswith("MONTH_202611_20261128_174500_")
+        assert res2["batch_id"].startswith("MONTH_202611_20261128_174500_")
+        assert res1["total_scanned"] == 1 and res2["total_scanned"] == 0
+
+        # Each batch's summary count matches its own snapshot detail rows
+        c1 = sconn.execute("SELECT COUNT(*) FROM snaps WHERE batch_id = ?", (res1["batch_id"],)).fetchone()[0]
+        c2 = sconn.execute("SELECT COUNT(*) FROM snaps WHERE batch_id = ?", (res2["batch_id"],)).fetchone()[0]
+        assert c1 == 1 and c2 == 0
+
+        # API alerts and CSV both select latest batch (res2, 0 items), never mixing ZY_FIRST_ONLY
+        alerts = asyncio.run(main_mod.get_inpatient_alerts(dept=None, scope="month", year_month="2026-11", operator={"sub": "admin", "role": "ADMIN", "dept": ""}))
+        assert alerts["batch_id"] == res2["batch_id"] and alerts["total"] == 0 and alerts["items"] == []
+        csv_resp = asyncio.run(main_mod.export_inpatient_alerts_csv(dept=None, level=None, scope="month", year_month="2026-11", operator={"sub": "admin", "role": "ADMIN", "dept": ""}))
+        assert csv_resp.headers.get("X-DIP-Batch-Id") == res2["batch_id"]
+        assert "ZY_FIRST_ONLY" not in csv_resp.body.decode("utf-8")
+
+        # 2) Explicit duplicate batch_id policy: if_exists="error" rejects, "replace" atomically clears old details
+        try:
+            scanner.scan_and_snapshot(batch_id=res1["batch_id"], scope="month", year_month="2026-11", if_exists="error")
+            raise AssertionError("Expected duplicate explicit batch_id to be rejected when if_exists='error'")
+        except ValueError as err:
+            assert "Duplicate explicit batch_id" in str(err)
+
+        scanner.scan_and_snapshot(batch_id=res1["batch_id"], scope="month", year_month="2026-11", if_exists="replace")
+        c1_after = sconn.execute("SELECT COUNT(*) FROM snaps WHERE batch_id = ?", (res1["batch_id"],)).fetchone()[0]
+        m1_after = sconn.execute("SELECT total_scanned FROM batches WHERE batch_id = ?", (res1["batch_id"],)).fetchone()[0]
+        assert c1_after == 0 and m1_after == 0
+
+
+def test_month_total_001_legacy_full_limit_vs_verified_and_compat_reader_offline():
+    """MONTH-TOTAL-001: Distinguish unverified legacy 100/100/false (unknown), verified 100/100/false (complete), and compat reader 101->truncated."""
+    import tools.inpatient_scanner as scanner_mod
+
+    # 1) Legacy compat reader WITHOUT return_meta param still receives limit+1=101 probe when 101 rows exist
+    class _LegacyActiveReader:
+        def __init__(self, total_available: int):
+            self.total_available = total_available
+            self.seen_limits = []
+        def get_active_inpatients(self, department=None, limit=None):
+            self.seen_limits.append(limit)
+            rows = [
+                {"zyh": f"ZY_C_{i:03d}", "patient_name": "P", "current_dept": "骨科", "current_dept_id": "101", "current_bed": str(i),
+                 "attending_doctor_id": "D1", "attending_doctor": "王", "age": "50", "ylzffs": "01", "insurance_type": "职工",
+                 "admission_diag_code": "M17.9", "admission_diag_name": "膝关节病", "ssmc1": "保守治疗"}
+                for i in range(self.total_available)
+            ]
+            return rows[:limit] if limit is not None else rows
+        def get_active_patient_fee(self, lsh, cutoff_time=None):
+            return {"total_fee": Decimal("1000.00"), "has_activity": True}
+
+    class _NoopCur:
+        def execute(self, *a, **kw):
+            pass
+        def fetchone(self):
+            return None
+
+    class _NoopConn:
+        def commit(self):
+            pass
+        def rollback(self):
+            pass
+        def close(self):
+            pass
+
+    legacy_101 = _LegacyActiveReader(101)
+    scanner = scanner_mod.InpatientScanner(rule_version="2026_SAMPLE_V1")
+    scanner.his_reader = legacy_101
+    with patch.object(scanner_mod, "get_local_db_connection", return_value=(_NoopCur(), _NoopConn())), \
+         patch.object(scanner_mod, "query_approved_dip_rules", return_value=[]):
+        res_101 = scanner.scan_and_snapshot(scope="active", limit=100)
+    assert legacy_101.seen_limits == [101]
+    assert res_101["scan_limit"] == 100 and res_101["total_scanned"] == 100 and res_101["is_truncated"] is True and res_101["probe_version"] == 2
+
+    # 2) API/CSV distinction between unverified legacy 100/100/false -> Unknown vs probe_version=2 100/100/false -> Complete vs 100/100/true -> Truncated
+    scenarios = [
+        ("OLD_100_UNVERIFIED", {"batch_id": "OLD_100", "data_cutoff_time": datetime(2026, 11, 28, 8, 0, 0), "synced_at": datetime(2026, 11, 28, 8, 0, 0),
+                                "scope": "active", "year_month": None, "scan_limit": 100, "total_scanned": 100, "is_truncated": 0, "probe_version": None, "has_batch_meta": 1},
+         None, "unknown", "未知(旧批次无完整度元数据)"),
+        ("NEW_100_VERIFIED", {"batch_id": "NEW_100", "data_cutoff_time": datetime(2026, 11, 28, 8, 0, 0), "synced_at": datetime(2026, 11, 28, 8, 0, 0),
+                              "scope": "active", "year_month": None, "scan_limit": 100, "total_scanned": 100, "is_truncated": 0, "probe_version": 2, "has_batch_meta": 1},
+         False, "false", "全量(共100例)"),
+        ("COMPAT_101_TRUNC", {"batch_id": "COMPAT_101", "data_cutoff_time": datetime(2026, 11, 28, 8, 0, 0), "synced_at": datetime(2026, 11, 28, 8, 0, 0),
+                              "scope": "active", "year_month": None, "scan_limit": 100, "total_scanned": 100, "is_truncated": 1, "probe_version": 2, "has_batch_meta": 1},
+         True, "true", "截断(上限100/已扫100例)"),
+    ]
+
+    sample_row = {
+        "visit_id": "ZY_1", "dept_id": "101", "dept_name": "骨科", "ward_name": "W", "bed_no": "1",
+        "doctor_id": "D1", "doctor_name": "王", "primary_icd": "M17.9", "ins_type": "职工",
+        "matched_rule_id": 85, "current_fee": Decimal("1000.00"), "target_base": Decimal("2000.00"),
+        "fee_ratio": Decimal("0.50"), "alert_level": "GREEN", "pending_reason": None,
+        "data_cutoff_time": datetime(2026, 11, 28, 8, 0, 0),
+    }
+
+    for _, batch_meta_row, expected_flag, expected_hdr, expected_csv_desc in scenarios:
+        class _MatrixCur:
+            def __init__(self, row=batch_meta_row):
+                self._one = None
+                self._all = []
+                self._row = row
+            def execute(self, sql, params=()):
+                s = " ".join(sql.split())
+                if "OBJECT_ID(N'dbo.inpatient_scan_batch'" in s:
+                    self._one = self._row
+                elif "COL_LENGTH('dbo.inpatient_dip_snapshot', 'doctor_name')" in s:
+                    self._one = {"has_dn": 1, "has_batch_tbl": 1, "has_pv": 1}
+                elif "FROM dbo.inpatient_dip_snapshot" in s:
+                    self._all = [sample_row]
+            def fetchone(self):
+                return self._one
+            def fetchall(self):
+                return self._all
+
+        class _MatrixConn:
+            def close(self):
+                pass
+
+        with patch.object(main_mod, "get_local_db_connection", side_effect=lambda as_dict=True: (_MatrixCur(), _MatrixConn())), \
+             patch.object(main_mod, "get_operator", return_value={"operator_id": "admin", "role_type": "ADMIN", "dept_scope": "", "can_export_case": True}), \
+             patch.object(main_mod, "record_audit_log"):
+            j = asyncio.run(main_mod.get_inpatient_alerts(dept=None, scope="active", operator={"sub": "admin", "role": "ADMIN", "dept": ""}))
+            assert j["is_truncated"] is expected_flag
+            c = asyncio.run(main_mod.export_inpatient_alerts_csv(dept=None, level=None, scope="active", operator={"sub": "admin", "role": "ADMIN", "dept": ""}))
+            assert c.headers.get("X-DIP-Is-Truncated") == expected_hdr
+            assert expected_csv_desc in c.body.decode("utf-8")
+
+    # 3) Verify Vue board explicitly renders unknown banner on is_truncated == null, complete badge on === false, warning on === true
+    vue_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web", "src", "views", "inpatient", "index.vue")
+    if os.path.exists(vue_path):
+        vue_txt = open(vue_path, "r", encoding="utf-8").read()
+        assert "report?.is_truncated === true" in vue_txt
+        assert "report?.is_truncated === false" in vue_txt
+        assert "report?.is_truncated == null" in vue_txt
+        assert "完整度未知" in vue_txt

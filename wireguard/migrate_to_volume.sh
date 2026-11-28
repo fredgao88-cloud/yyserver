@@ -39,47 +39,57 @@ while [ "$#" -gt 0 ]; do
 done
 
 resolve_compose_volume() {
-  if [ -n "${EXPLICIT_VOLUME}" ]; then
-    printf '%s' "${EXPLICIT_VOLUME}"
-    return 0
+  if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
+    echo "ERROR: docker compose CLI is required to resolve effective WireGuard target volume safely; refusing to guess." >&2
+    return 1
   fi
-  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
-    if [ -n "${PROJECT_NAME}" ]; then
-      CFG_JSON="$(docker compose -f "${COMPOSE_FILE}" -p "${PROJECT_NAME}" config --format json 2>/dev/null || true)"
-    else
-      CFG_JSON="$(docker compose -f "${COMPOSE_FILE}" config --format json 2>/dev/null || true)"
-    fi
-    if [ -n "${CFG_JSON}" ]; then
-      RESOLVED="$(printf '%s' "${CFG_JSON}" | python3 -c "
+  if [ -n "${PROJECT_NAME}" ]; then
+    CFG_JSON="$(docker compose -f "${COMPOSE_FILE}" -p "${PROJECT_NAME}" config --format json 2>/dev/null)" || {
+      echo "ERROR: failed to read Compose config (${COMPOSE_FILE}, project=${PROJECT_NAME}); aborting before touching any volume." >&2
+      return 1
+    }
+  else
+    CFG_JSON="$(docker compose -f "${COMPOSE_FILE}" config --format json 2>/dev/null)" || {
+      echo "ERROR: failed to read Compose config (${COMPOSE_FILE}); aborting before touching any volume." >&2
+      return 1
+    }
+  fi
+  if [ -z "${CFG_JSON}" ]; then
+    echo "ERROR: empty Compose config JSON for ${COMPOSE_FILE}; aborting." >&2
+    return 1
+  fi
+  RESOLVED="$(printf '%s' "${CFG_JSON}" | python3 -c "
 import json, sys
 cfg = json.load(sys.stdin)
 proj = str(cfg.get('name') or '').strip()
 vols = cfg.get('volumes') or {}
 wg = (cfg.get('services') or {}).get('wg') or {}
-src_key = None
+matches = []
 for m in (wg.get('volumes') or []):
     if isinstance(m, dict) and m.get('target') == '/etc/wireguard':
-        src_key = m.get('source')
-        break
-    elif isinstance(m, str) and ':/etc/wireguard' in m:
-        src_key = m.split(':', 1)[0]
-        break
-if not src_key:
+        matches.append(m)
+if len(matches) != 1:
+    sys.stderr.write('ERROR: wg service must have exactly one /etc/wireguard mount.\n')
     sys.exit(2)
+m = matches[0]
+if m.get('type') != 'volume':
+    sys.stderr.write(f\"ERROR: wg /etc/wireguard mount must be named volume, got type={m.get('type')!r}.\n\")
+    sys.exit(3)
+src_key = str(m.get('source') or '').strip()
+if not src_key or src_key not in vols:
+    sys.stderr.write(f'ERROR: named volume definition missing for {src_key!r}.\n')
+    sys.exit(4)
 vdef = vols.get(src_key) or {}
-phys = vdef.get('name') or (f'{proj}_{src_key}' if proj else src_key)
+phys = str(vdef.get('name') or (f'{proj}_{src_key}' if proj else src_key)).strip()
+if not phys:
+    sys.stderr.write('ERROR: resolved physical volume name is empty.\n')
+    sys.exit(5)
 print(phys)
-" 2>/dev/null || true)"
-      if [ -n "${RESOLVED}" ]; then
-        printf '%s' "${RESOLVED}"
-        return 0
-      fi
-    fi
-  fi
-  # 无 Docker CLI 离线回退：按 Compose 规则生成 <project>_wireguard_config
-  BASE_PROJ="${PROJECT_NAME:-$(basename "$(cd "$(dirname "${COMPOSE_FILE}")" && pwd)")}"
-  NORM_PROJ="$(printf '%s' "${BASE_PROJ}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]//g')"
-  printf '%s_wireguard_config' "${NORM_PROJ}"
+")" || {
+    echo "ERROR: Compose WireGuard named volume resolution/validation failed; aborting before write." >&2
+    return 1
+  }
+  printf '%s' "${RESOLVED}"
 }
 
 pick_helper_image() {
@@ -99,30 +109,69 @@ pick_helper_image() {
 VOLUME_NAME="$(resolve_compose_volume)"
 echo "Resolved effective Compose target physical volume: ${VOLUME_NAME}"
 
-# 若同时显式指定了预期挂载来源，拦截不一致，避免向错误物理卷写入后触发服务重建重新生成密钥
-if [ -n "${EXPLICIT_VOLUME}" ]; then
-  ACTUAL_COMP_VOL="$(EXPLICIT_VOLUME='' resolve_compose_volume)"
-  if [ "${EXPLICIT_VOLUME}" != "${ACTUAL_COMP_VOL}" ]; then
-    echo "ERROR: volume mismatch before recreate: --volume=${EXPLICIT_VOLUME} != Compose target=${ACTUAL_COMP_VOL}. Aborting." >&2
+# 若同时显式指定了预期卷名，拦截任何不一致，避免向错误物理卷写入后触发服务重建重新生成密钥
+if [ -n "${EXPLICIT_VOLUME}" ] && [ "${EXPLICIT_VOLUME}" != "${VOLUME_NAME}" ]; then
+  echo "ERROR: volume mismatch before recreate: --volume=${EXPLICIT_VOLUME} != Compose target=${VOLUME_NAME}. Aborting." >&2
+  exit 1
+fi
+
+VERIFY_SNIPPET='
+  [ "$(stat -c "%a" /dst)" = "700" ] || { echo "ERROR: /dst mode is not 700" >&2; exit 1; }
+  [ -f /dst/wg0.conf ] || { echo "ERROR: target missing wg0.conf" >&2; exit 1; }
+  [ "$(stat -c "%a" /dst/wg0.conf)" = "600" ] || { echo "ERROR: wg0.conf mode is not 600" >&2; exit 1; }
+  cmp -s /src/wg0.conf /dst/wg0.conf || { echo "ERROR: wg0.conf content mismatch" >&2; exit 1; }
+  if [ -f /src/server.key ]; then
+    [ -f /dst/server.key ] || { echo "ERROR: target missing server.key" >&2; exit 1; }
+    [ "$(stat -c "%a" /dst/server.key)" = "600" ] || { echo "ERROR: server.key mode is not 600" >&2; exit 1; }
+    cmp -s /src/server.key /dst/server.key || { echo "ERROR: server.key content mismatch" >&2; exit 1; }
+  fi
+  if [ -f /src/server.pub ]; then
+    [ -f /dst/server.pub ] || { echo "ERROR: target missing server.pub" >&2; exit 1; }
+    cmp -s /src/server.pub /dst/server.pub || { echo "ERROR: server.pub content mismatch" >&2; exit 1; }
+  fi
+  SRC_LIST=""
+  DST_LIST=""
+  if [ -d /src/clients ]; then
+    SRC_LIST="$(for p in /src/clients/*.conf; do [ -f "$p" ] && basename "$p"; done | sort)"
+  fi
+  if [ -d /dst/clients ]; then
+    DST_LIST="$(for p in /dst/clients/*.conf; do [ -f "$p" ] && basename "$p"; done | sort)"
+  fi
+  if [ "${SRC_LIST}" != "${DST_LIST}" ]; then
+    echo "ERROR: clients/*.conf file list mismatch between source and target." >&2
     exit 1
   fi
-fi
+  if [ -n "${SRC_LIST}" ]; then
+    [ -d /dst/clients ] && [ "$(stat -c "%a" /dst/clients)" = "700" ] || { echo "ERROR: /dst/clients mode is not 700" >&2; exit 1; }
+    for p in /src/clients/*.conf; do
+      [ -f "$p" ] || continue
+      base="$(basename "$p")"
+      [ "$(stat -c "%a" "/dst/clients/${base}")" = "600" ] || { echo "ERROR: clients/${base} mode is not 600" >&2; exit 1; }
+      cmp -s "$p" "/dst/clients/${base}" || { echo "ERROR: clients/${base} content mismatch" >&2; exit 1; }
+    done
+  fi
+  echo "VERIFIED: wg0.conf, keys, clients/*.conf, and permissions (700/600) match source exactly."
+'
 
 HELPER_IMAGE="$(pick_helper_image)"
 
 if [ "${ROLLBACK}" = "1" ]; then
   mkdir -p "${TARGET_DIR}/clients"
   ABS_DST="$(cd "${TARGET_DIR}" && pwd)"
-  docker run --rm --entrypoint sh -v "${VOLUME_NAME}:/src:ro" -v "${ABS_DST}:/dst" "${HELPER_IMAGE}" -eu -c '
-    [ -f /src/wg0.conf ] || { echo "ERROR: /src/wg0.conf missing in volume" >&2; exit 1; }
+  docker run --rm --entrypoint sh -v "${VOLUME_NAME}:/src:ro" -v "${ABS_DST}:/dst" "${HELPER_IMAGE}" -eu -c "
+    [ -f /src/wg0.conf ] || { echo 'ERROR: /src/wg0.conf missing in volume' >&2; exit 1; }
     mkdir -p /dst/clients && chmod 700 /dst /dst/clients
+    rm -f /dst/clients/*.conf
     cp -p /src/wg0.conf /dst/wg0.conf
     [ -f /src/server.key ] && cp -p /src/server.key /dst/server.key
     [ -f /src/server.pub ] && cp -p /src/server.pub /dst/server.pub
-    cp -p /src/clients/*.conf /dst/clients/ 2>/dev/null || true
+    if [ -d /src/clients ]; then
+      for p in /src/clients/*.conf; do [ -f \"\$p\" ] && cp -p \"\$p\" /dst/clients/; done
+    fi
     chmod 600 /dst/wg0.conf /dst/server.key /dst/clients/*.conf 2>/dev/null || true
-    echo "OK: rolled back WireGuard keys/configs to host dir."
-  '
+    ${VERIFY_SNIPPET}
+    echo 'OK: rolled back WireGuard keys/configs to host dir.'
+  "
   exit 0
 fi
 
@@ -145,26 +194,20 @@ if [ "${VERIFY_ONLY}" != "1" ]; then
       fi
       mkdir -p /dst/clients
       chmod 700 /dst /dst/clients
+      rm -f /dst/clients/*.conf
       cp -p /src/wg0.conf /dst/wg0.conf
       [ -f /src/server.key ] && cp -p /src/server.key /dst/server.key
       [ -f /src/server.pub ] && cp -p /src/server.pub /dst/server.pub
       if [ -d /src/clients ]; then
-        cp -p /src/clients/*.conf /dst/clients/ 2>/dev/null || true
+        for p in /src/clients/*.conf; do [ -f "$p" ] && cp -p "$p" /dst/clients/; done
       fi
       chmod 600 /dst/wg0.conf /dst/server.key /dst/clients/*.conf 2>/dev/null || true
       echo "OK: migrated WireGuard keys and peer configs into Docker volume."
     '
 fi
 
-# 强制重建前一致性校验：确保实际 Compose 挂载物理卷内 wg0.conf 与公钥、对端清单与源目录完全一致
-docker run --rm --entrypoint sh -v "${ABS_SRC}:/src:ro" -v "${VOLUME_NAME}:/dst:ro" "${HELPER_IMAGE}" -eu -c '
-  [ -f /dst/wg0.conf ] || { echo "ERROR: target volume missing wg0.conf before recreate" >&2; exit 1; }
-  cmp -s /src/wg0.conf /dst/wg0.conf || { echo "ERROR: wg0.conf mismatch between source and volume" >&2; exit 1; }
-  if [ -f /src/server.pub ]; then
-    cmp -s /src/server.pub /dst/server.pub || { echo "ERROR: server.pub mismatch" >&2; exit 1; }
-  fi
-  echo "VERIFIED: volume wg0.conf & server.pub match source exactly."
-'
+# 强制重建前一致性校验：确保目标物理卷内 wg0.conf、keys、clients/*.conf 文件集合与内容及权限（700/600）与源目录完全一致
+docker run --rm --entrypoint sh -v "${ABS_SRC}:/src:ro" -v "${VOLUME_NAME}:/dst:ro" "${HELPER_IMAGE}" -eu -c "${VERIFY_SNIPPET}"
 
 echo "验证通过！目标 Compose 挂载卷 ${VOLUME_NAME} 已就绪，可执行："
 echo "  docker compose -f ${COMPOSE_FILE}${PROJECT_NAME:+ -p ${PROJECT_NAME}} up -d --force-recreate wg"

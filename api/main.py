@@ -473,24 +473,41 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
         excl_filter = "" if scope_val == "month" else "MONTH_%"
         cursor.execute("""
         IF OBJECT_ID(N'dbo.inpatient_scan_batch', N'U') IS NOT NULL
+        BEGIN
+            DECLARE @pv_expr NVARCHAR(128) = CASE
+                WHEN COL_LENGTH('dbo.inpatient_scan_batch', 'probe_version') IS NOT NULL
+                THEN N'probe_version'
+                ELSE N'CAST(NULL AS INT) AS probe_version'
+            END;
+            DECLARE @ord_expr NVARCHAR(128) = CASE
+                WHEN COL_LENGTH('dbo.inpatient_scan_batch', 'seq_id') IS NOT NULL
+                THEN N'synced_at DESC, seq_id DESC'
+                ELSE N'synced_at DESC'
+            END;
+            DECLARE @dyn_sql NVARCHAR(MAX) = N'
+                SELECT TOP 1 batch_id, data_cutoff_time, synced_at, scope, year_month, scan_limit, total_scanned, is_truncated, probe_version, CAST(has_batch_meta AS BIT) AS has_batch_meta
+                FROM (
+                    SELECT batch_id, data_cutoff_time, synced_at, scope, year_month, scan_limit, total_scanned, is_truncated, ' + @pv_expr + N',
+                           ' + CASE WHEN COL_LENGTH('dbo.inpatient_scan_batch', 'seq_id') IS NOT NULL THEN N'seq_id' ELSE N'CAST(0 AS BIGINT) AS seq_id' END + N',
+                           1 AS has_batch_meta
+                    FROM dbo.inpatient_scan_batch
+                    WHERE batch_id LIKE @pat AND scope = @sc AND (@ym IS NULL OR year_month = @ym)
+                    UNION ALL
+                    SELECT batch_id, MAX(data_cutoff_time) AS data_cutoff_time, MAX(synced_at) AS synced_at,
+                           CAST(NULL AS NVARCHAR(16)) AS scope, CAST(NULL AS NVARCHAR(7)) AS year_month,
+                           CAST(NULL AS INT) AS scan_limit, CAST(NULL AS INT) AS total_scanned, CAST(NULL AS BIT) AS is_truncated,
+                           CAST(NULL AS INT) AS probe_version, CAST(0 AS BIGINT) AS seq_id, 0 AS has_batch_meta
+                    FROM dbo.inpatient_dip_snapshot
+                    WHERE batch_id LIKE @pat AND (@excl = N'''' OR batch_id NOT LIKE @excl)
+                      AND NOT EXISTS (SELECT 1 FROM dbo.inpatient_scan_batch b WHERE b.batch_id = dbo.inpatient_dip_snapshot.batch_id)
+                    GROUP BY batch_id
+                ) combined
+                ORDER BY ' + @ord_expr;
             EXEC sp_executesql
-                N'SELECT TOP 1 batch_id, data_cutoff_time, synced_at, scope, year_month, scan_limit, total_scanned, is_truncated, CAST(has_batch_meta AS BIT) AS has_batch_meta
-                  FROM (
-                      SELECT batch_id, data_cutoff_time, synced_at, scope, year_month, scan_limit, total_scanned, is_truncated, 1 AS has_batch_meta
-                      FROM dbo.inpatient_scan_batch
-                      WHERE batch_id LIKE @pat AND scope = @sc AND (@ym IS NULL OR year_month = @ym)
-                      UNION ALL
-                      SELECT batch_id, MAX(data_cutoff_time) AS data_cutoff_time, MAX(synced_at) AS synced_at,
-                             CAST(NULL AS NVARCHAR(16)) AS scope, CAST(NULL AS NVARCHAR(7)) AS year_month,
-                             CAST(NULL AS INT) AS scan_limit, CAST(NULL AS INT) AS total_scanned, CAST(NULL AS BIT) AS is_truncated, 0 AS has_batch_meta
-                      FROM dbo.inpatient_dip_snapshot
-                      WHERE batch_id LIKE @pat AND (@excl = N'''' OR batch_id NOT LIKE @excl)
-                        AND NOT EXISTS (SELECT 1 FROM dbo.inpatient_scan_batch b WHERE b.batch_id = dbo.inpatient_dip_snapshot.batch_id)
-                      GROUP BY batch_id
-                  ) combined
-                  ORDER BY synced_at DESC',
+                @dyn_sql,
                 N'@pat NVARCHAR(80), @excl NVARCHAR(80), @sc NVARCHAR(16), @ym NVARCHAR(7)',
                 @pat = %s, @excl = %s, @sc = %s, @ym = %s
+        END
         ELSE
             SELECT TOP 1 batch_id, data_cutoff_time, synced_at
             FROM dbo.inpatient_dip_snapshot
@@ -535,7 +552,8 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
 
         cursor.execute(
             "SELECT COL_LENGTH('dbo.inpatient_dip_snapshot', 'doctor_name') AS has_dn, "
-            "OBJECT_ID('dbo.inpatient_scan_batch', 'U') AS has_batch_tbl"
+            "OBJECT_ID('dbo.inpatient_scan_batch', 'U') AS has_batch_tbl, "
+            "COL_LENGTH('dbo.inpatient_scan_batch', 'probe_version') AS has_pv"
         )
         dn_row = cursor.fetchone() or {}
         doc_name_col = ", doctor_name" if dn_row.get("has_dn") is not None else ""
@@ -543,8 +561,9 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
         if latest_batch.get("has_batch_meta"):
             batch_meta = latest_batch
         elif dn_row.get("has_batch_tbl") is not None:
+            pv_col = ", probe_version" if dn_row.get("has_pv") is not None else ", CAST(NULL AS INT) AS probe_version"
             cursor.execute(
-                "SELECT scope, year_month, scan_limit, total_scanned, is_truncated "
+                f"SELECT scope, year_month, scan_limit, total_scanned, is_truncated{pv_col} "
                 "FROM dbo.inpatient_scan_batch WHERE batch_id = %s",
                 (batch_id,),
             )
@@ -629,8 +648,23 @@ async def get_inpatient_alerts(dept: Optional[str] = Query(None, description="�
         has_meta = bool(batch_meta)
         meta_total_scanned = batch_meta.get("total_scanned") if has_meta else None
         meta_scan_limit = batch_meta.get("scan_limit") if has_meta else None
-        # MONTH-TOTAL-001：明确区分 False（完整）、True（截断）、None（旧批次无元数据时未知）
-        meta_is_truncated: Optional[bool] = (bool(batch_meta.get("is_truncated")) if has_meta else None)
+        raw_probe_ver = batch_meta.get("probe_version") if has_meta else None
+        probe_verified = (raw_probe_ver is not None and int(raw_probe_ver) >= 2)
+        raw_trunc = bool(batch_meta.get("is_truncated")) if has_meta else None
+        # MONTH-TOTAL-001：明确区分 False（完整）、True（截断）、None（旧批次无元数据或旧版满额未经过 N+1 探针校验时未知）
+        if not has_meta:
+            meta_is_truncated: Optional[bool] = None
+        elif raw_trunc:
+            meta_is_truncated = True
+        elif (
+            not probe_verified
+            and meta_scan_limit is not None
+            and meta_total_scanned is not None
+            and int(meta_total_scanned) >= int(meta_scan_limit)
+        ):
+            meta_is_truncated = None
+        else:
+            meta_is_truncated = False
 
         # SNAP-COUNT-001：仅管理员/医保办接收全院扫描总数 total_scanned；科室主任仅接收本科授权可见数，严禁泄漏全院计数
         if role == ROLE_DEPT_HEAD:

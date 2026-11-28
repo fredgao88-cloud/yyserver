@@ -217,8 +217,8 @@ onMounted(loadData);
       当前批次受扫描上限 {{ report.scan_limit }} 截断（{{ isDeptOnlyScope ? `本科当前可见 ${counts.total} 例` : `已扫 ${report.total_scanned} 例` }}，可能存在未纳入的病例）。
     </NAlert>
 
-    <NAlert v-else-if="report?.batch_id && report?.is_truncated == null" type="info" title="历史批次完整度说明">
-      当前展示的是缺少批次元数据的历史快照批次，无法确认扫描当时是否全量覆盖或受上限截断；建议由医保办/管理员重新触发一次全量扫描。
+    <NAlert v-else-if="report?.batch_id && report?.is_truncated == null" type="info" title="批次完整度未知说明">
+      当前展示的批次缺少有效完整度探针元数据（历史旧批或旧版满额未校验批次），无法确认是否全量覆盖或受上限截断；建议由医保办/管理员重新触发一次扫描。
     </NAlert>
 
     <NAlert v-if="report?.is_stale && report?.stale_warning" type="warning" title="快照数据过期提醒">

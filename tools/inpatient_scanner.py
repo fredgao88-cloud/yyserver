@@ -18,6 +18,7 @@ Strictly compliant with 《开发设计文档 v1.2》:
 import os
 import sys
 import re
+import uuid
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from typing import List, Dict, Any, Optional
@@ -112,25 +113,35 @@ class InpatientScanner:
         notify_dingtalk: bool = False,
         scope: str = "active",
         year_month: Optional[str] = None,
+        if_exists: str = "replace",
     ) -> Dict[str, Any]:
         """
         Executes a scan over inpatient cases and saves snapshots into dbo.inpatient_dip_snapshot.
         - scope='active' (default): evaluates active un-discharged patients (default limit=50).
         - scope='month': evaluates all patients overlapping target year_month (full pagination when limit is None),
           writing into a distinct MONTH_YYYYMM_* batch so active-only snapshots stay strictly isolated.
+        - if_exists: 'replace' (default, atomically replaces stale detail rows of an explicit batch_id)
+          or 'error' (rejects reusing an existing explicit batch_id).
         """
         now_bj = datetime.now(BEIJING_TZ)
         scope_val = (scope or "active").strip().lower()
         if scope_val not in ("active", "month"):
             raise ValueError(f"Unsupported scan scope: {scope}")
+        if if_exists not in ("replace", "error"):
+            raise ValueError(f"Unsupported if_exists policy: {if_exists}")
 
         target_ym = (year_month or now_bj.strftime("%Y-%m")).strip()
-        if not batch_id:
+        explicit_batch_id = bool(batch_id and str(batch_id).strip())
+        if not explicit_batch_id:
+            # SNAP-BATCH-ID-001：微秒 + 随机 hex 确保同秒/固定时钟并发调用绝不碰撞且保持前缀兼容（总长 <= 42）
+            uniq_token = f"{now_bj.strftime('%Y%m%d_%H%M%S_%f')}_{uuid.uuid4().hex[:6]}"
             if scope_val == "month":
                 ym_compact = target_ym.replace("-", "")
-                batch_id = f"MONTH_{ym_compact}_{now_bj.strftime('%Y%m%d_%H%M%S')}"
+                batch_id = f"MONTH_{ym_compact}_{uniq_token}"
             else:
-                batch_id = f"BATCH_{now_bj.strftime('%Y%m%d_%H%M%S')}"
+                batch_id = f"BATCH_{uniq_token}"
+        else:
+            batch_id = str(batch_id).strip()
 
         data_cutoff_time = now_bj.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -140,6 +151,7 @@ class InpatientScanner:
             "year_month": target_ym if scope_val == "month" else None,
             "scan_limit": limit,
             "is_truncated": False,
+            "probe_version": 2,
         }
         if scope_val == "month":
             try:
@@ -150,16 +162,20 @@ class InpatientScanner:
                     return_meta=True,
                 )
             except TypeError:
+                probe_lim = (int(limit) + 1) if limit is not None else None
                 monthly_res = self.his_reader.get_monthly_inpatients(
                     year_month=target_ym,
                     department=department,
-                    limit=limit,
+                    limit=probe_lim,
                 )
             if isinstance(monthly_res, tuple) and len(monthly_res) == 2:
                 monthly_rows, raw_meta = monthly_res
                 month_meta.update(raw_meta or {})
             else:
                 monthly_rows = list(monthly_res or [])
+                if limit is not None and len(monthly_rows) > int(limit):
+                    monthly_rows = monthly_rows[:int(limit)]
+                    month_meta["is_truncated"] = True
             seen_zyh = set()
             for r in monthly_rows:
                 zyh_val = r.get("zyh")
@@ -169,7 +185,7 @@ class InpatientScanner:
                     seen_zyh.add(zyh_val)
                 patients_to_scan.append(r)
         else:
-            active_limit = 50 if limit is None else limit
+            active_limit = 50 if limit is None else int(limit)
             month_meta["scan_limit"] = active_limit
             try:
                 active_res = self.his_reader.get_active_inpatients(
@@ -178,9 +194,11 @@ class InpatientScanner:
                     return_meta=True,
                 )
             except TypeError:
+                # 兼容旧版未实现 return_meta 参数的读取器：同样按 active_limit + 1 探针多取一条以精准判定截断
+                probe_lim = (active_limit + 1) if active_limit is not None else None
                 active_res = self.his_reader.get_active_inpatients(
                     department=department,
-                    limit=active_limit,
+                    limit=probe_lim,
                 )
             if isinstance(active_res, tuple) and len(active_res) == 2:
                 active_inpatients, act_meta = active_res
@@ -253,16 +271,48 @@ class InpatientScanner:
                 "IF OBJECT_ID(N'dbo.inpatient_scan_batch', N'U') IS NULL "
                 "CREATE TABLE dbo.inpatient_scan_batch ("
                 "batch_id NVARCHAR(64) PRIMARY KEY, "
+                "seq_id BIGINT IDENTITY(1,1) NOT NULL, "
                 "scope NVARCHAR(16) NOT NULL, "
                 "year_month NVARCHAR(7) NULL, "
                 "rule_version NVARCHAR(50) NOT NULL, "
                 "scan_limit INT NULL, "
                 "total_scanned INT NOT NULL, "
                 "is_truncated BIT NOT NULL DEFAULT 0, "
+                "probe_version INT NULL, "
                 "data_cutoff_time DATETIME2 NOT NULL, "
                 "synced_at DATETIME2 NOT NULL DEFAULT SYSDATETIME()"
                 ");"
             )
+            local_cur.execute(
+                "IF OBJECT_ID(N'dbo.inpatient_scan_batch', N'U') IS NOT NULL "
+                "AND COL_LENGTH('dbo.inpatient_scan_batch', 'probe_version') IS NULL "
+                "ALTER TABLE dbo.inpatient_scan_batch ADD probe_version INT NULL;"
+            )
+            local_cur.execute(
+                "IF OBJECT_ID(N'dbo.inpatient_scan_batch', N'U') IS NOT NULL "
+                "AND COL_LENGTH('dbo.inpatient_scan_batch', 'seq_id') IS NULL "
+                "ALTER TABLE dbo.inpatient_scan_batch ADD seq_id BIGINT IDENTITY(1,1) NOT NULL;"
+            )
+            if explicit_batch_id:
+                if if_exists == "error":
+                    local_cur.execute(
+                        "SELECT TOP 1 1 FROM dbo.inpatient_scan_batch WHERE batch_id = %s",
+                        (batch_id,),
+                    )
+                    meta_dup = local_cur.fetchone()
+                    local_cur.execute(
+                        "SELECT TOP 1 1 FROM dbo.inpatient_dip_snapshot WHERE batch_id = %s",
+                        (batch_id,),
+                    )
+                    snap_dup = local_cur.fetchone()
+                    if meta_dup or snap_dup:
+                        raise ValueError(f"Duplicate explicit batch_id rejected: {batch_id}")
+                else:
+                    # SNAP-BATCH-ID-001：显式重用 batch_id 重试时，同事务先清理该批旧明细，保证摘要与明细 100% 一致
+                    local_cur.execute(
+                        "DELETE FROM dbo.inpatient_dip_snapshot WHERE batch_id = %s",
+                        (batch_id,),
+                    )
             for pat in patients_to_scan:
                 zyh = pat['zyh']
                 ward_name = pat.get('current_dept') or '默认病区'
@@ -468,25 +518,33 @@ class InpatientScanner:
                     scan_limit = %s,
                     total_scanned = %s,
                     is_truncated = %s,
+                    probe_version = %s,
                     data_cutoff_time = %s,
                     synced_at = SYSDATETIME()
             WHEN NOT MATCHED THEN
-                INSERT (batch_id, scope, year_month, rule_version, scan_limit, total_scanned, is_truncated, data_cutoff_time, synced_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, SYSDATETIME());
+                INSERT (batch_id, scope, year_month, rule_version, scan_limit, total_scanned, is_truncated, probe_version, data_cutoff_time, synced_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, SYSDATETIME());
             """
             is_trunc_bit = 1 if month_meta.get('is_truncated') else 0
             ym_val = month_meta.get('year_month')
             lim_val = month_meta.get('scan_limit')
             tot_val = len(evaluated_snapshots)
+            probe_ver_val = int(month_meta.get('probe_version') or 2)
             local_cur.execute(
                 batch_meta_sql,
                 (
-                    batch_id, scope_val, ym_val, self.rule_version, lim_val, tot_val, is_trunc_bit, data_cutoff_time,
-                    batch_id, scope_val, ym_val, self.rule_version, lim_val, tot_val, is_trunc_bit, data_cutoff_time,
+                    batch_id, scope_val, ym_val, self.rule_version, lim_val, tot_val, is_trunc_bit, probe_ver_val, data_cutoff_time,
+                    batch_id, scope_val, ym_val, self.rule_version, lim_val, tot_val, is_trunc_bit, probe_ver_val, data_cutoff_time,
                 ),
             )
             local_conn.commit()
             print(f"[{batch_id}] Successfully persisted {len(evaluated_snapshots)} snapshot records to local_db.")
+        except ValueError:
+            try:
+                local_conn.rollback()
+            except Exception:
+                pass
+            raise
         except Exception as scan_err:
             # SNAP-LOG-001：使用受控错误码记录写入失败与真实回滚状态，严禁输出原始异常详情
             rollback_ok = False
@@ -513,6 +571,7 @@ class InpatientScanner:
         summary['year_month'] = month_meta.get('year_month')
         summary['scan_limit'] = month_meta.get('scan_limit')
         summary['is_truncated'] = bool(month_meta.get('is_truncated'))
+        summary['probe_version'] = int(month_meta.get('probe_version') or 2)
         summary['snapshots'] = evaluated_snapshots
 
         if notify_dingtalk:
